@@ -1,0 +1,229 @@
+# A2A Multi-Agent System Docker Compose Configuration
+services:
+  # ===========================================
+  # Supervisor Agent (Master Orchestrator) 
+  # ===========================================
+  supervisor-agent:
+    build:
+      context: ../../
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: supervisor-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=supervisor
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8000
+      - DEBUG=${DEBUG:-false}
+      - SUB_AGENTS=DataCollectorAgent,AnalysisAgent,TradingAgent
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-trading-mcp:
+        condition: service_healthy
+      kiwoom-investor-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+      financial-analysis-mcp:
+        condition: service_healthy
+      naver-news-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  # ===========================================
+  # Data Collector Agent
+  # ===========================================
+  data-collector-agent:
+    build:
+      context: ../../
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: data-collector-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=data_collector
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8001
+      - DEBUG=${DEBUG:-false}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - NAVER_CLIENT_ID=${NAVER_CLIENT_ID:-}
+      - NAVER_CLIENT_SECRET=${NAVER_CLIENT_SECRET:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-investor-mcp:
+        condition: service_healthy
+      naver-news-mcp:
+        condition: service_healthy
+      tavily-search-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  # ===========================================
+  # Analysis Agent
+  # ===========================================
+  analysis-agent:
+    build:
+      context: ../../
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: analysis-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=analysis
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8002
+      - DEBUG=${DEBUG:-false}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - DART_API_KEY=${DART_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+      financial-analysis-mcp:
+        condition: service_healthy
+      macroeconomic-analysis-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  # ===========================================
+  # Trading Agent
+  # ===========================================
+  trading-agent:
+    build:
+      context: ../../
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: trading-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=trading
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8003
+      - DEBUG=${DEBUG:-false}
+      - MOCK_MODE=${MOCK_MODE:-true}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-trading-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+networks:
+  stock_system_network:
+    external: true
+    name: stock_system_network
+
+volumes:
+  logs_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${PWD}/logs
+      o: bind

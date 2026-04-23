@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment variables
+.env
+logs/
+data/
+
+# IDE
+*coverage*
+node_modules/
+
+# AI Tools
+.serena/
+.claude/
+.mcp.json
+CLAUDE.md
+CLAUDE-*.md
+shrimp_data/
+GEMINI.md
+GEMINI-*.md
+QWEN.md
+QWEN-*.md

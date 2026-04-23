@@ -1,0 +1,639 @@
+# 한국 주식 투자 자동화 시스템 - 통합 Docker Compose 설정
+# 모든 서비스를 단일 환경에서 관리하는 프로덕션 레디 구성
+# 실행 시에는 "run-all-services.sh" 파일을 실행하세요.
+# **.env 를 설정하지 않은 경우, 예기치 않은 오류가 발생할 수 있습니다!!**
+
+services:
+  # ===========================================
+  # MCP Domain Servers (5개 Core Domain)
+  # ===========================================
+  
+  kiwoom-market-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: kiwoom-market-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8031
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8031:8031"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8031/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/kiwoom_mcp/domains/market_domain.py
+    profiles:
+      - dev
+      - prod
+
+  kiwoom-info-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: kiwoom-info-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8032
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8032:8032"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8032/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/kiwoom_mcp/domains/info_domain.py
+    profiles:
+      - dev
+      - prod
+
+  kiwoom-trading-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: kiwoom-trading-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8030
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+      - MOCK_MODE=${MOCK_MODE:-true}
+    ports:
+      - "8030:8030"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8030/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/kiwoom_mcp/domains/trading_domain.py
+    profiles:
+      - dev
+      - prod
+
+  kiwoom-investor-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: kiwoom-investor-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8033
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8033:8033"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8033/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/kiwoom_mcp/domains/investor_domain.py
+    profiles:
+      - dev
+      - prod
+
+  kiwoom-portfolio-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: kiwoom-portfolio-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8034
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8034:8034"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8034/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/kiwoom_mcp/domains/portfolio_domain.py
+    profiles:
+      - dev
+      - prod
+
+  # ===========================================
+  # External Analysis MCP Servers
+  # ===========================================
+
+  financial-analysis-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: financial-analysis-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8040
+      - DART_API_KEY=${DART_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8040:8040"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8040/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/financial_analysis_mcp/server.py
+    profiles:
+      - dev
+      - prod
+
+  stock-analysis-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: stock-analysis-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8042
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8042:8042"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8042/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/stock_analysis_mcp/server.py
+    profiles:
+      - dev
+      - prod
+
+  macroeconomic-analysis-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: macroeconomic-analysis-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8041
+      - ECOS_API_KEY=${ECOS_API_KEY:-}
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8041:8041"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8041/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/macroeconomic_analysis_mcp/server.py
+    profiles:
+      - dev
+      - prod
+
+  naver-news-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: naver-news-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=8050
+      - NAVER_CLIENT_ID=${NAVER_CLIENT_ID:-}
+      - NAVER_CLIENT_SECRET=${NAVER_CLIENT_SECRET:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8050/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/naver_news_mcp/server.py
+    profiles:
+      - dev
+      - prod
+
+  tavily-search-mcp:
+    build:
+      context: .
+      dockerfile: docker/mcp_servers/Dockerfile
+    container_name: tavily-search-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_PORT=3020
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "3020:3020"
+    volumes:
+      - ./logs/mcp_servers:/app/logs
+      - ./src:/app/src:ro
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:3020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python src/mcp_servers/tavily_search_mcp/server.py
+    profiles:
+      - dev
+      - prod
+
+  # ===========================================
+  # A2A Agent Services (4개 Agent)
+  # ===========================================
+
+  supervisor-agent:
+    build:
+      context: .
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: supervisor-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=supervisor
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8000
+      - DEBUG=${DEBUG:-false}
+      - SUB_AGENTS=DataCollectorAgent,AnalysisAgent,TradingAgent
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-trading-mcp:
+        condition: service_healthy
+      kiwoom-investor-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+      financial-analysis-mcp:
+        condition: service_healthy
+      naver-news-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8000/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  data-collector-agent:
+    build:
+      context: .
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: data-collector-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=data_collector
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8001
+      - DEBUG=${DEBUG:-false}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - NAVER_CLIENT_ID=${NAVER_CLIENT_ID:-}
+      - NAVER_CLIENT_SECRET=${NAVER_CLIENT_SECRET:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-investor-mcp:
+        condition: service_healthy
+      naver-news-mcp:
+        condition: service_healthy
+      tavily-search-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8001/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  analysis-agent:
+    build:
+      context: .
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: analysis-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=analysis
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8002
+      - DEBUG=${DEBUG:-false}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - DART_API_KEY=${DART_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-market-mcp:
+        condition: service_healthy
+      kiwoom-info-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+      financial-analysis-mcp:
+        condition: service_healthy
+      macroeconomic-analysis-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8002/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+
+  trading-agent:
+    build:
+      context: .
+      dockerfile: docker/a2a_agents/Dockerfile
+    container_name: trading-agent
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=trading
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8003
+      - DEBUG=${DEBUG:-false}
+      - MOCK_MODE=${MOCK_MODE:-true}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-test-key-for-development}
+      - KIWOOM_APP_KEY=${KIWOOM_APP_KEY:-}
+      - KIWOOM_APP_SECRET=${KIWOOM_APP_SECRET:-}
+      - KIWOOM_ACCOUNT_NO=${KIWOOM_ACCOUNT_NO:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - IS_DOCKER=true
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./logs/agents:/app/logs
+      - ./src:/app/src:${DEV_MODE:-ro}
+    networks:
+      - stock_system_network
+    depends_on:
+      kiwoom-trading-mcp:
+        condition: service_healthy
+      kiwoom-portfolio-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8003/.well-known/agent-card.json"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    profiles:
+      - dev
+      - prod
+  
+  a2a-inspector:
+    build:
+      context: .
+      dockerfile: a2a-inspector/Dockerfile
+    container_name: a2a-inspector
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - stock_system_network
+    profiles:
+      - prod
+      - dev
+
+  # ===========================================
+  # Development Tools (dev profile only - MCP 서버 검증용)
+  # 사용 시 Server 주소 입력에 주의 필요
+  # 만약, Docker-Compose Network 로 접근하려면 서버명을 http://{container_name}:{container_port} 로 입력해야 함.
+  # 그게 아니라, Host 머신을 통해서 접근하려면, http://host.docker.internal:{host_binding_port} 로 입력해야 함.
+  # ===========================================
+
+  mcp-inspector:
+    image: mcpjam/mcp-inspector:latest
+    container_name: mcp-inspector
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    networks:
+      - stock_system_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    profiles:
+      - dev
+
+# ===========================================
+# Networks
+# ===========================================
+networks:
+  stock_system_network:
+    driver: bridge
+    name: stock_system_network
+
+# ===========================================
+# Volumes
+# ===========================================
+volumes:
+  logs_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${PWD}/logs
+      o: bind

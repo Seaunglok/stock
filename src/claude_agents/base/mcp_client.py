@@ -77,14 +77,24 @@ class MCPManager:
         self._sessions[server_name] = session
 
         tools_result = await session.list_tools()
+        loaded = 0
         for tool in tools_result.tools:
+            if tool.name in self._tool_server_map:
+                logger.warning(
+                    "중복 도구 이름 - 건너뜀 (먼저 등록된 서버 우선)",
+                    tool=tool.name,
+                    existing_server=self._tool_server_map[tool.name],
+                    skipped_server=server_name,
+                )
+                continue
             self._anthropic_tools.append(self._to_anthropic_tool(tool))
             self._tool_server_map[tool.name] = server_name
+            loaded += 1
 
         logger.info(
             "MCP 서버 연결 완료",
             server=server_name,
-            tool_count=len(tools_result.tools),
+            tool_count=loaded,
         )
 
     async def __aexit__(self, *args: Any) -> None:

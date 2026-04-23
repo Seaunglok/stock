@@ -55,7 +55,7 @@ class KiwoomRESTAPIClient:
         app_key: Optional[str] = None,
         app_secret: Optional[str] = None,
         account_no: Optional[str] = None,
-        mode: str = "paper",  # paper, production only
+        mode: Optional[str] = None,  # paper | production | None→env 기반 자동 결정
     ):
         """
         통합 클라이언트 초기화

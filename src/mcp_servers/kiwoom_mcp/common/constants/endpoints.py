@@ -15,12 +15,12 @@ class KiwoomEndpoints:
     # 모의투자 (Paper Trading) - 키움증권 공식 Paper Trading URL
     PAPER_BASE_URL = "https://mockapi.kiwoom.com"
     # 실제 운영서버 거래 (Production Trading - 주의!!)
-    PRODUCTION_BASE_URL = "https://openapi.kiwoom.com"
+    PRODUCTION_BASE_URL = "https://api.kiwoom.com"
 
     # WebSocket URLs
     PAPER_WS_URL = "wss://mockapi.kiwoom.com:10000"
     # 실제 운영서버 거래 (Production Trading - 주의!!)
-    PRODUCTION_WS_URL = "wss://openapi.kiwoom.com:19443"
+    PRODUCTION_WS_URL = "wss://api.kiwoom.com:10000"
 
     # 현재 모드
     _current_mode: str = "paper"

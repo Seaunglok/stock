@@ -8,12 +8,21 @@
 import asyncio
 import logging
 import os
+import sys
 from datetime import datetime, timedelta
 from difflib import get_close_matches
 from typing import Any, Literal
 
 import FinanceDataReader as fdr
 import pandas as pd
+
+# Kiwoom REST API client (same Python environment)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+try:
+    from mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client import KiwoomRESTAPIClient
+    _KIWOOM_CLIENT_AVAILABLE = True
+except ImportError:
+    _KIWOOM_CLIENT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -290,53 +299,140 @@ class FinancialClient:
     async def _get_basic_financial_data_fdr(
         self, symbol: str, current_price: float
     ) -> dict[str, Any]:
-        """
-        FinanceDataReader를 통한 기본 재무 데이터 수집
-        """
+        """키움 REST API로 기본 재무 데이터 수집 (fdr.SnapDataReader NAVER/FINSTATE 대체)"""
         try:
-            # 종목 기본 정보
-            stock_info = await asyncio.to_thread(fdr.SnapDataReader, f"NAVER/STOCK/{symbol}/FINSTATE")
+            # 1순위: 키움 REST API (get_stock_info = ka10001)
+            if _KIWOOM_CLIENT_AVAILABLE:
+                try:
+                    kiwoom_data = await self._get_kiwoom_stock_info(symbol)
+                    if kiwoom_data:
+                        return kiwoom_data
+                except Exception as e:
+                    logger.warning(f"Kiwoom API failed for {symbol}, fallback to fdr: {e}")
 
-            if stock_info is None or stock_info.empty:
-                raise FinancialAnalysisError(
-                    f"종목 {symbol}에 대한 기본 정보를 찾을 수 없습니다.", "NO_STOCK_INFO"
-                )
+            # 2순위: fdr.StockListing으로 시가총액/주식수만 가져와 추정
+            return await self._get_financial_data_from_stock_listing(symbol, current_price)
 
-            # 시가총액, PER, PBR 등 추출
-            market_cap = stock_info.get("MarketCap", 0) / 100000000  # 억원 단위
-            per = stock_info.get("PER", 0)
-            pbr = stock_info.get("PBR", 0)
-            eps = current_price / per if per > 0 else 0
-            bps = current_price / pbr if pbr > 0 else 0
-            shares_outstanding = (
-                (market_cap * 100000000) / current_price if current_price > 0 else 0
-            )
+        except FinancialAnalysisError:
+            raise
+        except Exception as e:
+            logger.error(f"Financial data collection failed for {symbol}: {e}")
+            raise FinancialAnalysisError(
+                f"재무 데이터 수집 실패: {e}", "FDR_ERROR"
+            ) from e
 
-            # 기본 재무 데이터 구조 (추정치)
-            estimated_revenue = market_cap * 1.5  # 매출액 추정 (PSR 1.5 가정)
-            estimated_net_income = market_cap / per if per > 0 else market_cap * 0.05
-            estimated_equity = market_cap / pbr if pbr > 0 else market_cap * 0.4
-            estimated_assets = estimated_equity * 2.5  # 자기자본비율 40% 가정
+    async def _get_kiwoom_stock_info(self, symbol: str) -> dict[str, Any] | None:
+        """키움 REST API ka10001 으로 재무 데이터 수집"""
+        client = KiwoomRESTAPIClient()
+        try:
+            resp = await client.get_stock_info(symbol)
+            d = resp.get("data", resp)
+
+            def _float(v, default=0.0) -> float:
+                try:
+                    return float(str(v).lstrip("+-").replace(",", "") or default)
+                except Exception:
+                    return default
+
+            per = _float(d.get("per"))
+            pbr = _float(d.get("pbr"))
+            eps = _float(d.get("eps"))
+            bps = _float(d.get("bps"))
+            roe = _float(d.get("roe"))
+            market_cap = _float(d.get("mac"))              # 억원
+            revenue = _float(d.get("sale_amt"))            # 억원
+            op_income = _float(d.get("bus_pro"))           # 억원
+            net_income = _float(d.get("cup_nga"))          # 억원
+            flo_stk = _float(d.get("flo_stk"))             # 천주
+            current_price = _float(d.get("cur_prc")) or _float(d.get("cur_prc"))
+
+            shares_outstanding = flo_stk * 1000  # 주
+            op_margin = (op_income / revenue * 100) if revenue > 0 else 0
+            net_margin = (net_income / revenue * 100) if revenue > 0 else 0
+            equity = market_cap / pbr if pbr > 0 else market_cap * 0.4
+            total_assets = equity / 0.4 if equity > 0 else market_cap * 2.5
+            ebitda = op_income * 1.15  # EBITDA ≈ 영업이익 + D&A 추정
 
             return {
                 "income_statement": {
-                    "revenue": estimated_revenue,
-                    "operating_income": estimated_revenue * 0.1,  # 영업이익률 10% 가정
-                    "net_income": estimated_net_income,
-                    "ebitda": estimated_revenue * 0.12,
+                    "revenue": revenue,
+                    "operating_income": op_income,
+                    "net_income": net_income,
+                    "ebitda": ebitda,
                     "eps": eps,
-                    "operating_margin": 10.0,
-                    "net_margin": (estimated_net_income / estimated_revenue * 100)
-                    if estimated_revenue > 0
-                    else 0,
+                    "operating_margin": op_margin,
+                    "net_margin": net_margin,
                 },
                 "balance_sheet": {
-                    "total_assets": estimated_assets,
-                    "total_equity": estimated_equity,
-                    "total_debt": estimated_assets - estimated_equity,
-                    "current_assets": estimated_assets * 0.4,
-                    "current_liabilities": (estimated_assets - estimated_equity) * 0.5,
+                    "total_assets": total_assets,
+                    "total_equity": equity,
+                    "total_debt": total_assets - equity,
+                    "current_assets": total_assets * 0.4,
+                    "current_liabilities": (total_assets - equity) * 0.5,
                     "book_value_per_share": bps,
+                },
+                "cash_flow": {
+                    "operating_cash_flow": net_income * 1.1,
+                    "investing_cash_flow": -revenue * 0.08,
+                    "financing_cash_flow": -net_income * 0.4,
+                    "free_cash_flow": net_income * 0.7,
+                },
+                "market_data": {
+                    "current_price": current_price,
+                    "market_cap": market_cap,
+                    "shares_outstanding": shares_outstanding,
+                    "per": per,
+                    "pbr": pbr,
+                    "roe": roe,
+                    "ev_ebitda": _float(d.get("ev")),
+                },
+                "source": "Kiwoom",
+                "currency": "KRW",
+                "unit": "억원",
+                "market": self.get_market_type(symbol),
+            }
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def _get_financial_data_from_stock_listing(
+        self, symbol: str, current_price: float
+    ) -> dict[str, Any]:
+        """fdr.StockListing KRX 으로 시가총액/주식수 조회 후 추정 (최후 수단)"""
+        try:
+            listing = await asyncio.to_thread(fdr.StockListing, "KRX")
+            row = listing[listing["Code"] == symbol]
+            if row.empty:
+                raise FinancialAnalysisError(
+                    f"종목 {symbol}을 KRX 목록에서 찾을 수 없습니다.", "NO_STOCK_INFO"
+                )
+            market_cap = float(row.iloc[0].get("Marcap", 0)) / 100_000_000  # 억원
+            shares_outstanding = float(row.iloc[0].get("Stocks", 0))
+            per = current_price / 1 if current_price > 0 else 0  # 알 수 없음
+            pbr = 1.0  # 알 수 없음
+            estimated_revenue = market_cap * 1.5
+            estimated_net_income = market_cap * 0.05
+            equity = market_cap * 0.4
+            assets = equity * 2.5
+            return {
+                "income_statement": {
+                    "revenue": estimated_revenue,
+                    "operating_income": estimated_revenue * 0.1,
+                    "net_income": estimated_net_income,
+                    "ebitda": estimated_revenue * 0.12,
+                    "eps": current_price / per if per > 0 else 0,
+                    "operating_margin": 10.0,
+                    "net_margin": (estimated_net_income / estimated_revenue * 100) if estimated_revenue > 0 else 0,
+                },
+                "balance_sheet": {
+                    "total_assets": assets,
+                    "total_equity": equity,
+                    "total_debt": assets - equity,
+                    "current_assets": assets * 0.4,
+                    "current_liabilities": (assets - equity) * 0.5,
+                    "book_value_per_share": current_price / pbr,
                 },
                 "cash_flow": {
                     "operating_cash_flow": estimated_net_income * 1.1,
@@ -351,19 +447,15 @@ class FinancialClient:
                     "per": per,
                     "pbr": pbr,
                 },
-                "source": "FDR",
+                "source": "FDR-StockListing(추정)",
                 "currency": "KRW",
                 "unit": "억원",
                 "market": self.get_market_type(symbol),
             }
-
         except FinancialAnalysisError:
             raise
         except Exception as e:
-            logger.error(f"FDR data collection failed for {symbol}: {e}")
-            raise FinancialAnalysisError(
-                f"FinanceDataReader 데이터 수집 실패: {e}", "FDR_ERROR"
-            ) from e
+            raise FinancialAnalysisError(f"StockListing 조회 실패: {e}", "FDR_ERROR") from e
 
     async def _get_dart_financial_statements(self, code: str) -> dict[str, Any] | None:
         """

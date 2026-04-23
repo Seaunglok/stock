@@ -504,79 +504,38 @@ class FinancialAnalysisMCPServer(BaseMCPServer):
                 # 실제 재무 데이터 조회
                 financial_data = await self.financial_client.get_financial_data(symbol)
 
-                # 실제 배당 데이터 계산
-                # FinanceDataReader를 통한 실제 데이터 조회
-                import FinanceDataReader as fdr
-                from datetime import datetime, timedelta
+                # 재무 데이터에서 필요한 값 추출 (단위: 억원)
+                mkt = financial_data.get("market_data", {})
+                inc = financial_data.get("income_statement", {})
 
-                # 종목 정보 조회
-                stock_info = fdr.StockListing("KRX")
-                stock_row = stock_info[stock_info["Code"] == symbol]
+                net_income_eok = float(inc.get("net_income", 0))        # 억원
+                market_cap_eok = float(mkt.get("market_cap", 0))        # 억원
+                cur_price = float(mkt.get("current_price", 0)) or float(current_price)
+                shares_outstanding = float(mkt.get("shares_outstanding", 0))
 
-                if stock_row.empty:
-                    return self.create_error_response(
-                        error=f"종목코드 {symbol}을 찾을 수 없습니다",
-                        func_name="calculate_dividend_analysis",
-                        symbol=symbol,
-                    )
+                # 발행주식수 fallback (market_cap 억원 → 원 / 주가)
+                if shares_outstanding == 0 and market_cap_eok > 0 and cur_price > 0:
+                    shares_outstanding = market_cap_eok * 100_000_000 / cur_price
 
-                # 현재 주가 조회 (current_price가 0이면 실제 주가 사용)
-                if current_price == 0.0:
-                    end_date = datetime.now()
-                    start_date = end_date - timedelta(days=30)
-                    price_data = fdr.DataReader(symbol, start_date, end_date)
-                    if not price_data.empty:
-                        current_price = price_data["Close"].iloc[-1]
-                    else:
-                        current_price = 50000  # 기본값
-
-                # 재무 데이터에서 배당 정보 추출
-                net_income = financial_data.get("income_statement", {}).get(
-                    "net_income", 0
+                # 배당금 추정 (한국 평균 배당성향 35%)
+                estimated_payout_ratio = 35.0
+                total_dividend_eok = net_income_eok * (estimated_payout_ratio / 100) if net_income_eok > 0 else 0
+                # 주당 배당금: 억원 → 원 변환 후 주수로 나눔
+                dividend_per_share_won = (
+                    total_dividend_eok * 100_000_000 / shares_outstanding
+                    if shares_outstanding > 0 else 0
                 )
-
-                # 실제 배당금 정보 (FinanceDataReader의 한계로 추정치 사용)
-                # 한국 주식의 평균 배당성향 30~40% 가정
-                estimated_payout_ratio = 35.0  # 35% 배당성향
-
-                # 발행주식수 추정 (시가총액 / 현재주가)
-                market_cap = (
-                    float(stock_row["Marcap"].iloc[0])
-                    if not stock_row.empty
-                    else 1000000000000
-                )
-                total_shares = (
-                    market_cap / current_price if current_price > 0 else 1000000
-                )
-
-                # 배당금 추정
-                total_dividend = (
-                    net_income * (estimated_payout_ratio / 100) if net_income > 0 else 0
-                )
-                dividend_per_share = (
-                    total_dividend / total_shares if total_shares > 0 else 0
-                )
-
-                # 배당수익률 계산
-                dividend_yield = (
-                    (dividend_per_share / current_price * 100)
-                    if current_price > 0
-                    else 0
-                )
-
-                # 실제 배당성향 계산
-                payout_ratio = (
-                    (total_dividend / net_income * 100) if net_income > 0 else 0
-                )
+                dividend_yield = (dividend_per_share_won / cur_price * 100) if cur_price > 0 else 0
+                payout_ratio = estimated_payout_ratio  # 추정치이므로 가정값 그대로
 
                 result = {
                     "symbol": symbol,
-                    "current_price": current_price,
-                    "dividend_yield": round(dividend_yield, 2),
-                    "dividend_per_share": round(dividend_per_share, 0),
-                    "payout_ratio": round(payout_ratio, 2),
-                    "net_income": net_income,
-                    "total_shares": int(total_shares),
+                    "current_price": round(float(cur_price), 0),
+                    "dividend_yield": round(float(dividend_yield), 2),
+                    "dividend_per_share": round(float(dividend_per_share_won), 0),
+                    "payout_ratio": round(float(payout_ratio), 2),
+                    "net_income_eok": round(float(net_income_eok), 0),
+                    "total_shares": int(shares_outstanding),
                     "dividend_assessment": {
                         "yield_rating": "높음"
                         if dividend_yield >= 4
@@ -592,7 +551,8 @@ class FinancialAnalysisMCPServer(BaseMCPServer):
                         if payout_ratio <= 40 and dividend_yield >= 2
                         else "보통",
                     },
-                    "data_source": "FinanceDataReader (실제 데이터)",
+                    "data_source": "Kiwoom REST API",
+                    "note": "배당금은 배당성향 35% 기준 추정치입니다",
                 }
 
                 return self.create_standard_response(

@@ -868,13 +868,15 @@ class A2AMessageEngine:
 
                 consecutive_failures = 0  # 성공 시 리셋
 
-                # Task 상태 확인
+                # Task 상태 확인 (로깅 전에 상태 추출 — 이모지 포함 객체 로그 시 cp949 에러 방지)
                 task_status_obj = getattr(task, 'status', None)
-                logger.info(f"Task status object: {task_status_obj}")
                 if task_status_obj:
                     current_state = getattr(task_status_obj, 'state', None)
                     state_str = str(current_state).lower() if current_state else ""
 
+                    # 이모지 포함 가능성 있는 메시지는 ASCII 안전 로그
+                    safe_status = repr(task_status_obj).encode('ascii', errors='replace').decode('ascii')
+                    logger.info(f"Task status object: {safe_status}")
                     logger.info(f"Attempt {attempt + 1}: Task {task_id} state: {current_state} state_str: {state_str}")
 
                     if 'completed' in state_str:

@@ -7,10 +7,12 @@ langchain-mcp-adapters를 대체하며, Anthropic SDK가 직접 사용할 수 �
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AsyncExitStack
 from typing import Any
 
+import httpx
 import structlog
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -39,33 +41,51 @@ class MCPManager:
         self._exit_stack = AsyncExitStack()
         self._sessions: dict[str, ClientSession] = {}
 
+    _HEALTH_TIMEOUT = 3.0  # 서버 생존 확인 HTTP 타임아웃 (초)
+
     async def __aenter__(self) -> MCPManager:
         for server_name, url in self._server_urls.items():
+            if not await self._is_server_reachable(url):
+                logger.warning("MCP 서버 접근 불가 - 건너뜀", server=server_name, url=url)
+                continue
             try:
-                read, write, _ = await self._exit_stack.enter_async_context(
-                    streamablehttp_client(url)
-                )
-                session = await self._exit_stack.enter_async_context(
-                    ClientSession(read, write)
-                )
-                await session.initialize()
-                self._sessions[server_name] = session
-
-                tools_result = await session.list_tools()
-                for tool in tools_result.tools:
-                    self._anthropic_tools.append(self._to_anthropic_tool(tool))
-                    self._tool_server_map[tool.name] = server_name
-
-                logger.info(
-                    "MCP 서버 연결 완료",
-                    server=server_name,
-                    tool_count=len(tools_result.tools),
-                )
+                await self._connect_server(server_name, url)
             except Exception as e:
                 logger.warning("MCP 서버 연결 실패 - 건너뜀", server=server_name, error=str(e))
 
         logger.info("MCPManager 초기화 완료", total_tools=len(self._anthropic_tools))
         return self
+
+    async def _is_server_reachable(self, url: str) -> bool:
+        """MCP 서버에 HTTP로 빠르게 접근 가능한지 확인합니다."""
+        try:
+            async with httpx.AsyncClient(timeout=self._HEALTH_TIMEOUT) as client:
+                resp = await client.get(url)
+                return resp.status_code < 500
+        except Exception:
+            return False
+
+    async def _connect_server(self, server_name: str, url: str) -> None:
+        """단일 MCP 서버에 연결하고 도구 목록을 로드합니다."""
+        read, write, _ = await self._exit_stack.enter_async_context(
+            streamablehttp_client(url)
+        )
+        session = await self._exit_stack.enter_async_context(
+            ClientSession(read, write)
+        )
+        await session.initialize()
+        self._sessions[server_name] = session
+
+        tools_result = await session.list_tools()
+        for tool in tools_result.tools:
+            self._anthropic_tools.append(self._to_anthropic_tool(tool))
+            self._tool_server_map[tool.name] = server_name
+
+        logger.info(
+            "MCP 서버 연결 완료",
+            server=server_name,
+            tool_count=len(tools_result.tools),
+        )
 
     async def __aexit__(self, *args: Any) -> None:
         await self._exit_stack.aclose()

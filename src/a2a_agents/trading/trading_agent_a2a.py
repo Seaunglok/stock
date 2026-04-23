@@ -39,6 +39,9 @@ def _build_agent_card(url: str):
 
 
 def main():
+    from dotenv import load_dotenv
+    load_dotenv()
+
     logging.basicConfig(level=logging.INFO)
 
     host = os.getenv("AGENT_HOST", "localhost")

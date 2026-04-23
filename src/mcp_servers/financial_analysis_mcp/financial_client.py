@@ -268,13 +268,17 @@ class FinancialClient:
                     _symbol, current_price
                 )
 
-                # DART API가 있는 경우 상세 재무제표 조회
+                # DART API가 있는 경우 재무제표만 교체 (market_data·cash_flow 유지)
                 if self.dart_api_key:
                     try:
                         dart_data = await self._get_dart_financial_statements(_symbol)
                         if dart_data:
-                            financial_data.update(dart_data)
-                            financial_data["source"] = "FDR+DART"
+                            dart_year = dart_data.pop("dart_year", "")
+                            # income_statement·balance_sheet만 교체
+                            for key in ("income_statement", "balance_sheet"):
+                                if key in dart_data:
+                                    financial_data[key] = dart_data[key]
+                            financial_data["source"] = f"Kiwoom+DART({dart_year}년)"
                     except Exception as e:
                         logger.warning(f"DART API failed for {_symbol}: {e}")
 
@@ -458,12 +462,78 @@ class FinancialClient:
             raise FinancialAnalysisError(f"StockListing 조회 실패: {e}", "FDR_ERROR") from e
 
     async def _get_dart_financial_statements(self, code: str) -> dict[str, Any] | None:
-        """
-        DART API를 통한 상세 재무제표 조회
-        TODO: PublicDataReader DART API 구현
-        """
-        # 향후 DART API 연동 구현 예정
-        return None
+        """DART Open API로 실제 연결 재무제표 조회 (OpenDartReader 사용)"""
+        if not self.dart_api_key:
+            return None
+        try:
+            import OpenDartReader
+
+            dart = OpenDartReader(self.dart_api_key)
+
+            # 최신 회계연도 우선 시도 (직전년도 → 2년 전)
+            df = None
+            used_year = None
+            for year in [datetime.now().year - 1, datetime.now().year - 2]:
+                df = await asyncio.to_thread(dart.finstate, code, year)
+                if df is not None and not df.empty:
+                    used_year = year
+                    break
+
+            if df is None or df.empty:
+                return None
+
+            # 연결재무제표(CFS)만, 당기 금액 추출
+            cfs = df[df["fs_div"] == "CFS"].copy()
+
+            def _amount(names: list[str]) -> float:
+                """여러 가능한 계정명 중 첫 번째 매칭 값 반환 (원 → 억원)"""
+                for name in names:
+                    row = cfs[cfs["account_nm"] == name]
+                    if not row.empty:
+                        val = str(row.iloc[0]["thstrm_amount"]).replace(",", "").strip()
+                        try:
+                            return float(val) / 100_000_000
+                        except Exception:
+                            continue
+                return 0.0
+
+            revenue        = _amount(["매출액", "수익(매출액)"])
+            op_income      = _amount(["영업이익", "영업이익(손실)"])
+            net_income     = _amount(["당기순이익(손실)", "당기순이익", "분기순이익(손실)"])
+            total_assets   = _amount(["자산총계"])
+            total_equity   = _amount(["자본총계"])
+            current_assets = _amount(["유동자산"])
+            cur_liab       = _amount(["유동부채"])
+
+            if revenue == 0:
+                return None
+
+            total_debt = total_assets - total_equity
+            op_margin  = (op_income / revenue * 100) if revenue > 0 else 0
+            net_margin = (net_income / revenue * 100) if revenue > 0 else 0
+
+            # income_statement·balance_sheet만 교체 (market_data·cash_flow는 Kiwoom 유지)
+            return {
+                "income_statement": {
+                    "revenue": revenue,
+                    "operating_income": op_income,
+                    "net_income": net_income,
+                    "ebitda": op_income * 1.15,
+                    "operating_margin": op_margin,
+                    "net_margin": net_margin,
+                },
+                "balance_sheet": {
+                    "total_assets": total_assets,
+                    "total_equity": total_equity,
+                    "total_debt": total_debt,
+                    "current_assets": current_assets,
+                    "current_liabilities": cur_liab,
+                },
+                "dart_year": used_year,
+            }
+        except Exception as e:
+            logger.warning(f"DART API 조회 실패 ({code}): {e}")
+            return None
 
     # === 재무 비율 분석 메서드들 ===
 

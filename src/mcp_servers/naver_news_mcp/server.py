@@ -70,38 +70,24 @@ class NaverNewsMCPServer(BaseMCPServer):
 
     def _initialize_clients(self) -> None:
         """뉴스 분석 클라이언트 초기화"""
+        self.news_client = None
+        self._missing_keys: list[str] = []
+
+        required_vars = ["NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET"]
+        self._missing_keys = [v for v in required_vars if not os.getenv(v)]
+
+        if self._missing_keys:
+            logger.warning(
+                f"NAVER API 키 없음 — 도구 호출 시 오류 반환: {self._missing_keys}"
+            )
+            return
+
         try:
-            # 환경변수 검증
-            self._validate_environment()
-
-            # 뉴스 클라이언트 초기화
             self.news_client = NewsClient()
-
             logger.info("News analysis client initialized successfully")
-
         except Exception as e:
             logger.error(f"Failed to initialize news analysis client: {e}")
-            # 필수 환경변수 누락으로 인한 실패는 서버 시작 중단
-            if "필수 환경변수" in str(e) or "NAVER_CLIENT" in str(e):
-                raise
             self.news_client = None
-
-    def _validate_environment(self) -> None:
-        """환경변수 검증 - 필수"""
-        # 필수 환경변수들
-        required_vars = ["NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET"]
-
-        missing_vars = []
-        for var in required_vars:
-            if not os.getenv(var):
-                missing_vars.append(var)
-
-        if missing_vars:
-            error_msg = (
-                f"필수 환경변수가 설정되지 않았습니다: {', '.join(missing_vars)}"
-            )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
 
     def _register_tools(self) -> None:
         """MCP 도구들을 등록"""
@@ -127,8 +113,9 @@ class NaverNewsMCPServer(BaseMCPServer):
             """
             try:
                 if not self.news_client:
+                    msg = f"NAVER API 키 미설정: {self._missing_keys}" if self._missing_keys else "NewsClient not initialized"
                     return self.create_error_response(
-                        error="NewsClient not initialized",
+                        error=msg,
                         func_name="search_news_articles",
                         query=query,
                     )

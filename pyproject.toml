@@ -21,6 +21,8 @@ dependencies = [
     "publicdatareader>=1.1.0",
     "redis>=5.0.0",
     "structlog>=25.4.0",
+    "pykrx>=1.2.7",
+    "opendartreader>=0.2.3",
 ]
 
 [project.optional-dependencies]

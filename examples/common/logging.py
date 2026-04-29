@@ -91,7 +91,7 @@ def get_log_filename(prefix: str, suffix: str = "") -> str:
     표준화된 로그 파일명 생성
 
     Args:
-        prefix: 파일명 접두사 (예: "analysis_langgraph")
+        prefix: 파일명 접두사 (예: "analysis_a2a")
         suffix: 파일명 접미사 (기본값: "")
 
     Returns:

@@ -40,6 +40,7 @@ AGENT_MCP_SERVERS: dict[str, list[str]] = {
         "macroeconomic-analysis-mcp",
         "naver-news-mcp",
         "tavily-search-mcp",
+        "closing-bet-mcp",
     ],
     "trading": [
         "trading-domain",

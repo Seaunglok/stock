@@ -40,7 +40,7 @@ _SUB_AGENT_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "수집할 데이터에 대한 요청 (예: '삼성전자 현재가와 최근 뉴스 수집')",
+                    "description": "수집할 데이터에 대한 요청 (예: '현재가와 최근 뉴스 수집')",
                 }
             },
             "required": ["query"],

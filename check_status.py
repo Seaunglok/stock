@@ -29,6 +29,7 @@ SERVICES = [
     ("stock-analysis",   8042, "mcp",    "http://localhost:8042/mcp"),
     ("naver-news",       8050, "mcp",    "http://localhost:8050/mcp"),
     ("tavily-search",    3020, "mcp",    "http://localhost:3020/mcp"),
+    ("closing-bet",      8060, "mcp",    "http://localhost:8060/mcp"),
 ]
 
 def check(url: str, timeout: float = 2.0) -> tuple[bool, int]:

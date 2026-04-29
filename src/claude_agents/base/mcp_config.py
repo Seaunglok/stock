@@ -19,6 +19,8 @@ STANDARD_MCP_SERVERS: dict[str, str] = {
     # 외부 서비스
     "naver-news-mcp":           "http://localhost:8050/mcp",
     "tavily-search-mcp":        "http://localhost:3020/mcp",
+    # 종가배팅 (계산기)
+    "closing-bet-mcp":          "http://localhost:8060/mcp",
 }
 
 # 에이전트별 MCP 서버 그룹
@@ -26,8 +28,11 @@ AGENT_MCP_SERVERS: dict[str, list[str]] = {
     "data_collector": [
         "kiwoom-market-mcp",
         "kiwoom-info-mcp",
+        "investor-domain",
+        "financial-analysis-mcp",
         "naver-news-mcp",
         "tavily-search-mcp",
+        "closing-bet-mcp",
     ],
     "analysis": [
         "stock-analysis-mcp",

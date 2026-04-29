@@ -25,6 +25,11 @@ data/
 *coverage*
 node_modules/
 
+# Working artifacts (regenerable caches, PDFs)
+docs_cache/
+pdf_pages/
+*.pdf
+
 # AI Tools
 .serena/
 .claude/

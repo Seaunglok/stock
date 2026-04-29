@@ -25,6 +25,7 @@ SERVERS = [
     ("kiwoom_trade", "src.mcp_servers.kiwoom_mcp.domains.trading_domain"),
     ("kiwoom_inv",   "src.mcp_servers.kiwoom_mcp.domains.investor_domain"),
     ("kiwoom_port",  "src.mcp_servers.kiwoom_mcp.domains.portfolio_domain"),
+    ("closing_bet",  "src.mcp_servers.closing_bet_mcp.server"),
 ]
 
 

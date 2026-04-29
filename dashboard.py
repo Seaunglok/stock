@@ -8,6 +8,7 @@ import re
 import sys
 import json
 import uuid
+import queue
 import asyncio
 import argparse
 import threading
@@ -58,9 +59,12 @@ KOREAN_TICKERS = {
     "086790": "하나금융", "316140": "우리금융",
 }
 
-# 채팅 작업 추적 (in-memory)
+# 채팅 작업 추적 (in-memory) — 단일 워커가 큐를 소비해 한 번에 1개만 Supervisor 호출
 _chats: dict[str, dict] = {}
 _chats_lock = threading.Lock()
+_chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+_worker_started = False
+_worker_lock = threading.Lock()
 
 
 def check_service(url: str, timeout: float = 1.5) -> tuple[bool, int]:
@@ -158,30 +162,73 @@ async def _ask_supervisor_async(chat_id: str, question: str):
         _set(state="failed", error=str(e), finished_at=datetime.now().isoformat())
 
 
-def _run_in_thread(chat_id: str, question: str):
-    asyncio.run(_ask_supervisor_async(chat_id, question))
+def _queue_position(cid: str) -> int:
+    """현재 큐에서 해당 chat 의 대기 순번 (1-based, 0이면 즉시 실행 예정)"""
+    with _chats_lock:
+        waiting = [c for c in _chats.values() if c["state"] == "queued"]
+    waiting.sort(key=lambda c: c["started_at"])
+    for i, c in enumerate(waiting):
+        if c["id"] == cid:
+            return i + 1
+    return 0
+
+
+def _worker_loop():
+    """큐를 직렬 소비해 Supervisor 동시 호출이 1개를 넘지 않게 한다."""
+    while True:
+        cid, question = _chat_queue.get()
+        try:
+            with _chats_lock:
+                if cid in _chats:
+                    _chats[cid]["state"] = "working"
+                    _chats[cid]["dequeued_at"] = datetime.now().isoformat()
+            asyncio.run(_ask_supervisor_async(cid, question))
+        except Exception as e:
+            with _chats_lock:
+                if cid in _chats:
+                    _chats[cid].update(
+                        state="failed", error=str(e),
+                        finished_at=datetime.now().isoformat(),
+                    )
+        finally:
+            _chat_queue.task_done()
+
+
+def _ensure_worker():
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        threading.Thread(target=_worker_loop, daemon=True).start()
+        _worker_started = True
 
 
 def submit_chat(question: str) -> str:
+    _ensure_worker()
     cid = uuid.uuid4().hex[:12]
     with _chats_lock:
         _chats[cid] = {
             "id": cid,
             "question": question,
-            "state": "working",
+            "state": "queued",
             "answer": None,
             "error": None,
             "started_at": datetime.now().isoformat(),
+            "dequeued_at": None,
             "finished_at": None,
         }
-    t = threading.Thread(target=_run_in_thread, args=(cid, question), daemon=True)
-    t.start()
+    _chat_queue.put((cid, question))
     return cid
 
 
 def list_chats() -> list[dict]:
     with _chats_lock:
-        return sorted(_chats.values(), key=lambda c: c["started_at"], reverse=True)[:20]
+        chats = sorted(_chats.values(), key=lambda c: c["started_at"], reverse=True)[:20]
+        chats = [dict(c) for c in chats]
+    for c in chats:
+        if c["state"] == "queued":
+            c["queue_position"] = _queue_position(c["id"])
+    return chats
 
 
 def get_chat(cid: str) -> dict | None:
@@ -235,6 +282,7 @@ HTML_PAGE = r"""<!doctype html>
   .b-working { background: #9e6a03; color: #ffd33d; }
   .b-failed { background: #67060c; color: #ff7b72; }
   .b-submitted { background: #1f6feb; color: #cae8ff; }
+  .b-queued { background: #30363d; color: #8b949e; }
   .empty { color: #6e7681; font-style: italic; font-size: 12px; }
   .footer { text-align: center; color: #6e7681; font-size: 11px; margin-top: 20px; }
 
@@ -261,6 +309,7 @@ HTML_PAGE = r"""<!doctype html>
   .chat-a { background: #161b22; padding: 12px; border-radius: 4px;
             border-left: 3px solid #3fb950; max-height: 600px; overflow-y: auto; }
   .chat-a.working { border-left-color: #d29922; }
+  .chat-a.queued { border-left-color: #6e7681; }
   .chat-a.failed { border-left-color: #f85149; }
   .chat-a h1, .chat-a h2, .chat-a h3 { margin-top: 12px; margin-bottom: 6px; }
   .chat-a h1 { font-size: 18px; } .chat-a h2 { font-size: 16px; } .chat-a h3 { font-size: 14px; }
@@ -406,8 +455,12 @@ async function refreshChats() {
     document.getElementById('chats').innerHTML = list.map(c => {
       const stateBadge = badge(c.state);
       let body;
-      if (c.state === 'working') {
-        body = `<div class="working-indicator">Supervisor가 답변 작성 중 (${elapsed(c.started_at)})</div>`;
+      if (c.state === 'queued') {
+        const pos = c.queue_position || '?';
+        body = `<div class="working-indicator">대기 중 (큐 ${pos}번째, ${elapsed(c.started_at)})</div>`;
+      } else if (c.state === 'working') {
+        const since = c.dequeued_at || c.started_at;
+        body = `<div class="working-indicator">Supervisor가 답변 작성 중 (${elapsed(since)})</div>`;
       } else if (c.state === 'failed') {
         body = `<div style="color:#ff7b72">실패: ${escapeHtml(c.error || '')}</div>`;
       } else {

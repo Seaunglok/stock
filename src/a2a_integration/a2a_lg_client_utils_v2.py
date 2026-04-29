@@ -78,7 +78,7 @@ from a2a.types import (
 )
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 
-from src.lg_agents.base.a2a_interface import A2AOutput
+from src.a2a_integration.a2a_output import A2AOutput
 
 logger = structlog.get_logger(__name__)
 wrapper_logger = logging.getLogger(__name__)
@@ -469,7 +469,7 @@ class A2AMessageEngine:
         if task_id:
             logger.info(f"Always polling for NEW task completion (task_id: {task_id})")
 
-            completed_task = await self._wait_for_task_completion(task_id)
+            completed_task = await self._wait_for_task_completion(task_id, max_wait=600)
 
             if completed_task:
                 text_accumulator = await self._extract_task_results(completed_task, response, text_accumulator)

@@ -16,6 +16,7 @@ class TechnicalScores:
     candle_shape: float = 0.0          # 기준 4
     consolidation: float = 0.0         # 기준 5
     institutional: float = 0.0         # 기준 6
+    catalyst: float = 0.0              # 기준 1 (재료 — DART 공시 기반)
     breakdown: dict[str, Any] = field(default_factory=dict)
 
     def composite(self) -> float:
@@ -34,6 +35,7 @@ class TechnicalScores:
             "candle_shape": round(self.candle_shape, 1),
             "consolidation": round(self.consolidation, 1),
             "institutional": round(self.institutional, 1),
+            "catalyst": round(self.catalyst, 1),
             "composite": round(self.composite(), 1),
             "breakdown": self.breakdown,
         }
@@ -232,23 +234,288 @@ def score_institutional(
     }
 
 
+# 재료 점수: 호재 키워드 → 가산 / 악재 키워드 → 감점.
+# 사용처(score_catalyst)에서 단순 매칭만 한다 — 형태소 분석 없이 부분 일치.
+_CATALYST_POSITIVE = [
+    "단일판매ㆍ공급계약", "단일판매·공급계약", "공급계약체결",
+    "신규시설투자", "신규 시설투자",
+    "타법인주식및출자증권취득결정", "주식취득결정",
+    "유형자산양수", "영업양수",
+    "자기주식취득", "자기주식 소각",
+    "무상증자",
+    "주식분할",
+    "신규사업", "사업목적추가",
+    "임상시험결과", "임상결과", "품목허가", "신약허가",
+    "특허취득",
+    "흑자전환", "영업이익증가",
+    "수주", "수주공시",
+    "합병", "분할합병",
+    "배당증가", "현금배당",
+]
+
+_CATALYST_NEGATIVE = [
+    "유상증자", "전환사채발행", "신주인수권부사채",
+    "감자",
+    "영업정지", "관리종목지정",
+    "회생절차", "거래정지",
+    "소송", "고발",
+    "유형자산양도",
+    "적자전환", "영업이익감소",
+    "최대주주변경",  # 중립~부정 (덤핑 가능성)
+]
+
+
+def score_catalyst(
+    disclosures: list[dict],
+    target_date: str,
+    lookback_days: int = 3,
+) -> tuple[float, dict[str, Any]]:
+    """기준 1: 재료 — DART 공시 기반.
+
+    target_date(YYYY-MM-DD) 기준 직전 lookback_days 영업일 이내의 공시를 보고
+    호재 키워드 → 가산, 악재 키워드 → 감점.
+    가까운 공시일수록 가중 (T-0=1.0, T-1=0.7, T-2=0.4, ...).
+
+    Args:
+        disclosures: load_disclosures()의 출력 — [{"date","report_nm","rcept_no"}]
+        target_date: 평가 시점 (보통 종가 매수 검토일)
+        lookback_days: 며칠 이내 공시까지 인정할지 (영업일 아닌 달력일)
+
+    Returns: (score 0~100, breakdown dict)
+    """
+    if not disclosures:
+        return 0.0, {"reason": "공시 없음"}
+
+    from datetime import date, timedelta
+    try:
+        td = date.fromisoformat(target_date)
+    except ValueError:
+        return 0.0, {"reason": "target_date 형식 오류"}
+
+    score = 0.0
+    matched: list[dict] = []
+    for d in disclosures:
+        try:
+            dd = date.fromisoformat(d["date"])
+        except (ValueError, KeyError):
+            continue
+        # target_date 당일 이전 lookback_days 이내만 (당일 포함, 미래 제외)
+        delta = (td - dd).days
+        if delta < 0 or delta > lookback_days:
+            continue
+
+        recency = max(0.0, 1.0 - delta * 0.3)  # 0d=1.0, 1d=0.7, 2d=0.4, 3d=0.1
+        title = d.get("report_nm", "").replace(" ", "")
+
+        hit_pos = next((k for k in _CATALYST_POSITIVE if k.replace(" ", "") in title), None)
+        hit_neg = next((k for k in _CATALYST_NEGATIVE if k.replace(" ", "") in title), None)
+
+        if hit_pos:
+            delta_score = 35.0 * recency
+            score += delta_score
+            matched.append({"date": d["date"], "report_nm": d.get("report_nm", ""),
+                            "kind": "+", "keyword": hit_pos, "delta": round(delta_score, 1)})
+        elif hit_neg:
+            delta_score = -25.0 * recency
+            score += delta_score
+            matched.append({"date": d["date"], "report_nm": d.get("report_nm", ""),
+                            "kind": "-", "keyword": hit_neg, "delta": round(delta_score, 1)})
+
+    score = max(0.0, min(100.0, score))
+    return score, {
+        "target_date": target_date,
+        "lookback_days": lookback_days,
+        "n_disclosures_in_window": sum(
+            1 for d in disclosures
+            if 0 <= (td - date.fromisoformat(d["date"])).days <= lookback_days
+        ) if disclosures else 0,
+        "matched": matched,
+    }
+
+
 def compute_technical_scores(
     ohlcv: list[dict],
     foreign_net_5d: float | None = None,
     institutional_net_5d: float | None = None,
+    disclosures: list[dict] | None = None,
+    target_date: str | None = None,
 ) -> TechnicalScores:
-    """5개 기술 점수 계산 + 합산"""
+    """6개 점수 계산 + 합산. disclosures/target_date 가 있으면 catalyst 도 채움."""
     ts = TechnicalScores()
     ts.volume_surge, vs_b = score_volume_surge(ohlcv)
     ts.resistance_proximity, rp_b = score_resistance_proximity(ohlcv)
     ts.candle_shape, cs_b = score_candle_shape(ohlcv)
     ts.consolidation, co_b = score_consolidation(ohlcv)
     ts.institutional, in_b = score_institutional(foreign_net_5d, institutional_net_5d)
+    if disclosures is not None and target_date is not None:
+        ts.catalyst, ca_b = score_catalyst(disclosures, target_date)
+    else:
+        ts.catalyst, ca_b = 0.0, {"reason": "공시 데이터 미제공"}
     ts.breakdown = {
         "volume_surge": vs_b,
         "resistance_proximity": rp_b,
         "candle_shape": cs_b,
         "consolidation": co_b,
         "institutional": in_b,
+        "catalyst": ca_b,
+    }
+    return ts
+
+
+# ───────────────────────────────────────────────────────────────────
+# v2 — 2026-05-05 회귀 결과(저항이격·캔들이 음신호)에 따른 재설계.
+# ohlcv 데이터 입력 인터페이스는 v1과 동일.
+# ───────────────────────────────────────────────────────────────────
+
+
+def score_resistance_proximity_v2(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
+    """기준 3 (재설계): 60일 전고 돌파/깊은 눌림에 가산.
+
+    v1은 "거의 고점(-8 ~ -3%)"을 만점으로 봤는데 회귀에서 음신호로 드러남
+    (매물대 부담 → 익일 시초가 매도 압력 가설). v2는 분포를 뒤집는다:
+
+    - gap > +2%        → 100 (fresh breakout)
+    - 0 < gap ≤ +2%    → 80  (직전 고점 돌파 직후)
+    - -3 ≤ gap ≤ 0     → 60  (전고 직하, 모멘텀 잔존)
+    - -10 ≤ gap < -3   → 25  (예전 v1 만점 구간 — 매물대)
+    - -25 ≤ gap < -10  → 70  (깊은 눌림에서 회복 진입 후보)
+    - gap < -25        → 30  (낙폭 과대, 추세 회복 미확인)
+    """
+    if not ohlcv or len(ohlcv) < 60:
+        return 0.0, {"reason": "데이터 부족 (>=60봉 필요)"}
+
+    recent = ohlcv[-60:]
+    high_60 = max(_g(d, "high") for d in recent)
+    close = _g(ohlcv[-1], "close")
+    if high_60 <= 0:
+        return 0.0, {"reason": "고가 0"}
+
+    gap_pct = (close - high_60) / high_60 * 100.0
+
+    if gap_pct > 2.0:
+        score = 100.0
+    elif gap_pct > 0.0:
+        score = 80.0
+    elif gap_pct >= -3.0:
+        score = 60.0
+    elif gap_pct >= -10.0:
+        score = 25.0
+    elif gap_pct >= -25.0:
+        score = 70.0
+    else:
+        score = 30.0
+
+    return score, {
+        "high_60d": high_60,
+        "current": close,
+        "gap_pct": round(gap_pct, 2),
+        "regime": (
+            "breakout" if gap_pct > 0 else
+            "near_high" if gap_pct >= -3 else
+            "supply_zone" if gap_pct >= -10 else
+            "deep_pullback" if gap_pct >= -25 else
+            "extreme_drawdown"
+        ),
+    }
+
+
+def score_candle_shape_v2(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
+    """기준 4 (재설계): 종가 위꼬리에 가산.
+
+    v1은 "위꼬리 짧고 양봉"을 보상했는데 회귀에서 음신호.
+    가설: 위꼬리 = 장중 매도세 분출 → 익일 시초가에 추격매수 들어올 여지 큼.
+    또한 v1에서 양봉 가산점 +10이 너무 일률적 → v2는 비율 자체에 비례.
+
+    - upper_wick_ratio ≥ 0.4 → 100
+    - 0.2 ≤ ratio < 0.4      → 60
+    - 0.05 ≤ ratio < 0.2     → 30
+    - ratio < 0.05           → 10 (위꼬리 거의 없음 = 추가 상방 여력 적음)
+    """
+    if not ohlcv:
+        return 0.0, {"reason": "데이터 없음"}
+
+    last = ohlcv[-1]
+    o, h, l, c = _g(last, "open"), _g(last, "high"), _g(last, "low"), _g(last, "close")
+    body_top = max(o, c)
+    rng = h - l
+    if rng <= 0:
+        return 50.0, {"reason": "변동 없음"}
+
+    upper_wick_ratio = (h - body_top) / rng
+
+    if upper_wick_ratio >= 0.4:
+        score = 100.0
+    elif upper_wick_ratio >= 0.2:
+        score = 60.0
+    elif upper_wick_ratio >= 0.05:
+        score = 30.0
+    else:
+        score = 10.0
+
+    return score, {
+        "open": o, "high": h, "low": l, "close": c,
+        "upper_wick_ratio": round(upper_wick_ratio, 3),
+        "is_bullish": c >= o,
+    }
+
+
+def compute_technical_scores_hybrid(
+    ohlcv: list[dict],
+    foreign_net_5d: float | None = None,
+    institutional_net_5d: float | None = None,
+    disclosures: list[dict] | None = None,
+    target_date: str | None = None,
+) -> TechnicalScores:
+    """하이브리드 — volume v1 / candle v2 / consolidation v1 / resistance v1.
+
+    회귀에서 candle만 v2가 부호 반전(+) 됐다.
+    resistance v2는 음신호 중화에 그쳐 의미 없음 → v1 유지(가중 0으로 중립화).
+    """
+    ts = TechnicalScores()
+    ts.volume_surge, vs_b = score_volume_surge(ohlcv)
+    ts.resistance_proximity, rp_b = score_resistance_proximity(ohlcv)
+    ts.candle_shape, cs_b = score_candle_shape_v2(ohlcv)
+    ts.consolidation, co_b = score_consolidation(ohlcv)
+    ts.institutional, in_b = score_institutional(foreign_net_5d, institutional_net_5d)
+    if disclosures is not None and target_date is not None:
+        ts.catalyst, ca_b = score_catalyst(disclosures, target_date)
+    else:
+        ts.catalyst, ca_b = 0.0, {"reason": "공시 데이터 미제공"}
+    ts.breakdown = {
+        "volume_surge": vs_b,
+        "resistance_proximity": rp_b,
+        "candle_shape": cs_b,
+        "consolidation": co_b,
+        "institutional": in_b,
+        "catalyst": ca_b,
+    }
+    return ts
+
+
+def compute_technical_scores_v2(
+    ohlcv: list[dict],
+    foreign_net_5d: float | None = None,
+    institutional_net_5d: float | None = None,
+    disclosures: list[dict] | None = None,
+    target_date: str | None = None,
+) -> TechnicalScores:
+    """v2 scorer — resistance_proximity·candle_shape 재설계 적용 + catalyst 옵션."""
+    ts = TechnicalScores()
+    ts.volume_surge, vs_b = score_volume_surge(ohlcv)
+    ts.resistance_proximity, rp_b = score_resistance_proximity_v2(ohlcv)
+    ts.candle_shape, cs_b = score_candle_shape_v2(ohlcv)
+    ts.consolidation, co_b = score_consolidation(ohlcv)
+    ts.institutional, in_b = score_institutional(foreign_net_5d, institutional_net_5d)
+    if disclosures is not None and target_date is not None:
+        ts.catalyst, ca_b = score_catalyst(disclosures, target_date)
+    else:
+        ts.catalyst, ca_b = 0.0, {"reason": "공시 데이터 미제공"}
+    ts.breakdown = {
+        "volume_surge": vs_b,
+        "resistance_proximity": rp_b,
+        "candle_shape": cs_b,
+        "consolidation": co_b,
+        "institutional": in_b,
+        "catalyst": ca_b,
     }
     return ts

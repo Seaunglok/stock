@@ -1,0 +1,29 @@
+ PRODUCTION MODE Ȱ��ȭ�� - �ǰŷ� ����!
+Unexpected error during token acquisition: 'token'
+[universe] 키움 호출 실패 (Token acquisition error: 'token'); 폴백 → universe_kiwoom_20260430.json
+[load] 마스터 풀 500종목, 2025-01-01 ~ 2026-04-30
+[load] 매일 universe = 이 풀에서 5일 평균 거래대금 상위 200
+  [50/500] OK 50 / 실패 0
+  [100/500] OK 100 / 실패 0
+  [150/500] OK 150 / 실패 0
+  [200/500] OK 200 / 실패 0
+  [250/500] OK 250 / 실패 0
+  [300/500] OK 300 / 실패 0
+  [350/500] OK 350 / 실패 0
+  [400/500] OK 400 / 실패 0
+  [450/500] OK 450 / 실패 0
+  [500/500] OK 500 / 실패 0
+[load] 완료 OK 500종목 / 실패 0건
+[1/3] 회귀 샘플 수집 (rolling universe)...
+  샘플 46001건, X shape=(46001, 4)
+[2/3] OLS 회귀...
+  R²=0.0034, intercept=+0.6937
+  volume_surge: coef=+0.00463  → weight=0.904
+  resistance_proximity: coef=-0.00453  → weight=0.000
+  candle_shape: coef=-0.00226  → weight=0.000
+  consolidation: coef=+0.00049  → weight=0.096
+[3/3] 백테스트 비교 (기존 가중치 vs 신규 가중치, rolling)...
+  기존: 1153건 승률 51.0% 평균 +0.80%
+  신규: 1143건 승률 52.8% 평균 +0.86%
+
+[저장] docs\tune_weights_rolling.md

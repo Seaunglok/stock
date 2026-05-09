@@ -149,12 +149,19 @@ DataCollector 가 closing-bet-mcp 로 점수화한 후보 리스트를 넘겨주
 ### 워크플로우
 1. **룰 컨텍스트 확인** — `get_strategy_rules` (closing-bet-mcp)로 신정재 룰 다시 읽기.
    닫힌 공식 점수는 **재계산하지 않는다** — DataCollector 결과 그대로 신뢰.
-2. **상위 후보(최대 3개)에만** 4차원 분석 적용:
+2. **PLAYBOOK A 적용 (Breadth-Regime Gate)** — 후보 진입 전 시장 레짐 먼저 판정.
+   `weak` 레짐이면 후보를 모두 보류하고 사유와 함께 즉시 종료.
+3. **PLAYBOOK B 적용 (VCP-style Multi-Criteria Filter)** — 점수 정렬 외에
+   "volume_surge ≥ 80 AND (consolidation ≥ 50 OR ATR 수축)" 게이트 통과한 종목만
+   상위 후보로 인정. 합산 점수는 닫혀 있으니 손대지 않고 *필터*로만 사용.
+4. **상위 후보(최대 3개)에만** 4차원 분석 적용:
    - 기술적: `analyze_chart_patterns`, `identify_support_resistance` (저항 이격 검증)
    - 기본적: `get_financial_ratios` (PER/부채비율 — 펀더멘털 결격 종목 거르기)
    - 거시: `assess_sector_trends` (매칭 트렌드의 업종 모멘텀 검증)
    - 감성: `analyze_news_sentiment` (catalyst 점수의 방향성 검증)
-3. **종베 적합도 판정** — 4차원 신호가 점수와 일관되는지 확인.
+5. **PLAYBOOK C 적용 (Score-Weighted Position Sizer)** — 추천 종목별로
+   점수 구간·ATR 기반 권장 사이즈/손절폭을 산출해 결과에 첨부.
+6. **종베 적합도 판정** — 4차원 신호가 점수와 일관되는지 확인.
    - 일관 → 그대로 추천 / 신뢰도 상향
    - 모순(예: 점수 높지만 펀더멘털 적신호) → 제외하거나 신뢰도 하향
 
@@ -175,6 +182,195 @@ DataCollector 가 closing-bet-mcp 로 점수화한 후보 리스트를 넘겨주
 - closing-bet-mcp 점수는 **공식이 닫혀있으니 재계산 금지** — 검증만.
 - 후보가 5개 이상이면 상위 3개만 4차원 분석 (토큰 절약).
 - 4차원 중 하나라도 적신호면 신뢰도를 50% 이하로 떨어뜨려 명시.
+
+---
+
+## 📘 ANALYSIS PLAYBOOKS
+
+`tradermonty/claude-trading-skills` 의 트레이딩 스킬을 한국 시장 + 우리 MCP 스택에
+맞춰 재작성한 분석 플레이북. 종베 분석 모드(또는 사용자가 명시적으로 호출)에서
+선택적으로 적용한다. 합산 점수 공식 자체는 변경하지 않으며 **게이트/사이저** 형태로만
+개입한다 — 2026-05-06 백테스트에서 선형 가중평균이 천장에 닿았다는 결론에 따른 설계.
+
+---
+
+### PLAYBOOK A — Breadth-Regime Gate
+
+**목적**: 약세 레짐 픽 차단으로 픽 풀 축소 → 픽 평균 승률 상향. 자동매매의 첫
+번째 안전장치.
+
+**트리거**: 종베 분석 모드 진입 시 항상 1회 실행. 결과는 후속 플레이북에 컨텍스트로
+전달.
+
+**입력 도구**:
+- `kiwoom-market-mcp` 의 `get_index_info`(KOSPI/KOSDAQ 당일 등락률), 등락 종목 수
+  통계 도구가 있다면 그것도. (없으면 `get_volume_ranking` 의 양/음봉 분포로 근사)
+- 가능하면 `kiwoom-info-mcp`/`kiwoom-market-mcp` 의 신고가·신저가 종목 수.
+
+**판정 룰** (단순·결정론적 / 2026-05-08 백테스트 검증 기준):
+| 조건 | 레짐 |
+|---|---|
+| KOSPI 등락률 > +0.5% AND 상승종목/전체 ≥ 0.55 | `strong` |
+| KOSPI 등락률 < -1.0% OR 상승종목/전체 < 0.35 | `weak` |
+| 그 외 | `neutral` |
+
+> **검증 결과 (2025-01-01~2026-04-30, v1+new 가중치):**
+> weak 레짐 픽이 58.7% 승률 / +1.10% 평균으로 가장 우수 (strong 52.2%, neutral 50.2%).
+> → "약세장 종베가 가장 잘 먹힌다"는 결론. KOSPI 실측값 기반이므로 신뢰도 높음.
+
+**출력 스키마**:
+```json
+{"regime": "strong|neutral|weak",
+ "kospi_today_pct": 0.0,
+ "advance_ratio": 0.0,
+ "new_high_low": [n_high, n_low],
+ "score_threshold_suggest": 50.0,
+ "gate_decision": "PASS|HOLD|BLOCK",
+ "rationale": "..."}
+```
+
+**후속 동작** (백테스트 검증 결과 반영):
+- `weak` → **PRIORITY** — 종베 최우선 실행. threshold 50 그대로, 픽 그대로.
+  사용자에게 "약세장 — 종베 유효 (역발상)" 명시.
+- `neutral` → threshold 65 로 상향 (픽 축소로 질 향상).
+- `strong` → threshold 70 으로 상향 추천. 강세장 volume 신호 변별력 낮음.
+  `CAUTION` 표시 — "강세장이라 volume 신호 노이즈↑" 안내.
+
+---
+
+### PLAYBOOK B — VCP-Style Multi-Criteria Filter
+
+**목적**: 합산 점수 정렬 단독으로는 잡히지 않는 "약한 신호 다수 합산" 종목을
+배제. 2026-05-06 §6 의 룰 기반 필터링 노선을 분석 단계에서 선반영.
+
+**트리거**: PLAYBOOK A 가 `BLOCK` 이 아닐 때 후보 리스트에 적용.
+
+**입력**: DataCollector 가 넘긴 후보별 컴포넌트 점수
+(`volume_surge`, `resistance_proximity`, `candle_shape`, `consolidation`).
+
+**게이트 룰** (모두 만족해야 통과):
+1. `volume_surge ≥ 80` — 유의미한 거래량 신호 (마진의 대부분이 여기서 옴)
+2. `consolidation ≥ 50` **또는** ATR 수축 확인 (`stock-analysis-mcp` 의 ATR 도구)
+3. `composite ≥ threshold` (PLAYBOOK A 가 정한 동적 threshold)
+
+**후속 동작**:
+- 통과 = 상위 후보로 4차원 분석 진행.
+- 탈락 = 후보 리스트에 "filtered_out: rule" 로 표시하되 사용자에게는 보고하지 않음
+  (노이즈).
+- 통과 후보가 0개면 PLAYBOOK A 의 `gate_decision` 을 `HOLD` 로 격상하고 종료.
+
+**출력 스키마**:
+```json
+{"passed": [{"code": "...", "composite": 87, "components": {...}}],
+ "filtered": [{"code": "...", "reason": "volume_surge<80"}]}
+```
+
+---
+
+### PLAYBOOK C — Score-Weighted Position Sizer
+
+**목적**: 승률을 직접 올리지 못해도 EV 를 끌어올림. 점수 구간·ATR 손절폭으로
+신호 강도에 사이즈를 비례. 라이브 거래 코드는 변경하지 않고 **권장값** 만 출력.
+
+**트리거**: 4차원 분석 통과한 최종 추천 종목에 대해 1회.
+
+**입력 도구**:
+- `stock-analysis-mcp` 의 `calculate_technical_indicators` (ATR 14일)
+- `portfolio-domain` 의 `get_portfolio_status` (현재 자본)
+
+**산식**:
+- 점수 구간 → 자본 대비 사이즈 (강한 신호에 큰 베팅):
+  - `composite ≥ 85` → 자본의 **8%**
+  - `70 ≤ composite < 85` → **5%**
+  - `composite < 70` → **2%** (또는 PLAYBOOK B 통과 못했으면 0)
+- 손절폭 = `max(2.0%, 1.5 × ATR/close)` — ATR 기반 변동성 정규화
+- 익절 1차 = 손절폭 × 1.5 (R:R 1.5)
+
+**출력 스키마** (종목별):
+```json
+{"code": "...",
+ "size_pct_of_equity": 5.0,
+ "stop_pct": 2.4,
+ "tp1_pct": 3.6,
+ "atr_pct": 1.6,
+ "rationale": "score 78 → 5%, ATR 1.6% → stop 2.4%"}
+```
+
+**중요**: TradingAgent 는 자체 리스크 평가 도구를 별도로 돌린다. PLAYBOOK C 결과는
+**참고용 권장**일 뿐, TradingAgent 의 `calculate_position_size`/`set_risk_parameters`
+판단을 우선한다.
+
+---
+
+---
+
+### PLAYBOOK D — Regime-Adaptive Strategy Selector (레짐 연동 전략 분기)
+
+**목적**: PLAYBOOK A 의 레짐 결과를 받아 시장 상황에 맞는 최적 전략으로 자동 분기.
+백테스트(2025-01-01~2026-04-30, kiwoom-top 500) 검증 결과 D+E-vol (섹터RS필터+거래량) 조합이
+baseline 대비 +1.3pp 개선 (54.1% / +0.92%). 특히 neutral 레짐 **56.0% / +1.05%** 최우수.
+
+**트리거**: 종베 분석 모드에서 PLAYBOOK A 판정 후 자동 적용.
+
+**분기 규칙**:
+| 레짐 | 선택 전략 | 실증 결과 |
+|------|-----------|---------|
+| `weak` | 종가매매 (PLAYBOOK B) | 53.5% / +0.89% (proxy기반). KOSPI 실측 시 58.7% / +1.10% |
+| `neutral` | 섹터RS필터 + 거래량 스코어러 (PLAYBOOK E-vol) | **56.0% / +1.05%** ← 최우수 |
+| `strong` | 섹터RS필터 + 거래량 스코어러 (PLAYBOOK E-vol) | 52.4% / +0.71% |
+
+**섹터RS+거래량 전략 (neutral / strong 레짐)**:
+- **Step 1 – 섹터 선별**: universe 내 종목의 20일 수익률 RS 백분위 계산 → 섹터별 평균 → 상위 2개 섹터 선정
+- **Step 2 – 종목 스코어링**: 선정된 섹터 내 종목만 `volume_surge 0.70 + consolidation 0.30` 으로 채점
+- **진입/청산**: 종가 매수 → 익일 시초가 매도 (1일 보유)
+- **RS는 섹터 선별 도구로만 사용** — 개별 종목 순위는 거래량 신호로 결정
+
+**출력 스키마**:
+```json
+{"regime": "strong|neutral|weak",
+ "selected_strategy": "종가매매|섹터RS+거래량",
+ "top_sectors": ["전기/전자", "증권"],
+ "candidates": [{"code": "...", "volume_surge": 82, "sector": "전기/전자"}],
+ "rationale": "..."}
+```
+
+---
+
+### PLAYBOOK E-vol — Sector RS Filter + Volume Scorer (섹터RS 필터 + 거래량 스코어러)
+
+**목적**: PLAYBOOK D 의 neutral/strong 레짐 전략. RS는 섹터 선별에만 쓰고,
+개별 종목 선정은 거래량 급증으로 결정한다. RS 단독 모멘텀보다 실증 우위 확인.
+
+**트리거**: PLAYBOOK D 가 neutral/strong 레짐 판정했을 때.
+
+**섹터 분류** (Kiwoom 업종명 기준):
+전기/전자 / 운송장비·부품 / 증권 / 금융 / 건설 / 일반서비스 / IT서비스 / 오락·문화 /
+제약 / 의료·정밀기기 / 화학 / 기계·장비 / 기타 (업종 없으면 "기타")
+
+**적용 절차**:
+1. universe 내 각 종목 20일 RS 백분위 계산
+2. 섹터별 평균 RS 집계 → 상위 2개 섹터 선정
+3. 선정 섹터 종목에만 `volume_surge × 0.70 + consolidation × 0.30` 적용
+4. 점수 상위 top-N 픽 출력
+
+**중요**: 섹터 필터는 종가매매(weak 레짐)에는 적용하지 않는다. weak 레짐은 공황
+반전이므로 섹터 무관하게 volume 신호가 강한 모든 종목이 대상.
+
+---
+
+### 플레이북 호출 라우팅
+
+| 사용자/Supervisor 입력 신호 | 적용 플레이북 |
+|---|---|
+| "종가배팅", "종베", "오늘 매수 후보" + 후보 리스트 동반 | A → D → (weak: B→4차원→C) (neutral/strong: E-vol→4차원→C) |
+| "시장 레짐만 확인" | A 만 |
+| "이 후보들 자동매매에 넣어도 돼?" | A → D → C (4차원 생략 가능) |
+| 일반 종목 분석 | 플레이북 미적용 (기존 4차원만) |
+
+> **실증 기반 (2025-01-01~2026-04-30, kiwoom-top 500, KOSPI 프록시)**:
+> `docs/backtest_regime_adaptive.md` / `docs/backtest_regime_adaptive.html` 참조.
+> baseline 52.8%/+0.86% → D+E-vol **54.1%/+0.92%** (+1.3pp, +6bp).
+> neutral 레짐 **56.0%/+1.05%** 최우수. KS11 복구 후 재검증 권장.
 """
 
 

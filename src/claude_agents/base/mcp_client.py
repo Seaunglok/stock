@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -18,6 +19,22 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 logger = structlog.get_logger(__name__)
+
+# 단일 MCP 도구 호출 결과의 최대 글자 수.
+# Claude 컨텍스트와 분당 토큰 한도를 보호하기 위해 거대 응답(예: get_theme_group_list)을 자른다.
+# 환경변수 MCP_TOOL_RESULT_MAX_CHARS로 오버라이드 가능 (0 또는 음수면 비활성화).
+DEFAULT_TOOL_RESULT_MAX_CHARS = 30_000
+
+
+def _resolve_max_chars() -> int:
+    raw = os.getenv("MCP_TOOL_RESULT_MAX_CHARS")
+    if raw is None:
+        return DEFAULT_TOOL_RESULT_MAX_CHARS
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("MCP_TOOL_RESULT_MAX_CHARS 파싱 실패 - 기본값 사용", value=raw)
+        return DEFAULT_TOOL_RESULT_MAX_CHARS
 
 
 class MCPManager:
@@ -128,7 +145,29 @@ class MCPManager:
         logger.debug("도구 실행", tool=tool_name, server=server_name)
         result = await session.call_tool(tool_name, tool_input)
 
-        return self._format_tool_result(result)
+        formatted = self._format_tool_result(result)
+        return self._truncate_if_needed(tool_name, formatted)
+
+    @staticmethod
+    def _truncate_if_needed(tool_name: str, text: str) -> str:
+        """결과가 너무 길면 자르고 안내 문구를 덧붙여 Claude에 컨텍스트 폭주를 알린다."""
+        max_chars = _resolve_max_chars()
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+
+        omitted = len(text) - max_chars
+        logger.warning(
+            "MCP 도구 결과 자름",
+            tool=tool_name,
+            original_chars=len(text),
+            kept_chars=max_chars,
+            omitted_chars=omitted,
+        )
+        notice = (
+            f"\n\n[... 결과가 너무 커서 {omitted:,}자가 생략되었습니다 "
+            f"(최대 {max_chars:,}자). 더 좁은 필터/limit 파라미터로 재호출하세요. ...]"
+        )
+        return text[:max_chars] + notice
 
     # -------------------------------------------------------------------------
     # Internal helpers

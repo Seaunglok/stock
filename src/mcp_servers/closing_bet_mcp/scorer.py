@@ -101,20 +101,22 @@ def score_volume_surge(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
 
 
 def score_resistance_proximity(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
-    """기준 3: 60일 전고점 대비 현재가 이격.
+    """기준 3: 90일 전고점 대비 현재가 이격.
 
     -8% ~ -3% = 만점 (저항 근처지만 부담 없음).
+    90일 기준으로 확장해 더 긴 추세의 전고점 이격을 포착.
     """
-    if not ohlcv or len(ohlcv) < 60:
+    window = min(90, len(ohlcv))
+    if not ohlcv or window < 60:
         return 0.0, {"reason": "데이터 부족 (>=60봉 필요)"}
 
-    recent = ohlcv[-60:]
-    high_60 = max(_g(d, "high") for d in recent)
+    recent = ohlcv[-window:]
+    high_nd = max(_g(d, "high") for d in recent)
     close = _g(ohlcv[-1], "close")
-    if high_60 <= 0:
+    if high_nd <= 0:
         return 0.0, {"reason": "고가 0"}
 
-    gap_pct = (close - high_60) / high_60 * 100.0
+    gap_pct = (close - high_nd) / high_nd * 100.0
 
     if -8.0 <= gap_pct <= -3.0:
         score = 100.0
@@ -128,9 +130,10 @@ def score_resistance_proximity(ohlcv: list[dict]) -> tuple[float, dict[str, Any]
         score = max(0.0, 50.0 + gap_pct)
 
     return max(0.0, min(100.0, score)), {
-        "high_60d": high_60,
+        f"high_{window}d": high_nd,
         "current": close,
         "gap_pct": round(gap_pct, 2),
+        "window": window,
     }
 
 
@@ -161,26 +164,35 @@ def score_candle_shape(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
 
 
 def score_consolidation(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
-    """기준 5: 충분한 기간 조정 (N자형/W형) — 60일 고점 → 조정 → 회복."""
-    if not ohlcv or len(ohlcv) < 60:
+    """기준 5: 충분한 기간 조정 (N자형/W형) — 90일 고점 → 조정 → 회복.
+
+    90일로 확장해 더 긴 기간의 추세 조정(박스권·눌림)까지 포착.
+    추가 보너스: 조정 기간이 30봉(6주) 이상이면 +10점 (충분한 기간 조정 보상).
+    """
+    window = min(90, len(ohlcv))
+    if not ohlcv or window < 60:
         return 0.0, {"reason": "데이터 부족 (>=60봉 필요)"}
 
-    recent = ohlcv[-60:]
+    recent = ohlcv[-window:]
     highs = [_g(d, "high") for d in recent]
-    lows = [_g(d, "low") for d in recent]
-    high_60 = max(highs)
-    high_pos = highs.index(high_60)
-    if high_pos < len(recent) - 1:
-        low_after = min(lows[high_pos:])
-    else:
-        low_after = min(lows)
-    close = _g(ohlcv[-1], "close")
+    lows  = [_g(d, "low")  for d in recent]
+    high_nd  = max(highs)
+    high_pos = highs.index(high_nd)
 
-    if high_60 <= 0 or low_after <= 0:
+    if high_pos < len(recent) - 1:
+        low_after    = min(lows[high_pos:])
+        low_after_pos = lows.index(low_after, high_pos)
+    else:
+        low_after     = min(lows)
+        low_after_pos = lows.index(low_after)
+
+    close = _g(ohlcv[-1], "close")
+    if high_nd <= 0 or low_after <= 0:
         return 0.0, {"reason": "데이터 이상"}
 
-    drawdown_pct = (low_after - high_60) / high_60 * 100.0
+    drawdown_pct = (low_after - high_nd) / high_nd * 100.0
     recovery_pct = (close - low_after) / low_after * 100.0
+    consolidation_bars = len(recent) - 1 - high_pos  # 고점 이후 경과 봉 수
 
     if -25.0 <= drawdown_pct <= -8.0:
         dd_score = 100.0
@@ -192,14 +204,18 @@ def score_consolidation(ohlcv: list[dict]) -> tuple[float, dict[str, Any]]:
         dd_score = 0.0
 
     rec_score = min(100.0, recovery_pct * 5.0) if recovery_pct > 0 else 0.0
-    score = dd_score * 0.7 + rec_score * 0.3
+    duration_bonus = 10.0 if consolidation_bars >= 30 else 0.0
+    score = min(100.0, dd_score * 0.7 + rec_score * 0.3 + duration_bonus)
 
     return score, {
-        "high_60d": high_60,
-        "low_after_high": low_after,
-        "current": close,
-        "drawdown_pct": round(drawdown_pct, 2),
-        "recovery_pct": round(recovery_pct, 2),
+        f"high_{window}d": high_nd,
+        "low_after_high":  low_after,
+        "current":         close,
+        "drawdown_pct":    round(drawdown_pct, 2),
+        "recovery_pct":    round(recovery_pct, 2),
+        "consolidation_bars": consolidation_bars,
+        "duration_bonus":  duration_bonus,
+        "window":          window,
     }
 
 

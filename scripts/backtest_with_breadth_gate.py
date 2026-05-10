@@ -84,12 +84,14 @@ def fetch_kospi_returns(start: str, end: str) -> dict[str, float]:
             from pykrx import stock
             s_compact = start.replace("-", "")
             e_compact = end.replace("-", "")
-            pdf = stock.get_index_ohlcv(s_compact, e_compact, "1001")  # 1001 = KOSPI
+            # get_index_ohlcv_by_date: pykrx ≥1.0 공식 API (구 get_index_ohlcv 제거됨)
+            pdf = stock.get_index_ohlcv_by_date(s_compact, e_compact, "1001")
             for date, row in pdf.iterrows():
                 o, c = float(row["시가"]), float(row["종가"])
                 if o <= 0:
                     continue
                 out[date.strftime("%Y-%m-%d")] = (c - o) / o * 100.0
+            print(f"  pykrx KS11 로드 성공 {len(out)}일")
         except Exception as e2:
             print(f"  pykrx 도 실패 ({e2}). 005930+000660 프록시로 대체 [proxy]")
             try:

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>종가매매 Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; }
+  .log-line { font-family: "Consolas", "D2Coding", monospace; font-size: 11px; line-height: 1.4; white-space: pre; }
+  .log-line.err { color: #ef4444; }
+  .log-line.warn { color: #f59e0b; }
+  .log-line.info { color: #d1d5db; }
+  .ev-tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+</style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+<div class="max-w-7xl mx-auto p-4 space-y-4">
+
+  <!-- header -->
+  <header class="flex items-center justify-between">
+    <h1 class="text-xl font-bold">📈 종가매매 Dashboard</h1>
+    <div class="flex items-center gap-3 text-xs">
+      <span id="health-dot" class="inline-block w-2 h-2 rounded-full bg-slate-500"></span>
+      <span id="health-text" class="text-slate-400">checking…</span>
+      <button onclick="refreshAll()" class="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-slate-200">⟳ 새로고침</button>
+      <label class="flex items-center gap-1"><input type="checkbox" id="auto-refresh" checked /> 자동 (10초)</label>
+    </div>
+  </header>
+
+  <!-- KPI cards -->
+  <section class="grid grid-cols-2 md:grid-cols-5 gap-3" id="kpi"></section>
+
+  <!-- charts row -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="bg-slate-800 rounded p-3 lg:col-span-2">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">일별 누적 P&L (%)</h2>
+      <canvas id="pnl-chart" height="80"></canvas>
+    </div>
+    <div class="bg-slate-800 rounded p-3">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">점수 구간별 승률</h2>
+      <canvas id="bracket-chart" height="80"></canvas>
+    </div>
+  </section>
+
+  <!-- day selector + day detail -->
+  <section class="bg-slate-800 rounded p-3">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-sm font-semibold text-slate-300">일별 상세</h2>
+      <select id="day-select" class="bg-slate-700 text-slate-100 text-sm rounded px-2 py-1"></select>
+    </div>
+    <div id="day-detail" class="space-y-3"></div>
+  </section>
+
+  <!-- events + log -->
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="bg-slate-800 rounded p-3">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">이벤트 타임라인 (events.jsonl)</h2>
+      <div id="events-list" class="space-y-1 max-h-96 overflow-y-auto"></div>
+    </div>
+    <div class="bg-slate-800 rounded p-3">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2 flex items-center justify-between gap-2">
+        <span>실시간 로그</span>
+        <select id="log-date-select" class="bg-slate-700 text-slate-100 text-xs rounded px-2 py-0.5"></select>
+        <span class="text-xs text-slate-500 flex-1 text-right" id="log-meta"></span>
+      </h2>
+      <div id="log-tail" class="bg-slate-950 rounded p-2 max-h-96 overflow-y-auto"></div>
+    </div>
+  </section>
+
+  <!-- state -->
+  <section class="bg-slate-800 rounded p-3">
+    <h2 class="text-sm font-semibold text-slate-300 mb-2">현재 state (closing_bet_state_direct.json)</h2>
+    <pre id="state-pre" class="log-line text-slate-300 max-h-72 overflow-y-auto"></pre>
+  </section>
+
+</div>
+
+<script>
+let pnlChart = null, bracketChart = null;
+
+const fmtPct = v => (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
+const fmtNum = v => v.toLocaleString("ko-KR");
+
+const phaseColor = {
+  phase_start: "bg-blue-700",
+  market_filter: "bg-indigo-700",
+  regime: "bg-purple-700",
+  us_market: "bg-violet-700",
+  selection_done: "bg-emerald-700",
+  buy: "bg-green-700",
+  sell: "bg-amber-700",
+  after_hours: "bg-cyan-700",
+  skip: "bg-yellow-700",
+  error: "bg-red-700",
+};
+
+function classifyLog(line) {
+  if (/\[ERROR\]|ERROR/.test(line)) return "err";
+  if (/\[WARN\]|WARNING/.test(line)) return "warn";
+  return "info";
+}
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + " " + r.status);
+  return r.json();
+}
+
+async function loadHealth() {
+  try {
+    const h = await fetchJSON("/api/health");
+    document.getElementById("health-dot").className = "inline-block w-2 h-2 rounded-full bg-emerald-500";
+    document.getElementById("health-text").textContent = h.days + " 거래일 데이터";
+  } catch {
+    document.getElementById("health-dot").className = "inline-block w-2 h-2 rounded-full bg-red-500";
+    document.getElementById("health-text").textContent = "API 연결 실패";
+  }
+}
+
+async function loadSummary() {
+  const s = await fetchJSON("/api/summary");
+  const t = s.totals;
+
+  // KPI
+  const kpis = [
+    { label: "거래일", value: t.trading_days, sub: "data days" },
+    { label: "총 거래", value: t.trades, sub: `승 ${t.wins} / 패 ${t.losses}` },
+    { label: "승률", value: t.win_rate.toFixed(1) + "%", sub: t.win_rate >= 60 ? "🎯 목표 달성" : "목표 60%" },
+    { label: "평균 P&L", value: fmtPct(t.avg_pnl), sub: t.avg_pnl >= 0 ? "수익" : "손실" },
+    { label: "누적 P&L", value: fmtPct(t.total_pnl), sub: "all trades" },
+  ];
+  document.getElementById("kpi").innerHTML = kpis.map(k => `
+    <div class="bg-slate-800 rounded p-3">
+      <div class="text-xs text-slate-400">${k.label}</div>
+      <div class="text-xl font-bold mt-1 ${k.value.toString().includes("-") ? "text-red-400" : k.value.toString().includes("+") ? "text-emerald-400" : "text-slate-100"}">${k.value}</div>
+      <div class="text-xs text-slate-500 mt-1">${k.sub}</div>
+    </div>
+  `).join("");
+
+  // 일별 P&L 누적
+  const dates = Object.keys(s.daily_pnl).sort();
+  let cum = 0;
+  const cumData = dates.map(d => { cum += s.daily_pnl[d].total_pnl_pct; return cum; });
+
+  if (pnlChart) pnlChart.destroy();
+  pnlChart = new Chart(document.getElementById("pnl-chart"), {
+    type: "line",
+    data: {
+      labels: dates,
+      datasets: [{
+        label: "누적 P&L (%)",
+        data: cumData,
+        borderColor: "#10b981", backgroundColor: "rgba(16,185,129,0.1)",
+        fill: true, tension: 0.2,
+      }],
+    },
+    options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { color: "#94a3b8" } }, x: { ticks: { color: "#94a3b8" } } } },
+  });
+
+  // 점수구간별
+  if (bracketChart) bracketChart.destroy();
+  bracketChart = new Chart(document.getElementById("bracket-chart"), {
+    type: "bar",
+    data: {
+      labels: s.bracket_stats.map(b => b.label),
+      datasets: [
+        { label: "승률(%)", data: s.bracket_stats.map(b => b.win_rate), backgroundColor: "#3b82f6" },
+      ],
+    },
+    options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, max: 100, ticks: { color: "#94a3b8" } }, x: { ticks: { color: "#94a3b8" } } } },
+  });
+}
+
+async function loadDays() {
+  const r = await fetchJSON("/api/days");
+  const sel = document.getElementById("day-select");
+  const cur = sel.value;
+  sel.innerHTML = r.days.map(d => `<option value="${d}">${d}</option>`).join("");
+  if (cur && r.days.includes(cur)) sel.value = cur;
+  if (r.days.length && !sel.value) sel.value = r.days[0];
+  await loadDay(sel.value);
+}
+
+async function loadDay(date) {
+  if (!date) return;
+  const d = await fetchJSON("/api/day/" + date);
+  const det = document.getElementById("day-detail");
+
+  let html = "";
+
+  // selection
+  if (d.selection) {
+    const m = d.selection.market || {};
+    html += `<div class="border-l-2 border-blue-500 pl-3">
+      <div class="text-xs text-slate-400">SELECTION ${d.selection.timestamp || ""}</div>
+      <div class="text-sm">KOSPI <b>${fmtPct(m.kospi_today_pct||0)}</b> · 5d ${fmtPct(m.kospi_5d_pct||0)} · 레짐 <b>${m.regime||"?"}</b> · 양봉 ${((m.advance_ratio||0)*100).toFixed(0)}% · US S&P${fmtPct(m.sp500_pct||0)} / NQ${fmtPct(m.nasdaq_pct||0)}</div>
+      <div class="text-xs text-slate-500">분석 ${(d.selection.all_scored||[]).length}종목 · MA20제외 ${m.ma20_filtered||0} · 갭제외 ${m.gap_filtered||0} · 후보 ${(d.selection.candidates||[]).length}</div>`;
+    if ((d.selection.candidates||[]).length) {
+      html += `<table class="mt-2 w-full text-xs"><thead><tr class="text-slate-400"><th class="text-left">종목</th><th>섹터</th><th>점수</th><th>현재가</th><th>재료</th></tr></thead><tbody>`;
+      for (const c of d.selection.candidates) {
+        html += `<tr class="border-t border-slate-700"><td class="py-1">${c.company_name}(${c.symbol})</td><td class="text-center">${c.sector||"-"}</td><td class="text-center font-mono">${c.composite}</td><td class="text-right font-mono">${fmtNum(c.current_price)}</td><td class="text-center">${c.has_catalyst?"📰":"—"}</td></tr>`;
+      }
+      html += `</tbody></table>`;
+    }
+    html += `</div>`;
+  }
+
+  // buy
+  if (d.buy && (d.buy.orders||[]).length) {
+    html += `<div class="border-l-2 border-green-500 pl-3 mt-3">
+      <div class="text-xs text-slate-400">BUY ${d.buy.timestamp||""} ${d.buy.mock_mode?"🧪 MOCK":"💰 REAL"}</div>
+      <table class="mt-1 w-full text-xs"><thead><tr class="text-slate-400"><th class="text-left">종목</th><th>섹터</th><th>수량</th><th>매수가</th><th>점수</th></tr></thead><tbody>`;
+    for (const o of d.buy.orders) {
+      html += `<tr class="border-t border-slate-700"><td class="py-1">${o.company_name}(${o.symbol})</td><td class="text-center">${o.sector||"-"}</td><td class="text-center font-mono">${o.quantity}</td><td class="text-right font-mono">${fmtNum(o.entry_price)}</td><td class="text-center font-mono">${o.composite}</td></tr>`;
+    }
+    html += `</tbody></table>
+      <div class="text-xs text-slate-500 mt-1">총 투자: ${fmtNum(d.buy.total_invested||0)}원</div></div>`;
+  }
+
+  // sell
+  if (d.sell && (d.sell.results||[]).length) {
+    const sm = d.sell.summary || {};
+    html += `<div class="border-l-2 border-amber-500 pl-3 mt-3">
+      <div class="text-xs text-slate-400">SELL ${d.sell.timestamp||""}  entry=${d.sell.entry_date||"?"}</div>
+      <div class="text-sm">총 ${sm.total_trades||0}건 · 승률 <b>${(sm.win_rate||0).toFixed(1)}%</b> · 평균 P&L <b>${fmtPct(sm.avg_pnl_pct||0)}</b> · 합계 ${fmtPct(sm.total_pnl_pct||0)}</div>
+      <table class="mt-1 w-full text-xs"><thead><tr class="text-slate-400"><th class="text-left">종목</th><th>액션</th><th>P&L%</th><th>매수가→매도가</th><th>사유</th></tr></thead><tbody>`;
+    for (const r of d.sell.results) {
+      const cls = r.pnl_pct > 0 ? "text-emerald-400" : r.pnl_pct < 0 ? "text-red-400" : "text-slate-400";
+      html += `<tr class="border-t border-slate-700"><td class="py-1">${r.company_name}(${r.symbol})</td><td class="text-center">${r.action}</td><td class="text-center font-mono ${cls}">${fmtPct(r.pnl_pct||0)}</td><td class="text-right font-mono">${fmtNum(r.entry_price||0)}→${fmtNum(r.exit_price||0)}</td><td class="text-xs text-slate-400">${r.reason||""}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  if (!html) html = `<div class="text-sm text-slate-500">${date} 데이터 없음</div>`;
+  det.innerHTML = html;
+
+  // events
+  const evs = d.events || [];
+  document.getElementById("events-list").innerHTML = evs.length
+    ? evs.slice(-100).reverse().map(e => {
+        const tag = phaseColor[e.event] || "bg-slate-700";
+        const time = (e.ts||"").split("T")[1] || "";
+        return `<div class="text-xs flex items-start gap-2"><span class="text-slate-500 font-mono">${time}</span><span class="ev-tag ${tag}">${e.event}</span><span class="text-slate-300">${JSON.stringify(e.payload).slice(0,100)}</span></div>`;
+      }).join("")
+    : `<div class="text-xs text-slate-500">이벤트 없음</div>`;
+}
+
+async function loadLog() {
+  const sel = document.getElementById("log-date-select");
+  const date = sel.value || "";
+  const url = "/api/log?n=200" + (date && date !== "today" ? "&date=" + date : "");
+  const r = await fetchJSON(url);
+
+  // 날짜 옵션 갱신
+  if (r.available_dates && r.available_dates.length) {
+    const cur = sel.value;
+    sel.innerHTML = r.available_dates.map((d, i) =>
+      `<option value="${i === 0 ? "today" : d}">${i === 0 ? "오늘 (활성)" : d}</option>`
+    ).join("");
+    if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+  }
+
+  const el = document.getElementById("log-tail");
+  if (!r.exists) {
+    el.innerHTML = `<div class="text-xs text-slate-500">로그 파일 없음: ${r.path}</div>`;
+    document.getElementById("log-meta").textContent = "";
+    return;
+  }
+  el.innerHTML = (r.lines || []).map(l => `<div class="log-line ${classifyLog(l)}">${l.replace(/</g,"&lt;")}</div>`).join("");
+  el.scrollTop = el.scrollHeight;
+  document.getElementById("log-meta").textContent = `total ${r.total} lines`;
+}
+
+async function loadState() {
+  const r = await fetchJSON("/api/state");
+  document.getElementById("state-pre").textContent = r.exists
+    ? JSON.stringify(r.state, null, 2)
+    : "(state 파일 없음)";
+}
+
+async function refreshAll() {
+  try {
+    await loadHealth();
+    await loadSummary();
+    await loadDays();
+    await loadLog();
+    await loadState();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+document.getElementById("day-select").addEventListener("change", e => loadDay(e.target.value));
+document.getElementById("log-date-select").addEventListener("change", () => loadLog());
+
+let timer = null;
+function setupAuto() {
+  if (timer) clearInterval(timer);
+  if (document.getElementById("auto-refresh").checked) {
+    timer = setInterval(refreshAll, 10000);
+  }
+}
+document.getElementById("auto-refresh").addEventListener("change", setupAuto);
+
+refreshAll();
+setupAuto();
+</script>
+</body>
+</html>

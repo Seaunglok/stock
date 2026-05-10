@@ -45,12 +45,12 @@ def evaluate_exit(
             suggested_qty_pct=100,
         )
 
-    # 2) 매수 평단 이탈 (정규장)
-    if current_price < entry_price * 0.99:
+    # 2) 매수 평단 -3% 이탈 (정규장)
+    if current_price < entry_price * 0.97:
         return ExitDecision(
             action="STOP_LOSS",
             urgency="high",
-            reason=f"평단 이탈 ({pnl_pct:+.2f}%) — 손절",
+            reason=f"손절 트리거 ({pnl_pct:+.2f}%) — -3% 이탈",
             suggested_qty_pct=100,
         )
 
@@ -88,6 +88,27 @@ def evaluate_exit(
         reason=f"보유 ({pnl_pct:+.2f}%) — 청산 조건 미충족",
         suggested_qty_pct=0,
     )
+
+
+def classify_regime(
+    kospi_today_pct: float,
+    advance_ratio: float,
+    weak_kospi_pct: float = -1.0,
+    weak_adv_ratio: float = 0.35,
+    strong_kospi_pct: float = 0.5,
+    strong_adv_ratio: float = 0.55,
+) -> str:
+    """시장 레짐 분류: 'weak' | 'neutral' | 'strong'.
+
+    Args:
+        kospi_today_pct: KOSPI 당일 등락률 (%)
+        advance_ratio:   KOSPI 전 종목 중 등락률 > 0 비율 (0.0 ~ 1.0)
+    """
+    if kospi_today_pct > strong_kospi_pct and advance_ratio >= strong_adv_ratio:
+        return "strong"
+    if kospi_today_pct < weak_kospi_pct or advance_ratio < weak_adv_ratio:
+        return "weak"
+    return "neutral"
 
 
 def evaluate_market_filter(

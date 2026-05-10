@@ -185,12 +185,14 @@ def simulate_regime_adaptive(
     args,
     use_sector_filter: bool = False,
     use_sector_vol: bool = False,
+    neutral_only_vol: bool = False,
 ) -> list[dict]:
     """레짐별 전략 분기 시뮬레이션.
 
     weak   → 종가매매 scorer (WEIGHTS_NEW_V1)
     neutral/strong, use_sector_vol=False → RS 모멘텀 scorer (+ 선택적 섹터 필터)
     neutral/strong, use_sector_vol=True  → 섹터 RS 필터 + 거래량 scorer (SECTOR_VOL_W)
+    neutral_only_vol=True (use_sector_vol과 함께): strong은 종가매매로 폴백 (PLAYBOOK D+E-vol-N)
     """
     all_dates = sorted({d["date"] for h in histories.values() for d in h})
     picks: list[dict] = []
@@ -231,6 +233,37 @@ def simulate_regime_adaptive(
 
         else:
             # ── neutral/strong 스코어러 ────────────────────────────────────
+            # neutral_only_vol=True 이면 strong은 종가매매로 폴백 (PLAYBOOK D+E-vol-N)
+            if neutral_only_vol and use_sector_vol and regime == "strong":
+                scored_strong: list[tuple[str, float]] = []
+                for code in codes_today:
+                    h = histories.get(code, [])
+                    window = [d for d in h if d["date"] <= date_t][-90:]
+                    if len(window) < 60:
+                        continue
+                    ts = compute_technical_scores(window)
+                    score = (
+                        ts.volume_surge * WEIGHTS_NEW_V1["volume_surge"]
+                        + ts.consolidation * WEIGHTS_NEW_V1["consolidation"]
+                    )
+                    if score >= args.threshold:
+                        scored_strong.append((code, score))
+                scored_strong.sort(key=lambda x: -x[1])
+                day_picks = [(c, s, "종가매매(strong폴백)") for c, s in scored_strong[:args.top_n]]
+                for code, score, strategy in day_picks:
+                    h = histories.get(code, [])
+                    t_bar = next((d for d in h if d["date"] == date_t), None)
+                    n_bar = next((d for d in h if d["date"] == date_next), None)
+                    if t_bar is None or n_bar is None or t_bar["close"] <= 0:
+                        continue
+                    ret, exit_type = _exit_return(t_bar, n_bar, args.stop_loss)
+                    picks.append({
+                        "date": date_t, "code": code, "score": score,
+                        "ret": ret, "exit_type": exit_type, "regime": regime,
+                        "strategy": strategy, "sector": sector_by_code.get(code, "기타"),
+                    })
+                continue  # 다음 날짜로
+
             vol_sc: dict[str, float] = {}
             con_sc: dict[str, float] = {}
 
@@ -478,12 +511,14 @@ def render_html(
     sector: dict,
     sector_base: dict,
     sector_vol: dict,
+    sector_vol_n: dict,
     name_by_code: dict[str, str],
     base_picks: list[dict],
     adaptive_picks: list[dict],
     sector_picks: list[dict],
     sector_base_picks: list[dict],
     sector_vol_picks: list[dict],
+    sector_vol_n_picks: list[dict],
 ) -> str:
     stop_label = f"손절 {args.stop_loss:.1f}%" if args.stop_loss > 0 else "손절 없음"
 
@@ -518,6 +553,7 @@ def render_html(
         _row("sector (PLAYBOOK D+E)", sector, sector_picks, "highlight-gold"),
         _row("sector_base (PLAYBOOK F)", sector_base, sector_base_picks, "highlight-green"),
         _row("sector_vol (D+E-vol)", sector_vol, sector_vol_picks, "highlight-purple"),
+        _row("sector_vol_N (D+E-vol-N)", sector_vol_n, sector_vol_n_picks, "highlight-teal"),
     ]
 
     # 레짐별 분해
@@ -598,6 +634,7 @@ def render_html(
   tr.highlight-gold {{ background: #fef9e7; }}
   tr.highlight-green {{ background: #e8f8e8; }}
   tr.highlight-purple {{ background: #f3e8fd; }}
+  tr.highlight-teal {{ background: #e0f4f4; }}
   td.pos {{ color: #117a3d; font-weight: 600; }}
   td.neg {{ color: #b3261e; font-weight: 600; }}
   .meta {{ color: #555; font-size: 14px; line-height: 1.8; }}
@@ -660,12 +697,19 @@ def render_html(
   <tbody>{_regime_rows(sector_vol_picks)}</tbody>
 </table>
 
+<h2>Sector+Vol-N (D+E-vol-N) — 레짐별 분해</h2>
+<table>
+  <thead><tr><th>레짐</th><th>픽 수</th><th>승률</th><th>평균수익</th></tr></thead>
+  <tbody>{_regime_rows(sector_vol_n_picks)}</tbody>
+</table>
+
 <h2>픽 상세</h2>
 {_picks_table(base_picks, "Baseline (종가매매)")}
 {_picks_table(adaptive_picks, "Adaptive (PLAYBOOK D)")}
 {_picks_table(sector_picks, "Sector (PLAYBOOK D+E)")}
 {_picks_table(sector_base_picks, "Sector Baseline (PLAYBOOK F)")}
 {_picks_table(sector_vol_picks, "Sector+Vol (PLAYBOOK D+E-vol)")}
+{_picks_table(sector_vol_n_picks, "Sector+Vol-N (PLAYBOOK D+E-vol-N)")}
 
 <h2>전략 설명</h2>
 <div class="card">
@@ -690,6 +734,13 @@ def render_html(
   거래량 급증 스코어(volume_surge 0.70 + consolidation 0.30) 적용.<br>
   RS는 섹터 선별에만 사용, 개별 종목은 거래량으로 선정.
 </div>
+<div class="card">
+  <strong>PLAYBOOK D+E-vol-N — neutral만 섹터RS+거래량, strong은 종가매매 폴백</strong><br>
+  weak → 종가매매, <strong>neutral</strong> → 섹터RS 상위 {args.sector_top}개 + 거래량 스코어,
+  <strong>strong</strong> → 종가매매 폴백.<br>
+  실험 근거: D+E-vol에서 strong 52.4%가 weak(53.5%)·neutral(56.0%) 대비 약함 →
+  strong 레짐에서는 섹터 집중의 이점이 사라지는지 검증.
+</div>
 </body></html>"""
 
 
@@ -712,6 +763,10 @@ def main() -> None:
     p.add_argument("--weak-kospi-pct", type=float, default=-1.0)
     p.add_argument("--weak-adv-ratio", type=float, default=0.35)
     p.add_argument("--sector-top", type=int, default=2, help="섹터 집중 필터 상위 K개")
+    p.add_argument("--sector-top-sweep", action="store_true",
+                   help="sector_top 2/3/4 비교 스윕 (sector_vol 기준)")
+    p.add_argument("--weak-sweep", action="store_true",
+                   help="weak_kospi_pct × weak_adv_ratio 그리드 스윕")
     p.add_argument("--stop-loss", type=float, default=0.0,
                    help="손절 기준 %% (예: 2.0 → -2%% 이하 장중 손절, 0=비활성)")
     p.add_argument("--out", type=Path, default=None, help="MD 출력 경로")
@@ -832,6 +887,62 @@ def main() -> None:
     stop_msg_sv = f", 손절 발동 {n_sv}건 ({pct_sv:.1f}%)" if args.stop_loss > 0 else ""
     print(f"  sector_vol  → 픽 {sector_vol['n']}, 승률 {sector_vol['winrate']:.1f}%, 평균 {sector_vol['avg_ret']:+.2f}%{stop_msg_sv}")
 
+    # ── Sector+Vol-N (PLAYBOOK D+E-vol-N: neutral만 섹터RS+거래량, strong→종가매매 폴백)
+    print(f"\n[run] sector_vol_N (D+E-vol-N: neutral만 섹터RS+거래량, strong 종가매매 폴백){stop_info}")
+    sector_vol_n_picks = simulate_regime_adaptive(
+        histories, kospi, sector_by_code, args,
+        use_sector_filter=True, use_sector_vol=True, neutral_only_vol=True,
+    )
+    sector_vol_n = summarize(sector_vol_n_picks)
+    n_svn, pct_svn = stop_stat(sector_vol_n_picks)
+    stop_msg_svn = f", 손절 발동 {n_svn}건 ({pct_svn:.1f}%)" if args.stop_loss > 0 else ""
+    print(f"  sector_vol_N → 픽 {sector_vol_n['n']}, 승률 {sector_vol_n['winrate']:.1f}%, 평균 {sector_vol_n['avg_ret']:+.2f}%{stop_msg_svn}")
+
+    # ── sector_top 파라미터 sweep ─────────────────────────────────────────
+    if args.sector_top_sweep:
+        print("\n[sweep] sector_top 파라미터 비교 (sector_vol 기준)")
+        print(f"  {'top':>5} | {'픽 수':>6} | {'승률':>7} | {'평균수익':>8} | {'Δ승률':>7} | {'Δ평균':>8}")
+        for k in (2, 3, 4):
+            orig = args.sector_top
+            args.sector_top = k
+            _p = simulate_regime_adaptive(
+                histories, kospi, sector_by_code, args,
+                use_sector_filter=True, use_sector_vol=True,
+            )
+            _s = summarize(_p)
+            d_wr = _s["winrate"] - base["winrate"]
+            d_avg = _s["avg_ret"] - base["avg_ret"]
+            print(
+                f"  top={k}: 픽 {_s['n']:4d}, 승률 {_s['winrate']:.1f}%,"
+                f"  평균 {_s['avg_ret']:+.2f}%,"
+                f"  Δ승률 {d_wr:+.1f}pp, Δ평균 {d_avg:+.2f}%"
+            )
+            args.sector_top = orig
+
+    # ── weak sensitivity sweep ────────────────────────────────────────────
+    if args.weak_sweep:
+        print("\n[sweep] weak 파라미터 sensitivity (sector_vol, neutral leaning)")
+        kospi_grid = [-0.3, -0.5, -0.7, -1.0, -1.5]
+        adv_grid   = [0.30, 0.35, 0.40, 0.45]
+        hdr = "  KOSPI\\adv |" + "".join(f" {a:.2f}  " for a in adv_grid)
+        print(hdr)
+        orig_kp = args.weak_kospi_pct
+        orig_ar = args.weak_adv_ratio
+        for kp in kospi_grid:
+            row_parts = []
+            for ar in adv_grid:
+                args.weak_kospi_pct = kp
+                args.weak_adv_ratio = ar
+                _p = simulate_regime_adaptive(
+                    histories, kospi, sector_by_code, args,
+                    use_sector_filter=True, use_sector_vol=True,
+                )
+                _s = summarize(_p)
+                row_parts.append(f"{_s['winrate']:5.1f}%({_s['n']:3d})")
+            print(f"  {kp:+.1f}%      | " + " | ".join(row_parts))
+        args.weak_kospi_pct = orig_kp
+        args.weak_adv_ratio = orig_ar
+
     # ── 분해 통계 출력 ────────────────────────────────────────────────────
     print("\n[breakdown] Adaptive 레짐별")
     for r in ("strong", "neutral", "weak"):
@@ -863,6 +974,12 @@ def main() -> None:
         s = summarize(sub)
         print(f"  {r:8s}: 픽 {s['n']:4d}, 승률 {s['winrate']:.1f}%, 평균 {s['avg_ret']:+.2f}%")
 
+    print("\n[breakdown] Sector+Vol-N (D+E-vol-N) 레짐별")
+    for r in ("strong", "neutral", "weak"):
+        sub = [p for p in sector_vol_n_picks if p.get("regime") == r]
+        s = summarize(sub)
+        print(f"  {r:8s}: 픽 {s['n']:4d}, 승률 {s['winrate']:.1f}%, 평균 {s['avg_ret']:+.2f}%")
+
     # ── MD 리포트 ─────────────────────────────────────────────────────────
     lines: list[str] = [
         "# 레짐 연동 + 섹터 집중 전략 백테스트",
@@ -886,6 +1003,7 @@ def main() -> None:
         ("sector (D+E)", sector_stat_dict, sector_picks, n_sec, pct_sec),
         ("sector_base (F)", sector_base, sector_base_picks, n_sb, pct_sb),
         ("sector_vol (D+E-vol)", sector_vol, sector_vol_picks, n_sv, pct_sv),
+        ("sector_vol_N (D+E-vol-N)", sector_vol_n, sector_vol_n_picks, n_svn, pct_svn),
     ]:
         d_wr = s["winrate"] - base["winrate"]
         d_avg = s["avg_ret"] - base["avg_ret"]
@@ -945,6 +1063,7 @@ def main() -> None:
             ("sector", sector_picks),
             ("sector_base", sector_base_picks),
             ("sector_vol", sector_vol_picks),
+            ("sector_vol_N", sector_vol_n_picks),
         ]:
             path = args.csv_dir / f"picks_{label}.csv"
             with path.open("w", encoding="utf-8", newline="") as f:
@@ -962,10 +1081,10 @@ def main() -> None:
     if args.html:
         html = render_html(
             args, base, adaptive, sector_stat_dict,
-            sector_base, sector_vol,
+            sector_base, sector_vol, sector_vol_n,
             name_by_code,
             base_picks, adaptive_picks, sector_picks,
-            sector_base_picks, sector_vol_picks,
+            sector_base_picks, sector_vol_picks, sector_vol_n_picks,
         )
         args.html.parent.mkdir(parents=True, exist_ok=True)
         args.html.write_text(html, encoding="utf-8")

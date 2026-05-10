@@ -337,6 +337,82 @@ class ClosingBetMCPServer(BaseMCPServer):
             )
 
 
+        @self.mcp.tool()
+        async def classify_breadth_regime(
+            kospi_today_pct: float,
+            advance_ratio: float,
+            weak_kospi_pct: float = -1.0,
+            weak_adv_ratio: float = 0.35,
+            strong_kospi_pct: float = 0.5,
+            strong_adv_ratio: float = 0.55,
+        ) -> dict[str, Any]:
+            """시장 강도(Breadth) 기반 레짐 분류 — 라이브 거래 흐름 내장용.
+
+            PLAYBOOK A 레짐 판정 로직을 MCP 툴로 노출한다.
+            DataCollector가 KOSPI 등락률과 universe 양봉 비율을 계산한 뒤 호출.
+
+            Args:
+                kospi_today_pct: KOSPI 당일 등락률 (%) — 시가 대비 현재가 또는 종가
+                advance_ratio:   daily universe 내 양봉 비율 (0.0 ~ 1.0)
+                weak_kospi_pct:  KOSPI 이 값 미만이면 weak 단독 트리거 (기본 -1.0%)
+                weak_adv_ratio:  advance_ratio 이 값 미만이면 weak (기본 0.35)
+                strong_kospi_pct: KOSPI 이 값 초과 (기본 +0.5%)
+                strong_adv_ratio: advance_ratio 이 값 이상이면 strong (기본 0.55)
+
+            Returns:
+                regime: "strong" | "neutral" | "weak"
+                recommendation: 레짐별 행동 지침
+                inputs: 입력값 에코
+            """
+            try:
+                if kospi_today_pct > strong_kospi_pct and advance_ratio >= strong_adv_ratio:
+                    regime = "strong"
+                elif kospi_today_pct < weak_kospi_pct or advance_ratio < weak_adv_ratio:
+                    regime = "weak"
+                else:
+                    regime = "neutral"
+
+                recommendations = {
+                    "strong": (
+                        "강세장 — 종가매매 threshold 70 이상 적용 (노이즈 경고). "
+                        "섹터RS 상위 섹터 내 거래량 급증 종목 우선."
+                    ),
+                    "neutral": (
+                        "중립장 — 종가매매 threshold 65, 섹터RS 상위 섹터 집중 권장. "
+                        "거래량 신호가 가장 깨끗한 레짐 (역사적 승률 최우수)."
+                    ),
+                    "weak": (
+                        "약세장 — 종가매매 threshold 50 기본 유지 (1차 백테스트 기준 58.7%/+1.10%). "
+                        "RS·섹터 필터 적용 시 오히려 역효과 주의. 포지션 수 축소 고려."
+                    ),
+                }
+
+                return self.create_standard_response(
+                    success=True,
+                    query="classify_breadth_regime",
+                    data={
+                        "regime": regime,
+                        "recommendation": recommendations[regime],
+                        "inputs": {
+                            "kospi_today_pct": round(kospi_today_pct, 2),
+                            "advance_ratio": round(advance_ratio, 3),
+                            "weak_trigger": (
+                                kospi_today_pct < weak_kospi_pct or
+                                advance_ratio < weak_adv_ratio
+                            ),
+                            "strong_trigger": (
+                                kospi_today_pct > strong_kospi_pct and
+                                advance_ratio >= strong_adv_ratio
+                            ),
+                        },
+                    },
+                )
+            except Exception as e:
+                return await self.create_error_response(
+                    func_name="classify_breadth_regime", error=e,
+                )
+
+
 if __name__ == "__main__":
     try:
         server = ClosingBetMCPServer()

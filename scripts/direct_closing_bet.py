@@ -1537,7 +1537,8 @@ async def _manage_position(
         current = get_current_price(symbol) or entry_price
 
     new_peak, new_stop = ratchet_stop(entry_price, peak, stop, current, atr, ATR_K, STOP_LOSS_PCT)
-    aged = allow_time_exit and bool(pos.get("sell_after")) and today >= pos["sell_after"]
+    # sell_after 누락(레거시 포지션) 시 15:10 에 즉시 만기 처리 — 무한 이월 방지.
+    aged = allow_time_exit and (not pos.get("sell_after") or today >= pos["sell_after"])
     dec = evaluate_hold_exit(entry_price, current, new_stop, aged)
     pnl_pct = round((current - entry_price) / entry_price * 100, 2) if entry_price else 0.0
 

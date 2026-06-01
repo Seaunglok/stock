@@ -83,7 +83,10 @@ from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst  # noqa: E40
 from src.mcp_servers.closing_bet_mcp.exit_rules import (  # noqa: E402
     classify_regime,
     evaluate_exit,
+    evaluate_hold_exit,
     evaluate_market_filter,
+    init_stop_price,
+    ratchet_stop,
 )
 from src.mcp_servers.closing_bet_mcp.scorer import compute_technical_scores  # noqa: E402
 
@@ -135,6 +138,11 @@ TAX_BPS       = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))       # 매도�
 FEE_BPS       = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))        # 위탁수수료 (편도)
 SLIPPAGE_BPS  = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))  # 시장가 슬리피지 (편도)
 ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
+# (a) 보유기간 + (c) ATR 트레일링 손절 — 백테스트(atr2_h3)에서 p1 대비 OOS 우위 검증.
+#   기존 1영업일 강제청산(p1) 대신 최대 N영업일 보유 + ATR 트레일로 우측꼬리를 잡는다.
+HOLD_DAYS  = int(os.getenv("CLOSING_BET_HOLD_DAYS", "3"))       # 최대 보유 영업일 (시간청산)
+ATR_K      = float(os.getenv("CLOSING_BET_ATR_K", "2.0"))       # 트레일 밴드 = ATR_K × ATR
+ATR_PERIOD = int(os.getenv("CLOSING_BET_ATR_PERIOD", "14"))     # ATR 평균 기간(봉)
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
@@ -143,9 +151,9 @@ SCHEDULE: list[tuple[int, int, str]] = [
     (14, 50, "selection"),
     (15, 15, "buy_first"),    # E: 분할 매수 — 첫 50% (외부 권장 15:10~15:19)
     (15, 19, "buy_second"),   # E: 분할 매수 — 나머지 50% (마감 직전)
-    (18,  5, "after_hours"),  # 시간외 단일가 확인 → 내일 09:00 청산 우선순위
-    (9,   0, "sell"),         # 다음날 — 시초가 청산(부분청산 가능)
-    (15, 10, "force_close"),  # 다음날 — 잔량 강제청산 (1영업일 보유 보장, buy_first 15:15 직전)
+    (18,  5, "after_hours"),  # 시간외 단일가로 트레일링 스톱 갱신
+    (9,   0, "sell"),         # 매일 — 트레일/손절 청산만 (시간청산 X)
+    (15, 10, "force_close"),  # 매일 — 트레일 이탈 + 보유기간(HOLD_DAYS) 만기 시간청산
 ]
 
 # ─── 로거 ──────────────────────────────────────────────────────────────────
@@ -703,6 +711,34 @@ def _above_ma20(ohlcv: list[dict]) -> bool:
     return ohlcv[-1]["close"] >= ma20
 
 
+def _compute_atr(ohlcv: list[dict], period: int = ATR_PERIOD) -> float:
+    """평균 True Range (절대값). 데이터 부족 시 0.0 → 호출자가 고정손절로 폴백."""
+    if len(ohlcv) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(ohlcv)):
+        h = ohlcv[i].get("high", 0.0)
+        l = ohlcv[i].get("low", 0.0)
+        pc = ohlcv[i - 1].get("close", 0.0)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    k = trs[-period:]
+    return sum(k) / len(k) if k else 0.0
+
+
+def _add_business_days(start_date_str: str, n: int) -> str:
+    """YYYY-MM-DD 에 영업일(주말만 스킵) n일을 더한 날짜. 시간청산 기한 계산용.
+
+    공휴일은 미반영 — 기존 스케줄러의 주말-only 규약과 동일.
+    """
+    d = datetime.strptime(start_date_str, "%Y-%m-%d")
+    added = 0
+    while added < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d.strftime("%Y-%m-%d")
+
+
 def _today_gap_pct(ohlcv: list[dict]) -> float:
     """오늘 종가가 전일 대비 몇 % 상승했는지 반환."""
     if len(ohlcv) < 2:
@@ -1059,6 +1095,7 @@ def score_one_stock(
             "catalyst_weighted":   cat.has_catalyst,
             "technical_composite": round(tech.composite(), 1),
             "current_price":       float(ohlcv[-1]["close"]) if ohlcv else 0.0,
+            "atr":                 round(_compute_atr(ohlcv), 2),   # (c) 트레일 손절 밴드용
         }
     except Exception as e:
         logger.debug("[SCORE] %s 오류: %s", symbol, e)
@@ -1342,6 +1379,9 @@ async def phase_buy(
                     entry_price = fill_price if fill_price and fill_price > 0 else price
                     if fill_price and abs(fill_price - price) > 0.01:
                         logger.info("[BUY] %s 체결가 반영: %.0f → %.0f원", symbol, price, entry_price)
+                    # (a)+(c) 트레일 손절·보유기간 상태 초기화
+                    atr = float(c.get("atr", 0.0) or 0.0)
+                    stop0 = init_stop_price(entry_price, atr, ATR_K, STOP_LOSS_PCT)
                     orders.append({
                         "symbol":       symbol,
                         "company_name": c["company_name"],
@@ -1351,6 +1391,10 @@ async def phase_buy(
                         "sector":       c.get("sector", "기타"),
                         "buy_date":     today_str,
                         "split":        split_label,
+                        "atr":          atr,
+                        "stop_price":   round(stop0, 2),
+                        "peak_price":   entry_price,
+                        "sell_after":   _add_business_days(today_str, HOLD_DAYS),
                         "order_result": parsed,
                     })
                     logger.info(
@@ -1411,10 +1455,10 @@ async def phase_buy(
 # ─── Phase 2-b: 시간외 확인 ────────────────────────────────────────────────
 
 async def phase_after_hours(positions: list[dict] | None = None) -> None:
-    """18:05 — 시간외 단일가로 청산 신호 사전 확인, 상태 저장.
+    """18:05 — 시간외 단일가로 트레일링 스톱을 갱신(상방만)하고 현황 알림.
 
-    phase_sell()이 09:00에 이 결과를 읽어 evaluate_exit에 after_hours_price로 전달.
-    실제 매도 주문은 발생하지 않는다.
+    (a)+(c) 모델에서 실제 매도는 09:00/15:10 phase 가 담당한다. 여기선 시간외 고가를
+    반영해 trailing stop 을 끌어올리고(peak/stop 갱신) 상태를 저장만 한다.
     """
     logger.info("=" * 60)
     logger.info("[PHASE AH] 시간외 확인  %s", datetime.now().strftime("%H:%M:%S"))
@@ -1427,63 +1471,38 @@ async def phase_after_hours(positions: list[dict] | None = None) -> None:
         logger.info("[PHASE AH] 보유 포지션 없음 — 스킵")
         return
 
-    ah_signals: list[dict] = []
+    updated: list[dict] = []
+    lines = [f"🌙 시간외 확인 [{datetime.now().strftime('%m/%d %H:%M')}]"]
     for pos in positions:
         symbol      = pos["symbol"]
         entry_price = float(pos.get("entry_price", 0))
         name        = pos.get("company_name", symbol)
+        atr         = float(pos.get("atr", 0.0) or 0.0)
+        peak        = float(pos.get("peak_price", entry_price) or entry_price)
+        stop        = float(pos.get("stop_price", 0.0) or 0.0)
 
         ah_price = await _try_get_after_hours_price(symbol)
         if ah_price is None:
-            logger.info("[PHASE AH] %s 시간외가 조회 불가", symbol)
+            updated.append(pos)
             continue
 
-        exit_dec = evaluate_exit(
-            entry_price=entry_price,
-            current_price=ah_price,
-            after_hours_price=ah_price,
-            now=datetime.now(),
-            stop_loss_pct=STOP_LOSS_PCT,
-        )
+        new_peak, new_stop = ratchet_stop(entry_price, peak, stop, ah_price, atr, ATR_K, STOP_LOSS_PCT)
+        pos = {**pos, "peak_price": round(new_peak, 2), "stop_price": round(new_stop, 2)}
+        updated.append(pos)
         pnl_pct = round((ah_price - entry_price) / entry_price * 100, 2) if entry_price else 0.0
-        ah_signals.append({
-            "symbol":       symbol,
-            "company_name": name,
-            "ah_price":     ah_price,
-            "entry_price":  entry_price,
-            "pnl_pct":      pnl_pct,
-            "action":       exit_dec.action,
-            "reason":       exit_dec.reason,
-        })
-        logger.info(
-            "[PHASE AH] %s %-10s  시간외 %+.2f%%  신호=%s",
-            symbol, name[:10], pnl_pct, exit_dec.action,
-        )
+        icon = "🟢" if pnl_pct > 0 else ("🔴" if ah_price <= new_stop else "⚪")
+        lines.append(f"{icon} {name}({symbol})  시간외:{ah_price:,.0f}  {pnl_pct:+.2f}%  stop:{new_stop:,.0f}")
         _data_logger.log_event("after_hours", {
             "symbol": symbol, "name": name, "ah_price": ah_price,
-            "entry_price": entry_price, "pnl_pct": pnl_pct, "signal": exit_dec.action,
+            "entry_price": entry_price, "pnl_pct": pnl_pct, "stop_price": round(new_stop, 2),
         })
 
-    save_state("after_hours_signals", ah_signals)
-
-    urgent = [s for s in ah_signals if s["action"] in ("SELL_ALL", "STOP_LOSS")]
-    lines = [f"🌙 시간외 확인 [{datetime.now().strftime('%m/%d %H:%M')}]"]
-    if ah_signals:
-        for s in ah_signals:
-            icon = "🔴" if s["action"] in ("SELL_ALL", "STOP_LOSS") else ("🟢" if s["pnl_pct"] > 0 else "⚪")
-            lines.append(
-                f"{icon} {s['company_name']}({s['symbol']})  "
-                f"시간외:{s['ah_price']:,.0f}  {s['pnl_pct']:+.2f}%  {s['action']}"
-            )
-    else:
-        lines.append("시간외 데이터 없음 — 내일 09:00 정규가로 청산 판단")
-    if urgent:
-        lines.append(f"\n⚠️ 내일 09:00 우선 청산: {', '.join(s['symbol'] for s in urgent)}")
+    save_state("positions", updated)   # 갱신된 trailing stop 저장
     await notify("\n".join(lines))
-    logger.info("[PHASE AH] 완료 — 신호 %d건 (긴급 %d건)", len(ah_signals), len(urgent))
+    logger.info("[PHASE AH] 완료 — %d종목 트레일 갱신", len(updated))
 
 
-# ─── Phase 3: 매도 ──────────────────────────────────────────────────────────
+# ─── Phase 3: 매도 (다일 보유 + ATR 트레일) ─────────────────────────────────────
 
 async def _sell_market(mcp: Any, symbol: str, sell_qty: int) -> None:
     """trading-domain 시장가 매도 1건. 예외는 호출자에 전파."""
@@ -1496,16 +1515,77 @@ async def _sell_market(mcp: Any, symbol: str, sell_qty: int) -> None:
     })
 
 
-async def phase_sell(positions: list[dict] | None = None) -> None:
-    """다음날 09:00 — 시초가 기준 청산 신호 확인 → 매도 (부분청산 가능).
+async def _manage_position(
+    mcp: Any, pos: dict, exit_date: str, today: str, allow_time_exit: bool, when_label: str,
+) -> tuple[str, Any]:
+    """포지션 1건 평가: 트레일 갱신 → 손절/시간청산이면 전량 매도(원장 기록), 아니면 갱신본 유지.
 
-    부분청산(33/50%)·HOLD 로 남은 잔량은 positions 에 유지되어 같은 날 15:10
-    phase_force_close() 가 강제 정리한다(1영업일 보유 보장). 모든 매도는 종목별로
-    exit_ledger 에 누적되며, sell.json 의 승률은 "포지션 1건당 가중 실현손익"으로
-    계산되어 HOLD 편향이 없다.
+    Returns:
+      ("sold", pnl_pct)     — 전량 청산 완료 (원장/이벤트 기록됨)
+      ("keep", updated_pos) — 보유 지속 (갱신된 peak/stop)
+    """
+    symbol      = pos["symbol"]
+    entry_price = float(pos.get("entry_price", 0))
+    qty         = int(pos.get("quantity", 0))
+    name        = pos.get("company_name", symbol)
+    atr         = float(pos.get("atr", 0.0) or 0.0)
+    peak        = float(pos.get("peak_price", entry_price) or entry_price)
+    stop        = float(pos.get("stop_price", 0.0) or 0.0)
+
+    current = await _try_get_realtime_price(symbol)
+    if current is None:
+        current = get_current_price(symbol) or entry_price
+
+    new_peak, new_stop = ratchet_stop(entry_price, peak, stop, current, atr, ATR_K, STOP_LOSS_PCT)
+    aged = allow_time_exit and bool(pos.get("sell_after")) and today >= pos["sell_after"]
+    dec = evaluate_hold_exit(entry_price, current, new_stop, aged)
+    pnl_pct = round((current - entry_price) / entry_price * 100, 2) if entry_price else 0.0
+
+    if dec.action == "HOLD":
+        logger.info("[%s] %s %-10s  HOLD  손익=%+.2f%%  stop=%.0f",
+                    when_label, symbol, name[:10], pnl_pct, new_stop)
+        return ("keep", {**pos, "peak_price": round(new_peak, 2), "stop_price": round(new_stop, 2)})
+
+    if qty < 1:
+        return ("sold", pnl_pct)
+    try:
+        await _sell_market(mcp, symbol, qty)
+        _append_exit(exit_date, {
+            "symbol": symbol, "company_name": name, "entry_price": entry_price,
+            "qty": qty, "exit_price": current,
+            "composite": pos.get("composite", 0.0), "sector": pos.get("sector", "기타"),
+            "reason": dec.reason, "when": when_label,
+        })
+        _data_logger.log_event("sell", {
+            "symbol": symbol, "name": name, "action": dec.action,
+            "qty": qty, "entry_price": entry_price, "exit_price": current,
+            "pnl_pct": pnl_pct, "reason": dec.reason,
+            "composite": pos.get("composite", 0.0), "mock": MOCK_MODE,
+        })
+        logger.info("[%s] %s %-10s  SELL_ALL  손익=%+.2f%%  (%s)",
+                    when_label, symbol, name[:10], pnl_pct, dec.reason)
+        return ("sold", pnl_pct)
+    except Exception as e:
+        logger.error("[%s] %s 매도 실패: %s", when_label, symbol, e)
+        _data_logger.log_event("error", {"phase": when_label, "symbol": symbol, "error": str(e)[:200]})
+        return ("keep", {**pos, "peak_price": round(new_peak, 2), "stop_price": round(new_stop, 2)})
+
+
+def _entry_date_label(positions: list[dict]) -> str:
+    """보유 포지션들의 최소 buy_date (다일 보유라 진입일이 섞일 수 있음)."""
+    dates = [p.get("buy_date") for p in positions if p.get("buy_date")]
+    return min(dates) if dates else (get_state("buy_date") or
+                                     (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"))
+
+
+async def phase_sell(positions: list[dict] | None = None) -> None:
+    """매 영업일 09:00 — 보유 전 종목의 트레일/손절 청산만 평가 (시간청산은 15:10).
+
+    (a)+(c): 우측꼬리를 잡기 위해 부분 익절 없이 트레일링 스톱 이탈 시에만 전량 청산하고,
+    그렇지 않으면 보유를 지속한다(최대 HOLD_DAYS 영업일). 보유분은 갱신된 stop 으로 유지.
     """
     logger.info("=" * 60)
-    logger.info("[PHASE 3] 청산 판단 시작  %s", datetime.now().strftime("%H:%M:%S"))
+    logger.info("[PHASE 3] 청산 판단(09:00) 시작  %s", datetime.now().strftime("%H:%M:%S"))
     logger.info("=" * 60)
     _data_logger.log_event("phase_start", {"phase": "sell"})
 
@@ -1516,196 +1596,115 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
         _data_logger.log_event("skip", {"reason": "no_positions", "phase": "sell"})
         return
 
-    mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
-    exit_date  = datetime.now().strftime("%Y-%m-%d")
-    entry_date = get_state("buy_date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    mode_tag   = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
+    today      = datetime.now().strftime("%Y-%m-%d")
+    exit_date  = today
+    entry_date = _entry_date_label(positions)
     _ensure_exit_ledger(exit_date)
-    # 18:05 시간외 확인 결과 로드 (없으면 빈 dict)
-    ah_signals_map = {s["symbol"]: s for s in (get_state("after_hours_signals") or [])}
-    remaining: list[dict] = []   # 부분청산/HOLD 잔량 → 15:10 force_close 대상
+    remaining: list[dict] = []
+    sold = 0
 
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
                 await notify("❌ trading-domain :8030 연결 실패 — 청산 중단")
                 return
-
             for pos in positions:
-                symbol      = pos["symbol"]
-                entry_price = float(pos.get("entry_price", 0))
-                qty         = int(pos.get("quantity", 0))
-                name        = pos.get("company_name", symbol)
-
-                # 현재가: kiwoom-market-mcp → trading-domain → pykrx 전일종가 순으로 시도
-                current_price = await _try_get_realtime_price(symbol)
-                if current_price is None:
-                    current_price = get_current_price(symbol)  # pykrx 전일 종가
-                    if current_price is None:
-                        current_price = entry_price
-                    logger.warning(
-                        "[SELL] %s 실시간가 미조회 — pykrx 전일종가 사용 "
-                        "(kiwoom-market-mcp :8031 미기동 시 손익 정확도 낮음)", symbol,
-                    )
-
-                # 청산 신호 (시간외 가격 있으면 반영)
-                ah_price = ah_signals_map.get(symbol, {}).get("ah_price")
-                exit_dec = evaluate_exit(
-                    entry_price=entry_price,
-                    current_price=current_price,
-                    after_hours_price=ah_price,
-                    now=datetime.now(),
-                    stop_loss_pct=STOP_LOSS_PCT,
+                status, payload = await _manage_position(
+                    mcp, pos, exit_date, today, allow_time_exit=False, when_label="09:00",
                 )
-                pnl_pct = (
-                    round((current_price - entry_price) / entry_price * 100, 2)
-                    if entry_price else 0.0
-                )
-                logger.info(
-                    "[SELL] %s %-10s  신호=%-12s  손익=%+.2f%%",
-                    symbol, name[:10], exit_dec.action, pnl_pct,
-                )
-
-                if exit_dec.action == "HOLD":
-                    remaining.append(pos)   # 15:10 강제청산이 처리
-                    continue
-
-                sell_qty = (
-                    qty if exit_dec.suggested_qty_pct >= 100
-                    else max(1, int(qty * exit_dec.suggested_qty_pct / 100))
-                )
-                try:
-                    await _sell_market(mcp, symbol, sell_qty)
-                    _append_exit(exit_date, {
-                        "symbol": symbol, "company_name": name, "entry_price": entry_price,
-                        "qty": sell_qty, "exit_price": current_price,
-                        "composite": pos.get("composite", 0.0), "sector": pos.get("sector", "기타"),
-                        "reason": exit_dec.reason, "when": "09:00",
-                    })
-                    _data_logger.log_event("sell", {
-                        "symbol": symbol, "name": name, "action": exit_dec.action,
-                        "qty": sell_qty, "entry_price": entry_price, "exit_price": current_price,
-                        "pnl_pct": pnl_pct, "reason": exit_dec.reason,
-                        "composite": pos.get("composite", 0.0), "mock": MOCK_MODE,
-                    })
-                    rem_qty = qty - sell_qty
-                    if rem_qty > 0:   # 부분청산 → 잔량은 15:10 강제청산
-                        remaining.append({**pos, "quantity": rem_qty})
-                except Exception as e:
-                    logger.error("[SELL] %s 매도 실패: %s", symbol, e)
-                    _data_logger.log_event("error", {
-                        "phase": "sell", "symbol": symbol, "error": str(e)[:200],
-                    })
-                    remaining.append(pos)   # 실패분은 15:10 재시도
-
+                if status == "keep":
+                    remaining.append(payload)
+                else:
+                    sold += 1
     except Exception as e:
         logger.error("[SELL] 오류: %s", e)
         await notify(f"❌ 청산 오류: {e}")
         return
 
     save_state("positions", remaining)
-    results = _finalize_sell_log(entry_date, exit_date)   # 09:00 시점 실현분으로 sell.json 갱신
-    save_state("sell", results)
+    results = _finalize_sell_log(entry_date, exit_date) if sold else _aggregate_exits(exit_date)
+    if sold:
+        save_state("sell", results)
 
-    # 알림 — 09:00 실현분 + 잔량(15:10 강제청산 예정)
     lines = [f"📤 청산(09:00) {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]"]
-    for r in results:
-        icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
-        lines.append(f"{icon} {r['company_name']}({r['symbol']})  {r['pnl_pct']:+.2f}%  ({r['sell_qty']}주 실현)")
+    if sold:
+        for r in results:
+            icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
+            lines.append(f"{icon} {r['company_name']}({r['symbol']})  실현 {r['pnl_pct']:+.2f}%")
+    else:
+        lines.append("트레일 이탈 없음 — 전량 보유 지속")
     if remaining:
-        lines.append(f"\n⏳ 잔량 {len(remaining)}종목 — 15:10 강제청산 예정: {', '.join(p['symbol'] for p in remaining)}")
+        lines.append(f"\n⏳ 보유 {len(remaining)}종목 (트레일 유지, 만기 15:10 시간청산): "
+                     f"{', '.join(p['symbol'] for p in remaining)}")
     await notify("\n".join(lines))
-    logger.info("[PHASE 3] 완료 — 실현:%d종목  잔량:%d종목", len(results), len(remaining))
+    logger.info("[PHASE 3] 완료 — 청산:%d종목  보유지속:%d종목", sold, len(remaining))
 
 
-# ─── Phase 3-b: 잔량 강제 청산 (1영업일 보장) ──────────────────────────────────
+# ─── Phase 3-b: 시간청산 + 트레일 (매 영업일 15:10) ──────────────────────────────
 
 async def phase_force_close(positions: list[dict] | None = None) -> None:
-    """15:10 — 09:00 청산에서 남은 잔량(부분청산 후 잔여/HOLD)을 전량 시장가 청산.
+    """매 영업일 15:10 — 트레일 이탈분 청산 + 보유기간(HOLD_DAYS) 만기분 시간청산.
 
-    종가매매는 1영업일 보유 전략이므로, 보유분이 다음날로 넘어가지 않도록 같은 날
-    장 마감 직전 강제 정리한다. 모든 매도는 exit_ledger 에 누적되어 sell.json 의
-    실현손익/승률이 완성된다.
+    (a): 만기에 도달하지 않은 포지션은 청산하지 않고 다음 영업일로 이월(트레일 유지).
+    따라서 force_close 는 더 이상 '전량 청산'이 아니라 'aged-out + 트레일 이탈'만 정리한다.
     """
     logger.info("=" * 60)
-    logger.info("[PHASE FC] 잔량 강제청산  %s", datetime.now().strftime("%H:%M:%S"))
+    logger.info("[PHASE FC] 시간청산/트레일(15:10)  %s", datetime.now().strftime("%H:%M:%S"))
     logger.info("=" * 60)
     _data_logger.log_event("phase_start", {"phase": "force_close"})
 
     if positions is None:
         positions = get_state("positions") or []
 
-    exit_date  = datetime.now().strftime("%Y-%m-%d")
-    entry_date = get_state("buy_date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today      = datetime.now().strftime("%Y-%m-%d")
+    exit_date  = today
+    entry_date = _entry_date_label(positions) if positions else \
+        (get_state("buy_date") or today)
 
     if not positions:
-        logger.info("[PHASE FC] 잔량 없음 — 09:00에 전량 청산됨")
-        # 09:00에 모두 실현됐어도 sell.json 을 최종 확정해 둔다.
+        logger.info("[PHASE FC] 보유 포지션 없음")
         _finalize_sell_log(entry_date, exit_date)
         return
 
     _ensure_exit_ledger(exit_date)
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
-    closed = 0
+    remaining: list[dict] = []
+    sold = 0
 
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
-                await notify("❌ trading-domain :8030 연결 실패 — 강제청산 중단")
+                await notify("❌ trading-domain :8030 연결 실패 — 청산 중단")
                 return
-
             for pos in positions:
-                symbol      = pos["symbol"]
-                entry_price = float(pos.get("entry_price", 0))
-                qty         = int(pos.get("quantity", 0))
-                name        = pos.get("company_name", symbol)
-                if qty < 1:
-                    continue
-
-                current_price = await _try_get_realtime_price(symbol)
-                if current_price is None:
-                    current_price = get_current_price(symbol) or entry_price
-                pnl_pct = round((current_price - entry_price) / entry_price * 100, 2) if entry_price else 0.0
-
-                try:
-                    await _sell_market(mcp, symbol, qty)
-                    _append_exit(exit_date, {
-                        "symbol": symbol, "company_name": name, "entry_price": entry_price,
-                        "qty": qty, "exit_price": current_price,
-                        "composite": pos.get("composite", 0.0), "sector": pos.get("sector", "기타"),
-                        "reason": "EOD 강제청산 (1영업일 보유 한도)", "when": "15:10",
-                    })
-                    _data_logger.log_event("force_close", {
-                        "symbol": symbol, "name": name, "qty": qty,
-                        "entry_price": entry_price, "exit_price": current_price,
-                        "pnl_pct": pnl_pct, "composite": pos.get("composite", 0.0), "mock": MOCK_MODE,
-                    })
-                    closed += 1
-                    logger.info("[FC] %s %-10s  %d주 강제청산  손익=%+.2f%%  %s",
-                                symbol, name[:10], qty, pnl_pct, mode_tag)
-                except Exception as e:
-                    logger.error("[FC] %s 강제청산 실패: %s", symbol, e)
-                    _data_logger.log_event("error", {
-                        "phase": "force_close", "symbol": symbol, "error": str(e)[:200],
-                    })
-
+                status, payload = await _manage_position(
+                    mcp, pos, exit_date, today, allow_time_exit=True, when_label="15:10",
+                )
+                if status == "keep":
+                    remaining.append(payload)
+                else:
+                    sold += 1
     except Exception as e:
         logger.error("[FC] 오류: %s", e)
-        await notify(f"❌ 강제청산 오류: {e}")
+        await notify(f"❌ 청산 오류: {e}")
         return
 
-    save_state("positions", [])   # 전량 청산 — 오버나잇 잔량 0
+    save_state("positions", remaining)   # 만기 미도달분만 이월
     results = _finalize_sell_log(entry_date, exit_date)
     save_state("sell", results)
 
-    lines = [f"🧹 잔량 강제청산(15:10) {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]  {closed}종목"]
+    lines = [f"🧹 시간청산/트레일(15:10) {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]  청산 {sold}종목"]
     for r in results:
         icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
         lines.append(f"{icon} {r['company_name']}({r['symbol']})  실현 {r['pnl_pct']:+.2f}%")
     if results:
         wins = sum(1 for r in results if r["pnl_pct"] > 0)
-        lines.append(f"\n📊 당일 실현 {len(results)}종목  승률 {wins/len(results)*100:.0f}%")
+        lines.append(f"\n📊 당일 실현 {len(results)}종목  승률(net) {wins/len(results)*100:.0f}%")
+    if remaining:
+        lines.append(f"⏭ 이월 {len(remaining)}종목 (보유기간 미만기): {', '.join(p['symbol'] for p in remaining)}")
     await notify("\n".join(lines))
-    logger.info("[PHASE FC] 완료 — 강제청산 %d종목, 실현 합산 %d종목", closed, len(results))
+    logger.info("[PHASE FC] 완료 — 청산:%d  이월:%d  실현합산:%d종목", sold, len(remaining), len(results))
 
 
 # ─── 즉시 테스트 (선별만) ───────────────────────────────────────────────────

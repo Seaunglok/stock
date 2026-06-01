@@ -55,4 +55,19 @@ OOS에서도 hold3가 **누적 net ~3배, 기대값 ~3배**. 인샘플 우연이
 - (c) 손절을 ATR/트레일 기반으로 정교화(현 고정 -2%는 일봉 근사) 후 재측정.
 - (d) 채택 시 `direct_closing_bet.py`의 force_close/scheduler를 N영업일 보유로 일반화(현재는 1일 고정).
 
-> 라이브 코드는 변경하지 않았다(P1 1영업일 청산 유지). 위 (a)~(d) 중 방향을 정하면 구현한다.
+## 4. 채택 (2026-06-01) — (a)+(c) 구현 완료
+
+위 (a)[보유기간]+(c)[ATR 트레일]를 **`atr2_h3`(ATR k=2, 최대 3영업일 보유)** 설정으로 라이브에 반영.
+
+OOS 검증 (동일 진입 55/3, 비용 후):
+| 청산 | 승률 | 기대값/건 | PF | P90 | 누적 net |
+|------|------|-----------|----|-----|----------|
+| `p1` (구) | 41.0% | +0.46% | 1.35 | +6.76% | +47.9% |
+| **`atr2_h3` (신규)** | 47.6% | **+1.15%** | 1.45 | +11.87% | **+120.9%** |
+
+구현: [exit_rules.py](../src/mcp_servers/closing_bet_mcp/exit_rules.py) `init_stop_price/ratchet_stop/evaluate_hold_exit`,
+[direct_closing_bet.py](../scripts/direct_closing_bet.py) `_manage_position` + phase_sell/force_close/after_hours 재설계.
+파라미터: `CLOSING_BET_HOLD_DAYS=3`, `CLOSING_BET_ATR_K=2.0` (env로 조정, `HOLD_DAYS=1`이면 구 동작 근접).
+
+**잔여 트레이드오프(운영 모니터링 필요)**: 오버나잇 노출 ×3, 단일 레짐 검증, 우측꼬리 소수 종목 의존,
+ATR 밴드(k=2)가 고정 -2%보다 넓어 개별 손실(P10)은 더 큼. 추세 약화/횡보장에서 재측정 권장.

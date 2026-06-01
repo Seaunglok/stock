@@ -104,6 +104,79 @@ def evaluate_exit(
     )
 
 
+# ───────────────────────────────────────────────────────────────────
+# (a) N영업일 보유 + (c) ATR 기반 트레일링 스톱 — 순수 함수.
+#   백테스트(backtest_walkforward.py 'atr2_h3')에서 p1 대비 OOS 우위 검증:
+#   동일 진입 기준 승률↑·기대값↑·우측꼬리(P90)↑. 고정 -2% 일봉 근사를 대체.
+# ───────────────────────────────────────────────────────────────────
+
+def _atr_band(entry_price: float, atr: float, atr_k: float, fallback_stop_pct: float) -> float:
+    """손절 밴드(원). ATR 있으면 atr_k*ATR, 없으면 |fallback_stop_pct|%."""
+    if atr and atr > 0:
+        return atr_k * atr
+    return abs(fallback_stop_pct) / 100.0 * entry_price
+
+
+def init_stop_price(
+    entry_price: float,
+    atr: float,
+    atr_k: float = 2.0,
+    fallback_stop_pct: float = -2.0,
+) -> float:
+    """매수 직후 초기 손절가 = 평단 - 밴드."""
+    return entry_price - _atr_band(entry_price, atr, atr_k, fallback_stop_pct)
+
+
+def ratchet_stop(
+    entry_price: float,
+    peak_price: float,
+    stop_price: float,
+    current_price: float,
+    atr: float,
+    atr_k: float = 2.0,
+    fallback_stop_pct: float = -2.0,
+) -> tuple[float, float]:
+    """트레일링: 종가(현재가) 최고점 갱신 시 손절가를 위로만 끌어올린다.
+
+    Returns: (new_peak, new_stop) — stop 은 절대 내려가지 않음.
+    """
+    band = _atr_band(entry_price, atr, atr_k, fallback_stop_pct)
+    new_peak = max(peak_price or entry_price, current_price)
+    new_stop = max(stop_price, new_peak - band)
+    return new_peak, new_stop
+
+
+def evaluate_hold_exit(
+    entry_price: float,
+    current_price: float,
+    stop_price: float,
+    aged_out: bool,
+) -> ExitDecision:
+    """N일 보유 + 트레일 청산 판정.
+
+    우선순위: 트레일/손절 이탈(전량) → 보유기간 만료(시간청산, 전량) → 보유.
+    부분청산 없음 — 우측꼬리를 끝까지 잡기 위해 승자를 조기 절단하지 않는다.
+    """
+    pnl = (current_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+    if stop_price > 0 and current_price <= stop_price:
+        return ExitDecision(
+            action="SELL_ALL", urgency="high",
+            reason=f"트레일/손절 이탈 ({pnl:+.2f}%) — stop {stop_price:,.0f}",
+            suggested_qty_pct=100,
+        )
+    if aged_out:
+        return ExitDecision(
+            action="SELL_ALL", urgency="medium",
+            reason=f"보유기간 만료 ({pnl:+.2f}%) — 시간청산",
+            suggested_qty_pct=100,
+        )
+    return ExitDecision(
+        action="HOLD", urgency="low",
+        reason=f"보유 ({pnl:+.2f}%) — 트레일 유지 (stop {stop_price:,.0f})",
+        suggested_qty_pct=0,
+    )
+
+
 def classify_regime(
     kospi_today_pct: float,
     advance_ratio: float,

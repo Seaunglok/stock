@@ -6,18 +6,21 @@
 
 ## 1. 전략 개요
 
-전일 종가에 매수해 다음날 시초가/장중에 청산하는 **단기 스윙(보유 1영업일)** 전략.
+전일 종가에 매수해 **최대 N영업일(`HOLD_DAYS`, 기본 3) 보유**하며 ATR 트레일링 스톱으로
+청산하는 단기 스윙 전략. (구버전은 1영업일 강제청산이었으나, 백테스트에서 우측꼬리 포착이
+기대값을 좌우함이 드러나 보유기간+트레일로 일반화 — §6 참조.)
 
 ```
 14:50  선별 phase    →  거래대금 1,000억원+ × 상위 50종목 채점
-15:15  매수 1차      →  점수 60+ 1~5종목, 의도 수량의 50% 시장가 매수
+15:15  매수 1차      →  점수 55+ 1~3종목, 의도 수량의 50% 시장가 매수 (+ATR/stop 초기화)
 15:19  매수 2차      →  마감 직전, 잔여 50% 시장가 매수
-18:05  AH phase      →  시간외 단일가로 익일 청산 우선순위 미리 산정
-09:00  매도 phase    →  evaluate_exit() 신호로 청산 (부분청산 가능)
-15:10  강제청산 phase →  09:00 잔량(부분청산 후 잔여/HOLD) 전량 시장가 청산 → 오버나잇 잔량 0
+18:05  AH phase      →  시간외 단일가로 트레일링 스톱 갱신(상방만)
+09:00  매도 phase    →  보유 전 종목 트레일/손절 이탈만 청산 (시간청산 X)
+15:10  청산 phase    →  트레일 이탈분 + 보유기간 만기분 시간청산. 미만기는 다음날로 이월
 ```
 
-매수 후 보유 시간 ≈ 18시간. **하룻밤 위험**을 감수하는 대신, 종가 부근의 셋업(거래대금·매물대·외인 양매수)이 익일 시초가에 추가 매수세를 끌어올 확률에 베팅.
+매수 후 셋업(거래대금·매물대·외인 양매수)이 추가 매수세를 끌어올 확률에 베팅하되,
+**승자는 ATR 트레일로 끝까지 따라가고(우측꼬리), 패자는 ATR 손절로 제한**한다.
 
 ## 2. 진입 조건 — 6단계 게이트
 
@@ -96,29 +99,32 @@ composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
 - "반도체 5종목" 같은 상관 리스크 차단
 - 섹터 정보는 FinanceDataReader → 실패 시 Kiwoom universe 캐시
 
-## 6. 청산 규칙 ([evaluate_exit](../src/mcp_servers/closing_bet_mcp/exit_rules.py))
+## 6. 청산 규칙 — 보유기간 + ATR 트레일링 ([exit_rules.py](../src/mcp_servers/closing_bet_mcp/exit_rules.py))
 
-우선순위 (위에서부터 평가):
+**(a) 최대 `HOLD_DAYS` 영업일 보유 + (c) ATR 트레일링 스톱.** 매 영업일 09:00·15:10·18:05에
+보유 전 종목을 평가한다 ([evaluate_hold_exit](../src/mcp_servers/closing_bet_mcp/exit_rules.py)):
 
-| 조건 | 액션 | 수량 |
+| 시점 | 평가 | 청산 |
 |------|------|------|
-| 시간외 가격 < 평단 **AND** 시초가 ≤ 평단 | `SELL_ALL` | 100% |
-| 정규장 `STOP_LOSS_PCT` 이탈 | `STOP_LOSS` | 100% |
-| 09:00~09:05 + 수익 | `PARTIAL_SELL` | 33% (1/3 익절) |
-| 09:05 이후 + +2% 이상 | `SELL_ALL` | 100% (탐욕 X) |
-| 정규장 +3% 이상 | `PARTIAL_SELL` | 50% |
-| 그 외 | `HOLD` | 0% (→ 15:10 강제청산) |
+| 매수 직후 | `stop = 평단 − ATR_K×ATR` (ATR 없으면 `STOP_LOSS_PCT` 폴백) | — |
+| 18:05 / 매 09:00·15:10 | 종가 최고점 갱신 시 `stop = max(stop, peak − ATR_K×ATR)` (상방만) | — |
+| 매 09:00 | 현재가 ≤ stop | `SELL_ALL` (트레일/손절 이탈) |
+| 매 15:10 | 현재가 ≤ stop **또는** 보유 ≥ `HOLD_DAYS` 영업일 | `SELL_ALL` (트레일 이탈 / 시간청산) |
+| 그 외 | — | `HOLD` (다음 영업일 이월, stop 유지) |
 
 **핵심 규칙**:
-1. 손절은 `STOP_LOSS_PCT` 한도 (기본 -2.0%, 노이즈 손절 방지)
-2. 시초가 수익은 1/3만 익절 (러닝). HOLD/부분청산 잔량은 **같은 날 15:10 강제청산** → 1영업일 보유 보장.
-3. 9:05 지나면 +2% 이상은 전량 매도 (욕심 X)
-4. **(P1 2026-06-01)** 시간외 하락은 시초가도 평단 이하일 때만 즉시 전량 매도. 밤사이 회복해
-   시초 갭업한 종목까지 투매하던 문제를 수정 — 시초 회복(현재가 > 평단) 시엔 정상 룰에 위임.
+1. **부분 익절 없음** — 승자를 조기 절단하지 않고 ATR 트레일로 끝까지 추종(우측꼬리 포착).
+2. **손절은 변동성 비례(ATR)** — 고정 -2% 일봉 근사 대체. ATR 데이터 부족 시 `STOP_LOSS_PCT` 폴백.
+3. **시간청산**은 15:10에만 (`buy_date + HOLD_DAYS` 영업일 도달 시). 미만기 종목은 다음날 이월.
+4. 트레일 스톱은 절대 내려가지 않음(상방 래칫) — 한번 확보한 이익을 보호.
 
-> **승률 측정 (P1)**: 모든 포지션이 09:00 부분청산 + 15:10 강제청산으로 1영업일 내 실현되며,
-> sell.json 의 승률은 종목별 **가중 실현손익**(`exit_ledger` 합산)으로 계산된다. 과거 `HOLD`를
-> 분모에서 제외해 승률이 상향 편향되던 문제 제거.
+> **검증 (atr2_h3, OOS)**: 동일 진입(55/3) 기준 p1(구 1일 청산) 대비 누적 net +120.9% vs +47.9%,
+> 기대값 +1.15% vs +0.46%, 승률 47.6% vs 41.0%, P90 +11.9% vs +6.8%. 상세
+> [docs/backtest_exit_policy_2026-06-01.md](backtest_exit_policy_2026-06-01.md).
+> 승률 측정은 종목별 **net 가중 실현손익**(`exit_ledger`) — 모든 포지션이 트레일/시간청산으로 실현돼 HOLD 편향 없음.
+
+> ⚠️ **트레이드오프**: 최대 `HOLD_DAYS` 오버나잇 노출(기본 3일). 단일 레짐(6개월) 검증이며
+> 우측꼬리가 소수 종목에 의존 → 추세장 의존 가능. `CLOSING_BET_HOLD_DAYS=1`로 사실상 구 동작에 근접.
 
 ## 7. 운영 파라미터 (튜닝 가능)
 
@@ -131,6 +137,10 @@ composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
 | `INVESTMENT_PER_TRADE` | 500,000 | `INVESTMENT_PER_TRADE` | 1종목 기준 투자금 |
 | `CATALYST_WEIGHT` | 0.0 | `CLOSING_BET_CATALYST_WEIGHT` | catalyst 블렌딩 가중 (0=technical-only, 백테스트와 동일) |
 | `CONVICTION_SIZING` | false | `CLOSING_BET_CONVICTION_SIZING` | 점수 차등 사이징 on/off (기본 off=전 구간 1.0x) |
+| `HOLD_DAYS` | 3 | `CLOSING_BET_HOLD_DAYS` | 최대 보유 영업일 (시간청산 기한). 1이면 사실상 구 1일 청산 |
+| `ATR_K` | 2.0 | `CLOSING_BET_ATR_K` | 트레일 손절 밴드 = ATR_K × ATR |
+| `ATR_PERIOD` | 14 | `CLOSING_BET_ATR_PERIOD` | ATR 평균 기간(봉) |
+| `TAX/FEE/SLIPPAGE_BPS` | 18/1.5/10 | `CLOSING_BET_*_BPS` | 거래비용(편도 bps) — net 손익 차감 (왕복 ≈0.41%) |
 | `MOCK_MODE` | true | `MOCK_MODE` | 모의 주문 |
 | `MAX_PER_SECTOR` | 2 | (코드) | 섹터 분산 |
 | `TOP_N_STOCKS` | 50 | (코드) | 거래대금 상위 N |

@@ -72,9 +72,24 @@ class Costs:
                 f"tax={self.tax:.3f} fee={self.fee:.3f}x2 slip={self.slip:.3f}x2)")
 
 
-# ─── 청산정책 (gross % 반환; 모두 동일한 진입가/미래봉을 받아 청산만 달리한다) ────────
+# ─── ATR (변동성 기반 손절폭) ──────────────────────────────────────────────
 
-def _exit_p1(entry: float, fb: list[dict], stop_pct: float) -> float:
+def _atr(ohlcv: list[dict], period: int = 14) -> float:
+    """평균 True Range (절대값). 진입일까지의 봉으로 계산."""
+    if len(ohlcv) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(ohlcv)):
+        h, l, pc = ohlcv[i]["high"], ohlcv[i]["low"], ohlcv[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    k = trs[-period:]
+    return sum(k) / len(k) if k else 0.0
+
+
+# ─── 청산정책 (gross % 반환; 모두 동일한 진입가/미래봉을 받아 청산만 달리한다) ────────
+# 시그니처 통일: (entry, future_bars, stop_pct, atr). 고정손절 정책은 atr 무시.
+
+def _exit_p1(entry: float, fb: list[dict], stop_pct: float, atr: float = 0.0) -> float:
     """라이브 P1: 09:00 시초 부분청산(녹색 33%) + 15:10 종가 강제청산 + 장중 손절. T+1 만 사용."""
     if not fb or entry <= 0:
         return 0.0
@@ -91,7 +106,7 @@ def _exit_p1(entry: float, fb: list[dict], stop_pct: float) -> float:
     return realized + rem * rem_ret
 
 
-def _exit_close1(entry: float, fb: list[dict], stop_pct: float) -> float:
+def _exit_close1(entry: float, fb: list[dict], stop_pct: float, atr: float = 0.0) -> float:
     """T+1 종가 전량 청산 (시초 부분청산 없음). 갭다운/장중 손절 반영."""
     if not fb or entry <= 0:
         return 0.0
@@ -104,7 +119,7 @@ def _exit_close1(entry: float, fb: list[dict], stop_pct: float) -> float:
     return (c - entry) / entry * 100
 
 
-def _exit_hold(entry: float, fb: list[dict], stop_pct: float, n: int) -> float:
+def _exit_hold(entry: float, fb: list[dict], stop_pct: float, n: int, atr: float = 0.0) -> float:
     """N영업일 보유 후 종가 청산. 매일 장중 저가가 손절가 이탈 시 손절가 청산(우측꼬리 허용)."""
     if not fb or entry <= 0:
         return 0.0
@@ -119,7 +134,7 @@ def _exit_hold(entry: float, fb: list[dict], stop_pct: float, n: int) -> float:
     return (bars[-1]["close"] - entry) / entry * 100
 
 
-def _exit_trail(entry: float, fb: list[dict], stop_pct: float, trail_pct: float, n: int) -> float:
+def _exit_trail(entry: float, fb: list[dict], stop_pct: float, trail_pct: float, n: int, atr: float = 0.0) -> float:
     """트레일링 스톱: 종가 최고점 대비 trail_pct 하락 시 청산. 하드 손절 병행, 최대 N일 보유.
 
     우측꼬리(큰 추세)를 끝까지 따라가되, 고점 대비 일정 % 되돌리면 이익을 확정.
@@ -139,7 +154,7 @@ def _exit_trail(entry: float, fb: list[dict], stop_pct: float, trail_pct: float,
     return (bars[-1]["close"] - entry) / entry * 100
 
 
-def _exit_target(entry: float, fb: list[dict], stop_pct: float, tp_pct: float, n: int) -> float:
+def _exit_target(entry: float, fb: list[dict], stop_pct: float, tp_pct: float, n: int, atr: float = 0.0) -> float:
     """이익목표 + 손절 + 시간청산: 장중 고가가 +tp_pct 도달 시 목표가 익절,
     저가가 손절 이탈 시 손절, 둘 다 아니면 N일 종가 청산."""
     if not fb or entry <= 0:
@@ -161,14 +176,45 @@ def _exit_target(entry: float, fb: list[dict], stop_pct: float, tp_pct: float, n
     return (bars[-1]["close"] - entry) / entry * 100
 
 
-# name → (callable, kwargs)  ; stop_pct 는 런타임 주입
+def _exit_atr_trail(entry: float, fb: list[dict], stop_pct: float, atr: float,
+                    atr_k: float = 2.0, n: int = 3) -> float:
+    """(#a + #c) N영업일 보유 + ATR 기반 트레일링 스톱.
+
+    - 초기 하드손절 = entry - atr_k*ATR (변동성에 비례 — 고정 -2% 일봉 근사 대체)
+    - 종가 최고점이 갱신될 때마다 스톱을 peak - atr_k*ATR 로 끌어올림(상방만)
+    - 저가가 스톱 이탈 시 스톱가 청산, 아니면 N일 종가 시간청산
+    ATR=0(데이터 부족)이면 고정 stop_pct 로 폴백.
+    """
+    if not fb or entry <= 0:
+        return 0.0
+    band = atr_k * atr if atr > 0 else abs(stop_pct) / 100 * entry
+    hard0 = entry - band
+    bars = fb[:n]
+    if bars[0]["open"] <= hard0:
+        return (bars[0]["open"] - entry) / entry * 100
+    stop = hard0
+    peak = entry
+    for b in bars:
+        peak = max(peak, b["close"])
+        stop = max(stop, peak - band)        # 상방만 이동
+        if b["low"] <= stop:
+            return (stop - entry) / entry * 100
+    return (bars[-1]["close"] - entry) / entry * 100
+
+
+# name → callable(entry, fb, stop_pct, atr) ; stop_pct/atr 런타임 주입
 POLICIES: dict[str, callable] = {
-    "p1":     lambda e, fb, s: _exit_p1(e, fb, s),
-    "close1": lambda e, fb, s: _exit_close1(e, fb, s),
-    "hold2":  lambda e, fb, s: _exit_hold(e, fb, s, 2),
-    "hold3":  lambda e, fb, s: _exit_hold(e, fb, s, 3),
-    "trail3": lambda e, fb, s: _exit_trail(e, fb, s, trail_pct=-3.0, n=3),
-    "target": lambda e, fb, s: _exit_target(e, fb, s, tp_pct=4.0, n=3),
+    "p1":       lambda e, fb, s, atr: _exit_p1(e, fb, s),
+    "close1":   lambda e, fb, s, atr: _exit_close1(e, fb, s),
+    "hold2":    lambda e, fb, s, atr: _exit_hold(e, fb, s, 2),
+    "hold3":    lambda e, fb, s, atr: _exit_hold(e, fb, s, 3),
+    "trail3":   lambda e, fb, s, atr: _exit_trail(e, fb, s, trail_pct=-3.0, n=3),
+    "target":   lambda e, fb, s, atr: _exit_target(e, fb, s, tp_pct=4.0, n=3),
+    # (#a+#c) ATR 트레일 × 보유기간 조합
+    "atr2_h2":  lambda e, fb, s, atr: _exit_atr_trail(e, fb, s, atr, atr_k=2.0, n=2),
+    "atr2_h3":  lambda e, fb, s, atr: _exit_atr_trail(e, fb, s, atr, atr_k=2.0, n=3),
+    "atr25_h3": lambda e, fb, s, atr: _exit_atr_trail(e, fb, s, atr, atr_k=2.5, n=3),
+    "atr3_h3":  lambda e, fb, s, atr: _exit_atr_trail(e, fb, s, atr, atr_k=3.0, n=3),
 }
 
 
@@ -218,7 +264,7 @@ def build_daily_candidates(start, end, gap_mode, broad=None):
                 continue
             score = compute_technical_scores(ohlcv).composite()
             cands.append({"code": code, "score": score, "gap": gap,
-                          "entry": entry, "future": future})
+                          "entry": entry, "future": future, "atr": _atr(ohlcv)})
         if cands:
             cands.sort(key=lambda x: -x["score"])
             daily[date_fmt] = cands
@@ -234,7 +280,7 @@ def pick_net_returns(daily, dates, threshold, top_n, policy_fn, stop_pct, costs)
     for d in dates:
         qualified = [c for c in daily.get(d, []) if c["score"] >= threshold]
         for p in qualified[:top_n]:
-            gross = policy_fn(p["entry"], p["future"], stop_pct)
+            gross = policy_fn(p["entry"], p["future"], stop_pct, p.get("atr", 0.0))
             out.append(gross - costs.roundtrip_pct)
     return out
 

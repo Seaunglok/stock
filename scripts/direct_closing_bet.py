@@ -46,6 +46,13 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 # pykrx의 logging.info(args, kwargs) 잘못된 포맷 호출로 인한 "--- Logging error ---" 억제
 logging.Handler.handleError = lambda self, record: None  # noqa: E731
 
+# pykrx / FinanceDataReader 내부 INFO 노이즈 억제
+for _noisy in ("pykrx", "pykrx.website", "pykrx.stock", "FinanceDataReader",
+               "FinanceDataReader.krx", "requests", "urllib3", "httpx"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+# pykrx가 root logger에 출력하는 노이즈 차단 — 우리 로거만 WARNING+ 허용
+logging.getLogger().setLevel(logging.WARNING)
+
 
 def _load_env() -> None:
     """python-dotenv 없이 .env 파일 로드."""
@@ -65,8 +72,11 @@ def _load_env() -> None:
 
 _load_env()
 
-# pykrx — OHLCV 및 종목 목록 (KRX 공식 데이터)
-from pykrx import stock as krx  # noqa: E402
+# pykrx — import 시 "KRX 로그인 실패" stdout 메시지 억제
+import contextlib as _ctx, io as _io  # noqa: E402
+with _ctx.redirect_stdout(_io.StringIO()):
+    from pykrx import stock as krx  # noqa: E402
+del _ctx, _io
 
 # closing_bet_mcp 스코어링 함수 직접 임포트 (MCP 서버 불필요)
 from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst  # noqa: E402
@@ -75,7 +85,7 @@ from src.mcp_servers.closing_bet_mcp.exit_rules import (  # noqa: E402
     evaluate_exit,
     evaluate_market_filter,
 )
-from src.mcp_servers.closing_bet_mcp.scorer import compute_technical_scores_hybrid  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.scorer import compute_technical_scores  # noqa: E402
 
 # MCPManager — trading-domain 주문 실행 전용
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
@@ -107,17 +117,29 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TOP_N_STOCKS = 50       # 거래대금 상위 N종목 분석 (확장: 전고점 셋업 발굴 확률 향상)
 # "최고 확률 높은 종목만 1~5개" — composite >= 60 인 셋업만 후보로 인정.
 # 임계치 미달이면 0개도 가능 (강제로 5개 채우지 않음).
-MIN_SCORE = float(os.getenv("CLOSING_BET_MIN_SCORE", "60.0"))
-TOP_CANDIDATES = int(os.getenv("CLOSING_BET_TOP_CANDIDATES", "5"))  # 상한
+MIN_SCORE = float(os.getenv("CLOSING_BET_MIN_SCORE", "55.0"))
+TOP_CANDIDATES = int(os.getenv("CLOSING_BET_TOP_CANDIDATES", "3"))  # 상한 (백테스트 결과 3개가 5개보다 우수)
+# 거래대금 절대 임계 (외부 베스트 프랙티스 — 1,000억원 이상)
+MIN_VALUE_KRW = float(os.getenv("CLOSING_BET_MIN_VALUE_KRW", "100000000000"))  # 1,000억원
+# 손절 % (외부 권장 -1~-2%, 기본 -2.0)
+STOP_LOSS_PCT = float(os.getenv("CLOSING_BET_STOP_LOSS_PCT", "-2.0"))
+# P0: catalyst 가중 — 검증 백테스트(compute_technical_scores)엔 catalyst가 없었다.
+#     기본 0.0(= technical-only, 백테스트 채점식과 동일). 실거래 검증 후 0.3 등으로 상향 가능.
+CATALYST_WEIGHT = float(os.getenv("CLOSING_BET_CATALYST_WEIGHT", "0.0"))
+# P0: 점수 차등(확신) 사이징 — 백테스트에서 70+ 구간이 오히려 부진(50%/-0.13%, n=10)해
+#     기본 off(전 구간 1.0x). CLOSING_BET_CONVICTION_SIZING=true 일 때만 ≥70 1.5x / ≥85 2.0x.
+CONVICTION_SIZING = os.getenv("CLOSING_BET_CONVICTION_SIZING", "false").lower() == "true"
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
 
 SCHEDULE: list[tuple[int, int, str]] = [
     (14, 50, "selection"),
-    (15, 20, "buy"),
+    (15, 15, "buy_first"),    # E: 분할 매수 — 첫 50% (외부 권장 15:10~15:19)
+    (15, 19, "buy_second"),   # E: 분할 매수 — 나머지 50% (마감 직전)
     (18,  5, "after_hours"),  # 시간외 단일가 확인 → 내일 09:00 청산 우선순위
-    (9,   0, "sell"),         # 다음날
+    (9,   0, "sell"),         # 다음날 — 시초가 청산(부분청산 가능)
+    (15, 10, "force_close"),  # 다음날 — 잔량 강제청산 (1영업일 보유 보장, buy_first 15:15 직전)
 ]
 
 # ─── 로거 ──────────────────────────────────────────────────────────────────
@@ -188,6 +210,77 @@ def save_state(key: str, content: Any) -> None:
 
 def get_state(key: str) -> Any:
     return load_state().get(key, {}).get("content")
+
+
+# ─── 청산 원장 ──────────────────────────────────────────────────────────────
+# 1영업일 보장: 09:00 부분청산(러닝) + 15:10 잔량 강제청산을 종목별로 합산해
+# "포지션 1건당 가중 실현손익"을 만든다. HOLD가 남지 않으므로 승률 측정 편향이 사라진다.
+
+def _reset_exit_ledger(exit_date: str) -> None:
+    save_state("exit_ledger", {"exit_date": exit_date, "exits": []})
+
+
+def _ensure_exit_ledger(exit_date: str) -> None:
+    """exit_date가 바뀌었으면 원장 초기화 (새 청산일 첫 phase에서 호출)."""
+    led = get_state("exit_ledger") or {}
+    if led.get("exit_date") != exit_date:
+        _reset_exit_ledger(exit_date)
+
+
+def _append_exit(exit_date: str, rec: dict) -> None:
+    """종목별 부분 청산 1건(09:00 또는 15:10)을 원장에 누적."""
+    led = get_state("exit_ledger") or {}
+    if led.get("exit_date") != exit_date:
+        led = {"exit_date": exit_date, "exits": []}
+    led.setdefault("exits", []).append(rec)
+    save_state("exit_ledger", led)
+
+
+def _aggregate_exits(exit_date: str) -> list[dict]:
+    """원장을 종목별 가중 실현손익으로 합산 (부분 매도 + 강제 청산 모두 반영).
+
+    반환 레코드는 sell.json `results` 스키마와 호환:
+      symbol/company_name/entry_price/exit_price/pnl_pct/pnl_amount/composite/sector/action
+    action 은 항상 "REALIZED" — 모든 포지션이 1영업일 내 실현되므로 HOLD 미발생.
+    """
+    led = get_state("exit_ledger") or {}
+    if led.get("exit_date") != exit_date:
+        return []
+    by_sym: dict[str, dict] = {}
+    for e in led.get("exits", []):
+        s = by_sym.setdefault(e["symbol"], {
+            "symbol":       e["symbol"],
+            "company_name": e.get("company_name", e["symbol"]),
+            "entry_price":  float(e.get("entry_price", 0) or 0),
+            "composite":    e.get("composite", 0.0),
+            "sector":       e.get("sector", "기타"),
+            "action":       "REALIZED",
+            "sell_qty":     0,
+            "pnl_amount":   0.0,
+            "exits":        [],
+        })
+        qty = int(e.get("qty", 0) or 0)
+        s["sell_qty"]   += qty
+        s["pnl_amount"] += (float(e.get("exit_price", 0) or 0) - s["entry_price"]) * qty
+        s["exits"].append({
+            "qty": qty, "exit_price": e.get("exit_price"),
+            "reason": e.get("reason", ""), "when": e.get("when", ""),
+        })
+    results: list[dict] = []
+    for s in by_sym.values():
+        invested = s["entry_price"] * s["sell_qty"]
+        s["pnl_pct"]    = round(s["pnl_amount"] / invested * 100, 2) if invested > 0 else 0.0
+        s["exit_price"] = round(s["entry_price"] + s["pnl_amount"] / s["sell_qty"], 2) if s["sell_qty"] > 0 else s["entry_price"]
+        s["pnl_amount"] = round(s["pnl_amount"])
+        results.append(s)
+    return results
+
+
+def _finalize_sell_log(entry_date: str, exit_date: str) -> list[dict]:
+    """원장을 합산해 sell.json 을 (재)작성. 09:00·15:10 어느 쪽에서 호출해도 idempotent."""
+    results = _aggregate_exits(exit_date)
+    _data_logger.log_sell(entry_date, exit_date, results, MOCK_MODE)
+    return results
 
 
 # ─── 데이터 로거 ──────────────────────────────────────────────────────────────
@@ -403,23 +496,89 @@ def _days_ago(n: int) -> str:
     return (datetime.now() - timedelta(days=n)).strftime("%Y%m%d")
 
 
+def _suppress_pykrx_noise():
+    """pykrx util.py의 print(stdout) + logging.info(root) 노이즈 억제.
+
+    pykrx dataframe_empty_handler가 오류 시 print()와 logging.info()를 동시에 호출함.
+    stdout redirect + root logger 임시 레벨 상향으로 양쪽 억제.
+    """
+    import contextlib, io
+
+    class _Combined:
+        def __enter__(self):
+            self._stdout_ctx = contextlib.redirect_stdout(io.StringIO())
+            self._stdout_ctx.__enter__()
+            self._root = logging.getLogger()
+            self._prev_level = self._root.level
+            self._root.setLevel(logging.WARNING)
+            return self
+
+        def __exit__(self, *args):
+            self._stdout_ctx.__exit__(*args)
+            self._root.setLevel(self._prev_level)
+
+    return _Combined()
+
+
 def get_kospi_change_pct() -> tuple[float, float]:
-    """(오늘 등락률%, 5일 누적 등락률%) 반환."""
+    """(오늘 등락률%, 5일 누적 등락률%) 반환.
+
+    데이터 소스 우선순위:
+      1) Naver Finance 모바일 API — 장중 실시간 (오늘 등락률만)
+      2) pykrx — 영업일 마감 후
+      3) FinanceDataReader ^KS11 — Yahoo Finance (1일 lag 가능)
+
+    Naver 성공 시 5일 등락률은 FDR로 보완.
+    """
+    today_pct: float | None = None
+    five_d_pct: float | None = None
+
+    # 1차: Naver Finance 실시간 (장중에도 정확)
     try:
-        df = krx.get_index_ohlcv_by_date(_days_ago(20), _today(), "1001")
-        if df.empty or len(df) < 2:
-            return 0.0, 0.0
-        closes = df["종가"].values
-        today_pct = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2)
-        ref_idx = max(-6, -len(closes))
-        five_d_pct = round((closes[-1] - closes[ref_idx]) / closes[ref_idx] * 100, 2)
-        return today_pct, five_d_pct
+        import httpx  # noqa: PLC0415
+        r = httpx.get("https://m.stock.naver.com/api/index/KOSPI/basic", timeout=5.0)
+        if r.status_code == 200:
+            d = r.json()
+            ratio = d.get("fluctuationsRatio")
+            if ratio is not None:
+                today_pct = round(float(ratio), 2)
+                logger.debug("[KOSPI] naver 실시간 today=%.2f%%", today_pct)
     except Exception as e:
-        logger.warning("[KOSPI] 데이터 오류: %s", e)
-        return 0.0, 0.0
+        logger.debug("[KOSPI] naver 실패: %s", e)
+
+    # 5일 등락률은 FDR로 보완 (Naver API는 단일 값만)
+    try:
+        import FinanceDataReader as fdr  # noqa: PLC0415
+        df = fdr.DataReader("^KS11", _days_ago(20), _today())
+        if not df.empty and len(df) >= 2:
+            closes = df["Close"].values
+            fdr_today = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2)
+            ref_idx = max(-6, -len(closes))
+            five_d_pct = round((closes[-1] - closes[ref_idx]) / closes[ref_idx] * 100, 2)
+            if today_pct is None:
+                today_pct = fdr_today
+                logger.debug("[KOSPI] fdr ^KS11 today=%.2f%% 5d=%.2f%%", today_pct, five_d_pct)
+    except Exception as e:
+        logger.debug("[KOSPI] fdr 실패: %s", e)
+
+    # 마지막 fallback: pykrx
+    if today_pct is None:
+        try:
+            with _suppress_pykrx_noise():
+                df = krx.get_index_ohlcv_by_date(_days_ago(20), _today(), "1001")
+            if not df.empty and len(df) >= 2:
+                closes = df["종가"].values
+                today_pct = round((closes[-1] - closes[-2]) / closes[-2] * 100, 2)
+                if five_d_pct is None:
+                    ref_idx = max(-6, -len(closes))
+                    five_d_pct = round((closes[-1] - closes[ref_idx]) / closes[ref_idx] * 100, 2)
+        except Exception as e:
+            logger.warning("[KOSPI] 모든 소스 실패 — 0.0 사용: %s", e)
+
+    return today_pct or 0.0, five_d_pct or 0.0
 
 
-def _fallback_top_stocks(n: int) -> list[tuple[str, str]]:
+def _fallback_top_stocks(n: int) -> list[tuple[str, str, float]]:
     """pykrx KRX 엔드포인트 불가 시 캐시된 Kiwoom universe로 대체."""
     try:
         cache_files = sorted(_ROOT.glob("docs_cache/universe_kiwoom_*.json"), reverse=True)
@@ -431,7 +590,8 @@ def _fallback_top_stocks(n: int) -> list[tuple[str, str]]:
             if r.get("market") in ("거래소",) and r.get("warn", "0") == "0"
         ]
         kospi.sort(key=lambda r: r.get("market_cap", 0), reverse=True)
-        result = [(r["code"], r["name"]) for r in kospi[:n]]
+        # fallback은 거래대금 데이터 없음 → MIN_VALUE_KRW 이상으로 가정해 필터 통과
+        result = [(r["code"], r["name"], MIN_VALUE_KRW) for r in kospi[:n]]
         logger.info("[DATA] fallback universe %d종목 (캐시: %s)", len(result), cache_files[0].name)
         return result
     except Exception as e:
@@ -439,22 +599,24 @@ def _fallback_top_stocks(n: int) -> list[tuple[str, str]]:
         return []
 
 
-def get_top_stocks_by_value(n: int = TOP_N_STOCKS) -> list[tuple[str, str]]:
-    """거래대금 상위 N 종목 [(ticker, name), ...] 반환."""
+def get_top_stocks_by_value(n: int = TOP_N_STOCKS) -> list[tuple[str, str, float]]:
+    """거래대금 상위 N 종목 [(ticker, name, value_krw), ...] 반환."""
     for offset in range(8):
         try:
             date = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
-            df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
+            with _suppress_pykrx_noise():
+                df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
             if df.empty:
                 continue
             df = df[df["거래대금"] > 0].sort_values("거래대금", ascending=False)
-            result: list[tuple[str, str]] = []
+            result: list[tuple[str, str, float]] = []
             for ticker in df.head(n).index:
                 try:
                     name = krx.get_market_ticker_name(ticker)
                 except Exception:
                     name = ticker
-                result.append((ticker, name))
+                value = float(df.loc[ticker, "거래대금"])
+                result.append((ticker, name, value))
             logger.info("[DATA] 거래대금 상위 %d종목 (기준일: %s)", len(result), date)
             return result
         except Exception:
@@ -501,7 +663,8 @@ def get_advance_ratio() -> float:
     for offset in range(3):
         try:
             date = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
-            df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
+            with _suppress_pykrx_noise():
+                df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
             if df.empty:
                 continue
             active = df[df["거래량"] > 0]
@@ -514,7 +677,7 @@ def get_advance_ratio() -> float:
             return round(rising / len(active), 3)
         except Exception:
             pass
-    logger.warning("[DATA] 양봉비율 조회 실패 — 중립값 0.5 사용")
+    logger.debug("[DATA] 양봉비율 조회 실패 — 중립값 0.5 사용")
     return 0.5
 
 
@@ -527,22 +690,83 @@ def _above_ma20(ohlcv: list[dict]) -> bool:
     return ohlcv[-1]["close"] >= ma20
 
 
-def _has_today_gap(ohlcv: list[dict], threshold_pct: float = 4.0) -> bool:
-    """오늘 종가가 전일 대비 threshold_pct% 이상 급등 = 이벤트 갭 의심."""
+def _today_gap_pct(ohlcv: list[dict]) -> float:
+    """오늘 종가가 전일 대비 몇 % 상승했는지 반환."""
     if len(ohlcv) < 2:
-        return False
+        return 0.0
     prev = ohlcv[-2]["close"]
     curr = ohlcv[-1]["close"]
-    return prev > 0 and (curr - prev) / prev * 100 >= threshold_pct
+    if prev <= 0:
+        return 0.0
+    return (curr - prev) / prev * 100
+
+
+# 갭 임계값 — 백테스트 결과:
+#  -2~0% 갭: 80% 승률 / +1.28%
+#   0~+2% 갭: 76% 승률 / +1.17%
+#  +2~+4% 갭: 57.9% 승률 / +0.61% (가장 약한 구간)
+#  +4%+: 차익실현 압력 ↑
+# → +2% 이상 갭 종목은 익일 시초 약세 가능성 높아 제외
+_GAP_LIMIT = 2.0
+
+
+def _merge_split_orders(first: list[dict], second: list[dict]) -> list[dict]:
+    """분할 매수 1차+2차 결과를 종목별 평단/총 수량으로 합산."""
+    by_symbol: dict[str, dict] = {}
+    for o in first + second:
+        sym = o["symbol"]
+        if sym not in by_symbol:
+            by_symbol[sym] = {**o, "split": "merged"}
+        else:
+            existing = by_symbol[sym]
+            total_qty = existing["quantity"] + o["quantity"]
+            # 가중 평단가
+            avg_price = (
+                existing["entry_price"] * existing["quantity"]
+                + o["entry_price"] * o["quantity"]
+            ) / total_qty if total_qty > 0 else existing["entry_price"]
+            existing["quantity"] = total_qty
+            existing["entry_price"] = round(avg_price, 2)
+    return list(by_symbol.values())
+
+
+def _has_min_value(ohlcv: list[dict], min_value_krw: float = MIN_VALUE_KRW) -> bool:
+    """오늘 거래대금이 min_value_krw 이상인지 확인.
+
+    외부 베스트 프랙티스: 종가매매는 1,000억원 이상 거래대금에서 안정적.
+    pykrx의 '거래대금'은 원 단위.
+    """
+    if not ohlcv:
+        return False
+    today_value = ohlcv[-1].get("value") or 0
+    return today_value >= min_value_krw
 
 
 def get_overnight_us_change() -> tuple[float, float]:
-    """(S&P 500 전일 등락률%, NASDAQ 전일 등락률%). 실패 시 (0.0, 0.0)."""
+    """(S&P 500 선물 등락률%, NASDAQ 선물 등락률%). 실패 시 (0.0, 0.0).
+
+    외부 권장: KOSPI 14:50 시점에 미국 현물(전일 종가)보다 **야간 선물 실시간**이 신호 정확.
+    티커: ES=F (S&P500 선물), NQ=F (NASDAQ 100 선물).
+    선물 조회 실패 시 현물(US500/IXIC)로 폴백.
+    """
     try:
         import FinanceDataReader as fdr  # noqa: PLC0415
         end = datetime.now()
         start = (end - timedelta(days=10)).strftime("%Y-%m-%d")
         end_str = end.strftime("%Y-%m-%d")
+        # 1순위: 선물 (ES=F, NQ=F)
+        try:
+            es = fdr.DataReader("ES=F", start, end_str)
+            nq = fdr.DataReader("NQ=F", start, end_str)
+            if len(es) >= 2 and len(nq) >= 2:
+                es_pct = round((es["Close"].iloc[-1] - es["Close"].iloc[-2]) / es["Close"].iloc[-2] * 100, 2)
+                nq_pct = round((nq["Close"].iloc[-1] - nq["Close"].iloc[-2]) / nq["Close"].iloc[-2] * 100, 2)
+                logger.debug("[US_FUTURES] ES=F %+.2f%%  NQ=F %+.2f%%", es_pct, nq_pct)
+                return es_pct, nq_pct
+        except Exception as e:
+            logger.warning("[US_FUTURES] ES=F/NQ=F 조회 실패 — 현물 폴백: %s", str(e)[:80])
+
+        # 폴백: 현물 (US500, IXIC)
         sp = fdr.DataReader("US500", start, end_str)
         nq = fdr.DataReader("IXIC", start, end_str)
         sp_pct = round(float(sp["Close"].iloc[-1] / sp["Close"].iloc[-2] - 1) * 100, 2) if len(sp) >= 2 else 0.0
@@ -564,18 +788,16 @@ def _load_sector_map() -> dict[str, str]:
     try:
         import FinanceDataReader as fdr  # noqa: PLC0415
         df = fdr.StockListing("KOSPI")
-        if df.empty:
-            return {}
-        sector_col = next((c for c in ["Sector", "업종", "Industry"] if c in df.columns), None)
-        code_col   = next((c for c in ["Symbol", "Code", "종목코드"] if c in df.columns), None)
-        if not sector_col or not code_col:
-            return {}
-        result = {str(row[code_col]): str(row[sector_col]) for _, row in df.iterrows() if row.get(code_col)}
-        cache_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-        logger.info("[SECTOR] 업종 맵 로드 완료 (%d종목)", len(result))
-        return result
+        if not df.empty:
+            sector_col = next((c for c in ["Sector", "업종", "Industry"] if c in df.columns), None)
+            code_col   = next((c for c in ["Symbol", "Code", "종목코드"] if c in df.columns), None)
+            if sector_col and code_col:
+                result = {str(row[code_col]): str(row[sector_col]) for _, row in df.iterrows() if row.get(code_col)}
+                cache_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                logger.info("[SECTOR] 업종 맵 로드 완료 (%d종목)", len(result))
+                return result
     except Exception as e:
-        logger.warning("[SECTOR] fdr 업종 맵 실패: %s — Kiwoom 캐시 시도", e)
+        logger.debug("[SECTOR] fdr 업종 맵 실패 → Kiwoom 캐시 사용: %s", e)
     # fdr 실패 시 Kiwoom universe 캐시에서 섹터 정보 로드
     try:
         cache_files = sorted(_ROOT.glob("docs_cache/universe_kiwoom_*.json"), reverse=True)
@@ -711,27 +933,50 @@ async def _try_get_realtime_price(symbol: str) -> float | None:
 
 
 async def _try_get_after_hours_price(symbol: str) -> float | None:
-    """kiwoom-market-mcp에서 시간외 단일가 조회. 서버 미가동 시 None."""
+    """시간외 단일가 조회.
+
+    1) 전용 after_hours/시간외 툴이 있으면 우선 사용.
+    2) 없으면 get_stock_basic_info → cur_prc 필드 fallback.
+       (키움 API는 장 마감 후에도 cur_prc에 시간외 최신가 반영)
+    """
     _AH_TOOL_KW = ("after_hours", "overtime", "시간외", "extended")
     _AH_PRICE_KEYS = ("after_hours_price", "시간외현재가", "overtime_price", "extended_price")
     try:
         async with MCPManager({"kiwoom-market-mcp": MARKET_URL}) as mcp:
             if not mcp.tools:
                 return None
-            tool = next(
+
+            # 1) 전용 시간외 툴 탐색
+            ah_tool = next(
                 (t["name"] for t in mcp.tools
                  if any(kw in t["name"].lower() for kw in _AH_TOOL_KW)),
                 None,
             )
-            if not tool:
-                return None
-            raw = await mcp.call_tool(tool, {"stock_code": symbol})
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            d = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
-            for key in _AH_PRICE_KEYS:
-                val = d.get(key) if isinstance(d, dict) else None
-                if val:
-                    return float(str(val).replace(",", ""))
+            if ah_tool:
+                raw = await mcp.call_tool(ah_tool, {"stock_code": symbol})
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                d = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
+                for key in _AH_PRICE_KEYS:
+                    val = d.get(key) if isinstance(d, dict) else None
+                    if val:
+                        return float(str(val).replace(",", ""))
+
+            # 2) Fallback: get_stock_basic_info → cur_prc (장 마감 후 시간외 가격 반영)
+            info_tool = next(
+                (t["name"] for t in mcp.tools if "basic_info" in t["name"] or "basic" in t["name"]),
+                None,
+            )
+            if info_tool:
+                raw = await mcp.call_tool(info_tool, {"stock_code": symbol})
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                d = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
+                cur = d.get("cur_prc") if isinstance(d, dict) else None
+                if cur:
+                    # cur_prc는 "+126600" / "-126600" 형식 — 부호 제거 후 숫자만
+                    price = float(str(cur).lstrip("+-").replace(",", ""))
+                    if price > 0:
+                        logger.debug("[AH] %s 전용툴 없음 → cur_prc fallback: %.0f원", symbol, price)
+                        return price
     except Exception:
         pass
     return None
@@ -756,13 +1001,16 @@ def score_one_stock(
             news_descriptions=[],
             disclosure_titles=[],
         )
-        tech = compute_technical_scores_hybrid(
+        # P0: 라이브 채점식을 검증 백테스트(compute_technical_scores, candle v1, catalyst 미반영)와 일치.
+        #     기존 hybrid는 candle v2(위꼬리 클수록 高)로 백테스트 결론(위꼬리 작을수록 승률↑)과 부호가 반대였음.
+        tech = compute_technical_scores(
             ohlcv=ohlcv,
             foreign_net_5d=foreign_net,
             institutional_net_5d=inst_net,
         )
-        # 재료 신호가 있을 때만 30% 반영. 뉴스 없는 조용한 종목을 페널티하지 않는다.
-        cat_weight = 0.30 if cat.has_catalyst else 0.0
+        # catalyst 가중은 CLOSING_BET_CATALYST_WEIGHT(기본 0.0)로만 블렌딩.
+        # 0.0이면 composite = technical-only로 백테스트와 동일. 뉴스 없는 종목은 페널티하지 않음.
+        cat_weight = CATALYST_WEIGHT if cat.has_catalyst else 0.0
         composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
         return {
             "symbol":              symbol,
@@ -780,12 +1028,17 @@ def score_one_stock(
 
 
 def calc_position_qty(composite: float, current_price: float) -> int:
-    """PLAYBOOK C — composite 점수 기반 투자 수량 산출."""
+    """composite 점수 기반 투자 수량 산출.
+
+    P0: 확신 사이징(≥70 1.5x / ≥85 2.0x)은 백테스트에서 70+ 구간이 오히려 부진
+    (승률 50.0% / 평균 -0.13%, n=10)해 근거가 약하다. 기본은 전 구간 1.0x(평탄).
+    근거가 쌓이면 CLOSING_BET_CONVICTION_SIZING=true 로 점수 차등을 다시 켤 수 있다.
+    """
     if current_price <= 0:
         return 0
-    if composite >= 85:
+    if CONVICTION_SIZING and composite >= 85:
         invest = INVESTMENT_PER_TRADE * 2.0
-    elif composite >= 70:
+    elif CONVICTION_SIZING and composite >= 70:
         invest = INVESTMENT_PER_TRADE * 1.5
     else:
         invest = INVESTMENT_PER_TRADE
@@ -872,7 +1125,12 @@ async def phase_selection() -> list[dict]:
     scored: list[dict] = []
     ma20_filtered = 0
     gap_filtered  = 0
-    for idx, (symbol, name) in enumerate(stocks, 1):
+    value_filtered = 0
+    for idx, (symbol, name, stock_value) in enumerate(stocks, 1):
+        if stock_value < MIN_VALUE_KRW:    # B: 거래대금 1,000억원 미만 제외 (get_top_stocks_by_value에서 가져온 값 사용)
+            value_filtered += 1
+            logger.debug("[FILTER] %s %s — 거래대금 %.0f억원 < %.0f억원", symbol, name, stock_value / 1e8, MIN_VALUE_KRW / 1e8)
+            continue
         ohlcv = get_ohlcv(symbol)
         if not ohlcv:
             continue
@@ -880,9 +1138,10 @@ async def phase_selection() -> list[dict]:
             ma20_filtered += 1
             logger.debug("[FILTER] %s %s — MA20 이하 제외", symbol, name)
             continue
-        if _has_today_gap(ohlcv):        # Fix 3: 당일 급등(이벤트 갭) 제외
+        gap_pct = _today_gap_pct(ohlcv)
+        if gap_pct >= _GAP_LIMIT:   # +2% 이상 갭은 익일 시초 약세 가능성 높음
             gap_filtered += 1
-            logger.debug("[FILTER] %s %s — 당일 갭 4%%+ 제외", symbol, name)
+            logger.debug("[FILTER] %s %s — 당일 갭 %.1f%% 제외", symbol, name, gap_pct)
             continue
         news = await _try_get_news(symbol, name)
         foreign, inst = await _try_get_investor_data(symbol)
@@ -916,18 +1175,20 @@ async def phase_selection() -> list[dict]:
         "nasdaq_pct":      nq_pct,
         "ma20_filtered":   ma20_filtered,
         "gap_filtered":    gap_filtered,
+        "value_filtered":  value_filtered,
     }
     _data_logger.log_selection(today_str, market_info, scored, candidates)
     _data_logger.log_event("selection_done", {
         "analyzed": len(scored), "qualified": len(qualified_pool), "candidates": len(candidates),
-        "ma20_filtered": ma20_filtered, "gap_filtered": gap_filtered,
+        "ma20_filtered": ma20_filtered, "gap_filtered": gap_filtered, "value_filtered": value_filtered,
         "regime": regime, "candidate_symbols": [c["symbol"] for c in candidates],
     })
 
     # 5) 알림 — 섹터 정보 + 채점 분포 통합 포맷
     filter_summary = (
-        f"분석:{len(scored)}  MA20제외:{ma20_filtered}  갭제외:{gap_filtered}  "
-        f"US S&P{sp_pct:+.1f}%/NQ{nq_pct:+.1f}%"
+        f"분석:{len(scored)}  거래대금제외:{value_filtered}  "
+        f"MA20제외:{ma20_filtered}  갭제외:{gap_filtered}  "
+        f"US ES{sp_pct:+.1f}%/NQ{nq_pct:+.1f}%"
     )
     if not candidates:
         msg = (
@@ -961,19 +1222,37 @@ async def phase_selection() -> list[dict]:
 
 # ─── Phase 2: 매수 ──────────────────────────────────────────────────────────
 
-async def phase_buy(candidates: list[dict] | None = None) -> list[dict]:
-    """15:20 — trading-domain MCP로 종가 시장가 매수."""
+async def phase_buy(
+    candidates: list[dict] | None = None,
+    split_pct: int = 100,
+    split_label: str = "full",
+) -> list[dict]:
+    """trading-domain MCP로 종가 시장가 매수.
+
+    Args:
+        candidates: 매수 후보. None이면 state['selection']에서 로드.
+        split_pct: 이번 회차에서 매수할 수량 비율 (1~100).
+                   분할 매수 시 첫 번째는 50, 두 번째는 100 - 첫번째 실수량.
+        split_label: 'full' / 'first' / 'second' — 로깅/state 키 분리용.
+    """
     logger.info("=" * 60)
-    logger.info("[PHASE 2] 종가 매수 시작  %s", datetime.now().strftime("%H:%M:%S"))
+    logger.info("[PHASE 2:%s] 매수 시작 (split=%d%%)  %s",
+                split_label, split_pct, datetime.now().strftime("%H:%M:%S"))
     logger.info("=" * 60)
-    _data_logger.log_event("phase_start", {"phase": "buy"})
+    _data_logger.log_event("phase_start", {"phase": f"buy_{split_label}", "split_pct": split_pct})
 
     if candidates is None:
         candidates = get_state("selection") or []
     if not candidates:
-        await notify("⚠️ 매수 중단: 선별된 후보 없음")
-        _data_logger.log_event("skip", {"reason": "no_candidates", "phase": "buy"})
+        await notify(f"⚠️ 매수 중단({split_label}): 선별된 후보 없음")
+        _data_logger.log_event("skip", {"reason": "no_candidates", "phase": f"buy_{split_label}"})
         return []
+
+    # 분할 매수: 두 번째 회차는 첫 번째에서 매수한 수량을 빼고 나머지만
+    first_orders_by_symbol: dict[str, dict] = {}
+    if split_label == "second":
+        prev = get_state("buy_first") or []
+        first_orders_by_symbol = {o["symbol"]: o for o in prev}
 
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -987,10 +1266,27 @@ async def phase_buy(candidates: list[dict] | None = None) -> list[dict]:
 
             for c in candidates:
                 symbol = c["symbol"]
-                price  = c.get("current_price", 0.0)
-                qty    = calc_position_qty(c["composite"], price)
-                if qty < 1:
+                # 매수 직전 현재가 재조회 — 선별 시점 가격 대신 실시간 가격 사용
+                live_price = get_current_price(symbol)
+                price = live_price if live_price and live_price > 0 else c.get("current_price", 0.0)
+                if live_price and live_price != c.get("current_price", 0.0):
+                    logger.info("[BUY] %s 가격 갱신: %.0f → %.0f원", symbol, c.get("current_price", 0.0), price)
+                full_qty = calc_position_qty(c["composite"], price)
+                if full_qty < 1:
                     continue
+
+                # 이 회차의 매수 수량 계산
+                if split_label == "first":
+                    qty = max(1, int(full_qty * split_pct / 100))
+                elif split_label == "second":
+                    prev_qty = first_orders_by_symbol.get(symbol, {}).get("quantity", 0)
+                    qty = max(0, full_qty - prev_qty)
+                    if qty == 0:
+                        logger.info("[BUY:second] %s 잔여 수량 없음 — 스킵", symbol)
+                        continue
+                else:  # full
+                    qty = full_qty
+
                 try:
                     raw = await mcp.call_tool("place_buy_order", {
                         "stock_code": symbol,
@@ -1008,32 +1304,45 @@ async def phase_buy(candidates: list[dict] | None = None) -> list[dict]:
                         "composite":    c["composite"],
                         "sector":       c.get("sector", "기타"),
                         "buy_date":     today_str,
+                        "split":        split_label,
                         "order_result": parsed,
                     })
                     logger.info(
-                        "[BUY] %s %-10s  %d주 @ %s원  %s",
-                        symbol, c["company_name"][:10], qty, price, mode_tag,
+                        "[BUY:%s] %s %-10s  %d주 @ %s원  %s",
+                        split_label, symbol, c["company_name"][:10], qty, price, mode_tag,
                     )
                     _data_logger.log_event("buy", {
                         "symbol": symbol, "name": c["company_name"], "qty": qty,
                         "price": price, "composite": c["composite"],
                         "sector": c.get("sector", "기타"), "mock": MOCK_MODE,
+                        "split": split_label,
                     })
                 except Exception as e:
-                    logger.error("[BUY] %s 주문 실패: %s", symbol, e)
+                    logger.error("[BUY:%s] %s 주문 실패: %s", split_label, symbol, e)
                     _data_logger.log_event("error", {
-                        "phase": "buy", "symbol": symbol, "error": str(e)[:200],
+                        "phase": f"buy_{split_label}", "symbol": symbol, "error": str(e)[:200],
                     })
 
     except Exception as e:
-        logger.error("[BUY] trading-domain 연결 오류: %s", e)
-        await notify(f"❌ 매수 오류: {e}")
+        logger.error("[BUY:%s] trading-domain 연결 오류: %s", split_label, e)
+        await notify(f"❌ 매수 오류({split_label}): {e}")
         return []
 
-    save_state("positions", orders)
-    save_state("buy", orders)
+    # state 누적: positions = 평단·총 수량 통합 (first + second)
+    if split_label == "second":
+        prev = get_state("buy_first") or []
+        merged = _merge_split_orders(prev, orders)
+        save_state("positions", merged)
+        save_state("buy", merged)
+    elif split_label == "first":
+        save_state("buy_first", orders)
+        save_state("positions", orders)  # 임시 (second가 덮어씀)
+    else:  # full
+        save_state("positions", orders)
+        save_state("buy", orders)
+
     save_state("buy_date", today_str)
-    _data_logger.log_buy(today_str, orders, MOCK_MODE)
+    _data_logger.log_buy(today_str, orders if split_label != "second" else (get_state("buy") or orders), MOCK_MODE)
 
     if orders:
         total = sum(o["quantity"] * o["entry_price"] for o in orders)
@@ -1088,6 +1397,7 @@ async def phase_after_hours(positions: list[dict] | None = None) -> None:
             current_price=ah_price,
             after_hours_price=ah_price,
             now=datetime.now(),
+            stop_loss_pct=STOP_LOSS_PCT,
         )
         pnl_pct = round((ah_price - entry_price) / entry_price * 100, 2) if entry_price else 0.0
         ah_signals.append({
@@ -1120,7 +1430,7 @@ async def phase_after_hours(positions: list[dict] | None = None) -> None:
                 f"시간외:{s['ah_price']:,.0f}  {s['pnl_pct']:+.2f}%  {s['action']}"
             )
     else:
-        lines.append("시간외 데이터 없음 (kiwoom-market-mcp :8031 미기동)")
+        lines.append("시간외 데이터 없음 — 내일 09:00 정규가로 청산 판단")
     if urgent:
         lines.append(f"\n⚠️ 내일 09:00 우선 청산: {', '.join(s['symbol'] for s in urgent)}")
     await notify("\n".join(lines))
@@ -1129,8 +1439,25 @@ async def phase_after_hours(positions: list[dict] | None = None) -> None:
 
 # ─── Phase 3: 매도 ──────────────────────────────────────────────────────────
 
+async def _sell_market(mcp: Any, symbol: str, sell_qty: int) -> None:
+    """trading-domain 시장가 매도 1건. 예외는 호출자에 전파."""
+    await mcp.call_tool("place_sell_order", {
+        "stock_code": symbol,
+        "quantity":   sell_qty,
+        "price":      None,
+        "order_type": "03",   # 시장가
+        "account_no": ACCOUNT_NO,
+    })
+
+
 async def phase_sell(positions: list[dict] | None = None) -> None:
-    """다음날 09:00 — 시초가 기준 청산 신호 확인 → 매도."""
+    """다음날 09:00 — 시초가 기준 청산 신호 확인 → 매도 (부분청산 가능).
+
+    부분청산(33/50%)·HOLD 로 남은 잔량은 positions 에 유지되어 같은 날 15:10
+    phase_force_close() 가 강제 정리한다(1영업일 보유 보장). 모든 매도는 종목별로
+    exit_ledger 에 누적되며, sell.json 의 승률은 "포지션 1건당 가중 실현손익"으로
+    계산되어 HOLD 편향이 없다.
+    """
     logger.info("=" * 60)
     logger.info("[PHASE 3] 청산 판단 시작  %s", datetime.now().strftime("%H:%M:%S"))
     logger.info("=" * 60)
@@ -1146,9 +1473,10 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     exit_date  = datetime.now().strftime("%Y-%m-%d")
     entry_date = get_state("buy_date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    _ensure_exit_ledger(exit_date)
     # 18:05 시간외 확인 결과 로드 (없으면 빈 dict)
     ah_signals_map = {s["symbol"]: s for s in (get_state("after_hours_signals") or [])}
-    results: list[dict] = []
+    remaining: list[dict] = []   # 부분청산/HOLD 잔량 → 15:10 force_close 대상
 
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
@@ -1180,6 +1508,7 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
                     current_price=current_price,
                     after_hours_price=ah_price,
                     now=datetime.now(),
+                    stop_loss_pct=STOP_LOSS_PCT,
                 )
                 pnl_pct = (
                     round((current_price - entry_price) / entry_price * 100, 2)
@@ -1191,15 +1520,7 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
                 )
 
                 if exit_dec.action == "HOLD":
-                    results.append({
-                        "symbol":       symbol,
-                        "company_name": name,
-                        "action":       "HOLD",
-                        "entry_price":  entry_price,
-                        "exit_price":   current_price,
-                        "pnl_pct":      pnl_pct,
-                        "composite":    pos.get("composite", 0.0),
-                    })
+                    remaining.append(pos)   # 15:10 강제청산이 처리
                     continue
 
                 sell_qty = (
@@ -1207,25 +1528,12 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
                     else max(1, int(qty * exit_dec.suggested_qty_pct / 100))
                 )
                 try:
-                    raw = await mcp.call_tool("place_sell_order", {
-                        "stock_code": symbol,
-                        "quantity":   sell_qty,
-                        "price":      None,
-                        "order_type": "03",
-                        "account_no": ACCOUNT_NO,
-                    })
-                    results.append({
-                        "symbol":       symbol,
-                        "company_name": name,
-                        "action":       exit_dec.action,
-                        "sell_qty":     sell_qty,
-                        "entry_price":  entry_price,
-                        "exit_price":   current_price,
-                        "pnl_pct":      pnl_pct,
-                        "pnl_amount":   round((current_price - entry_price) * sell_qty),
-                        "reason":       exit_dec.reason,
-                        "composite":    pos.get("composite", 0.0),
-                        "sector":       pos.get("sector", "기타"),
+                    await _sell_market(mcp, symbol, sell_qty)
+                    _append_exit(exit_date, {
+                        "symbol": symbol, "company_name": name, "entry_price": entry_price,
+                        "qty": sell_qty, "exit_price": current_price,
+                        "composite": pos.get("composite", 0.0), "sector": pos.get("sector", "기타"),
+                        "reason": exit_dec.reason, "when": "09:00",
                     })
                     _data_logger.log_event("sell", {
                         "symbol": symbol, "name": name, "action": exit_dec.action,
@@ -1233,33 +1541,125 @@ async def phase_sell(positions: list[dict] | None = None) -> None:
                         "pnl_pct": pnl_pct, "reason": exit_dec.reason,
                         "composite": pos.get("composite", 0.0), "mock": MOCK_MODE,
                     })
+                    rem_qty = qty - sell_qty
+                    if rem_qty > 0:   # 부분청산 → 잔량은 15:10 강제청산
+                        remaining.append({**pos, "quantity": rem_qty})
                 except Exception as e:
                     logger.error("[SELL] %s 매도 실패: %s", symbol, e)
                     _data_logger.log_event("error", {
                         "phase": "sell", "symbol": symbol, "error": str(e)[:200],
                     })
+                    remaining.append(pos)   # 실패분은 15:10 재시도
 
     except Exception as e:
         logger.error("[SELL] 오류: %s", e)
         await notify(f"❌ 청산 오류: {e}")
         return
 
+    save_state("positions", remaining)
+    results = _finalize_sell_log(entry_date, exit_date)   # 09:00 시점 실현분으로 sell.json 갱신
     save_state("sell", results)
-    sold_symbols = {r["symbol"] for r in results if r["action"] != "HOLD"}
-    save_state("positions", [p for p in positions if p["symbol"] not in sold_symbols])
-    _data_logger.log_sell(entry_date, exit_date, results, MOCK_MODE)
 
-    # 알림
-    sold = [r for r in results if r["action"] != "HOLD"]
-    held = [r for r in results if r["action"] == "HOLD"]
-    lines = [f"📤 청산 결과 {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]"]
-    for r in sold:
+    # 알림 — 09:00 실현분 + 잔량(15:10 강제청산 예정)
+    lines = [f"📤 청산(09:00) {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]"]
+    for r in results:
         icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
-        lines.append(f"{icon} {r['company_name']}({r['symbol']})  {r['action']}  {r['pnl_pct']:+.2f}%")
-    for r in held:
-        lines.append(f"⏸ {r['company_name']}({r['symbol']})  HOLD  {r['pnl_pct']:+.2f}%")
+        lines.append(f"{icon} {r['company_name']}({r['symbol']})  {r['pnl_pct']:+.2f}%  ({r['sell_qty']}주 실현)")
+    if remaining:
+        lines.append(f"\n⏳ 잔량 {len(remaining)}종목 — 15:10 강제청산 예정: {', '.join(p['symbol'] for p in remaining)}")
     await notify("\n".join(lines))
-    logger.info("[PHASE 3] 완료 — 매도:%d  보유:%d", len(sold), len(held))
+    logger.info("[PHASE 3] 완료 — 실현:%d종목  잔량:%d종목", len(results), len(remaining))
+
+
+# ─── Phase 3-b: 잔량 강제 청산 (1영업일 보장) ──────────────────────────────────
+
+async def phase_force_close(positions: list[dict] | None = None) -> None:
+    """15:10 — 09:00 청산에서 남은 잔량(부분청산 후 잔여/HOLD)을 전량 시장가 청산.
+
+    종가매매는 1영업일 보유 전략이므로, 보유분이 다음날로 넘어가지 않도록 같은 날
+    장 마감 직전 강제 정리한다. 모든 매도는 exit_ledger 에 누적되어 sell.json 의
+    실현손익/승률이 완성된다.
+    """
+    logger.info("=" * 60)
+    logger.info("[PHASE FC] 잔량 강제청산  %s", datetime.now().strftime("%H:%M:%S"))
+    logger.info("=" * 60)
+    _data_logger.log_event("phase_start", {"phase": "force_close"})
+
+    if positions is None:
+        positions = get_state("positions") or []
+
+    exit_date  = datetime.now().strftime("%Y-%m-%d")
+    entry_date = get_state("buy_date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if not positions:
+        logger.info("[PHASE FC] 잔량 없음 — 09:00에 전량 청산됨")
+        # 09:00에 모두 실현됐어도 sell.json 을 최종 확정해 둔다.
+        _finalize_sell_log(entry_date, exit_date)
+        return
+
+    _ensure_exit_ledger(exit_date)
+    mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
+    closed = 0
+
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                await notify("❌ trading-domain :8030 연결 실패 — 강제청산 중단")
+                return
+
+            for pos in positions:
+                symbol      = pos["symbol"]
+                entry_price = float(pos.get("entry_price", 0))
+                qty         = int(pos.get("quantity", 0))
+                name        = pos.get("company_name", symbol)
+                if qty < 1:
+                    continue
+
+                current_price = await _try_get_realtime_price(symbol)
+                if current_price is None:
+                    current_price = get_current_price(symbol) or entry_price
+                pnl_pct = round((current_price - entry_price) / entry_price * 100, 2) if entry_price else 0.0
+
+                try:
+                    await _sell_market(mcp, symbol, qty)
+                    _append_exit(exit_date, {
+                        "symbol": symbol, "company_name": name, "entry_price": entry_price,
+                        "qty": qty, "exit_price": current_price,
+                        "composite": pos.get("composite", 0.0), "sector": pos.get("sector", "기타"),
+                        "reason": "EOD 강제청산 (1영업일 보유 한도)", "when": "15:10",
+                    })
+                    _data_logger.log_event("force_close", {
+                        "symbol": symbol, "name": name, "qty": qty,
+                        "entry_price": entry_price, "exit_price": current_price,
+                        "pnl_pct": pnl_pct, "composite": pos.get("composite", 0.0), "mock": MOCK_MODE,
+                    })
+                    closed += 1
+                    logger.info("[FC] %s %-10s  %d주 강제청산  손익=%+.2f%%  %s",
+                                symbol, name[:10], qty, pnl_pct, mode_tag)
+                except Exception as e:
+                    logger.error("[FC] %s 강제청산 실패: %s", symbol, e)
+                    _data_logger.log_event("error", {
+                        "phase": "force_close", "symbol": symbol, "error": str(e)[:200],
+                    })
+
+    except Exception as e:
+        logger.error("[FC] 오류: %s", e)
+        await notify(f"❌ 강제청산 오류: {e}")
+        return
+
+    save_state("positions", [])   # 전량 청산 — 오버나잇 잔량 0
+    results = _finalize_sell_log(entry_date, exit_date)
+    save_state("sell", results)
+
+    lines = [f"🧹 잔량 강제청산(15:10) {mode_tag} [{datetime.now().strftime('%m/%d %H:%M')}]  {closed}종목"]
+    for r in results:
+        icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
+        lines.append(f"{icon} {r['company_name']}({r['symbol']})  실현 {r['pnl_pct']:+.2f}%")
+    if results:
+        wins = sum(1 for r in results if r["pnl_pct"] > 0)
+        lines.append(f"\n📊 당일 실현 {len(results)}종목  승률 {wins/len(results)*100:.0f}%")
+    await notify("\n".join(lines))
+    logger.info("[PHASE FC] 완료 — 강제청산 %d종목, 실현 합산 %d종목", closed, len(results))
 
 
 # ─── 즉시 테스트 (선별만) ───────────────────────────────────────────────────
@@ -1312,20 +1712,23 @@ async def scheduler_daemon() -> None:
     """14:50 선별 → 15:20 매수 → 다음날 09:00 청산을 매 거래일 자동 반복."""
     logger.info("=" * 60)
     logger.info("[DAEMON] 종가매매 스케줄러 시작")
-    logger.info("  14:50 선별 / 15:20 매수 / 18:05 시간외 / 09:00(다음날) 청산")
+    logger.info("  14:50 선별 / 15:15·15:19 매수 / 18:05 시간외 / 09:00 청산 / 15:10 잔량 강제청산 (다음날)")
     logger.info("  Ctrl+C 로 종료  |  MOCK_MODE=%s", MOCK_MODE)
     logger.info("=" * 60)
     await notify(
         f"🚀 종가매매 데몬 시작\n"
         f"{'🧪 MOCK 모의투자' if MOCK_MODE else '💰 실거래'}\n"
-        f"14:50 선별 / 15:20 매수 / 18:05 시간외확인 / 09:00 청산"
+        f"14:50 선별 / 15:15 매수1차 / 15:19 매수2차 / 18:05 시간외 / 09:00 청산 / 15:10 잔량 강제청산"
     )
 
     phase_funcs = {
         "selection":   lambda: phase_selection(),
         "buy":         lambda: phase_buy(),
+        "buy_first":   lambda: phase_buy(split_pct=50, split_label="first"),
+        "buy_second":  lambda: phase_buy(split_pct=100, split_label="second"),
         "after_hours": lambda: phase_after_hours(),
         "sell":        lambda: phase_sell(),
+        "force_close": lambda: phase_force_close(),
     }
 
     while True:
@@ -1512,7 +1915,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--phase",
-        choices=["selection", "buy", "sell", "after_hours"],
+        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close"],
         help="단발 실행 단계",
     )
     group.add_argument("--test",    action="store_true", help="즉시 테스트 (선별만, 주문 없음)")
@@ -1542,7 +1945,13 @@ if __name__ == "__main__":
         asyncio.run(phase_selection())
     elif args.phase == "buy":
         asyncio.run(phase_buy())
+    elif args.phase == "buy_first":
+        asyncio.run(phase_buy(split_pct=50, split_label="first"))
+    elif args.phase == "buy_second":
+        asyncio.run(phase_buy(split_pct=100, split_label="second"))
     elif args.phase == "sell":
         asyncio.run(phase_sell())
     elif args.phase == "after_hours":
         asyncio.run(phase_after_hours())
+    elif args.phase == "force_close":
+        asyncio.run(phase_force_close())

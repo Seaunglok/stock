@@ -30,27 +30,41 @@ def evaluate_exit(
     current_price: float,
     after_hours_price: float | None = None,
     now: datetime | None = None,
+    stop_loss_pct: float = -2.0,
 ) -> ExitDecision:
-    """매수 후 청산 신호 (HOLD/PARTIAL_SELL/SELL_ALL/STOP_LOSS)."""
+    """매수 후 청산 신호 (HOLD/PARTIAL_SELL/SELL_ALL/STOP_LOSS).
+
+    Args:
+        stop_loss_pct: 손절 임계 (음수 %, 기본 -2.0%). 외부 베스트 프랙티스(-1~-2%)에 맞춤.
+                       호출자가 환경변수 등으로 조정 가능.
+    """
     now = now or datetime.now()
     pnl_pct = (current_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
 
-    # 1) 시간외 하락 → 즉시 매도
-    if after_hours_price is not None and after_hours_price < entry_price:
+    # 1) 시간외 하락 → 단, 시초가도 약할 때만 즉시 전량 매도.
+    #    (P1) 과거엔 18:05 시간외가 < 평단이면 09:00 무조건 SELL_ALL 이라
+    #    밤사이 회복해 시초 갭업한 종목까지 투매했다. 이제 09:00 실시간가(current_price)도
+    #    평단 이하일 때만 동반 약세로 보고 청산하고, 시초 회복(current > 평단) 시엔 정상 룰에 위임.
+    if (
+        after_hours_price is not None
+        and after_hours_price < entry_price
+        and current_price <= entry_price
+    ):
         ah_pct = (after_hours_price - entry_price) / entry_price * 100.0
         return ExitDecision(
             action="SELL_ALL",
             urgency="high",
-            reason=f"시간외 하락 ({ah_pct:+.2f}%) — 평단 이탈, 즉시 매도",
+            reason=f"시간외+시초 동반 약세 (시간외 {ah_pct:+.2f}%, 현재 {pnl_pct:+.2f}%) — 즉시 매도",
             suggested_qty_pct=100,
         )
 
-    # 2) 매수 평단 -3% 이탈 (정규장)
-    if current_price < entry_price * 0.97:
+    # 2) 매수 평단 stop_loss_pct 이탈 (정규장)
+    threshold_ratio = 1.0 + stop_loss_pct / 100.0  # -2.0 → 0.98
+    if current_price < entry_price * threshold_ratio:
         return ExitDecision(
             action="STOP_LOSS",
             urgency="high",
-            reason=f"손절 트리거 ({pnl_pct:+.2f}%) — -3% 이탈",
+            reason=f"손절 트리거 ({pnl_pct:+.2f}%) — {stop_loss_pct:.1f}% 이탈",
             suggested_qty_pct=100,
         )
 

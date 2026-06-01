@@ -20,12 +20,17 @@ class TechnicalScores:
     breakdown: dict[str, Any] = field(default_factory=dict)
 
     def composite(self) -> float:
+        # 가중치 — 백테스트(2025-11~2026-05, 149종목) 기반 재조정:
+        #   consolidation 0.20→0.25 (조정 후 회복 패턴 승률 高)
+        #   candle_shape  0.15→0.20 (위꼬리 작은 종목 100% 승률)
+        #   volume_surge  0.25→0.20 (1.5~3배가 최적, 5배+는 익일 약함)
+        #   institutional 0.20→0.15 (단기 변동에 기여도 낮음)
         return (
-            self.volume_surge * 0.25
+            self.volume_surge * 0.20
             + self.resistance_proximity * 0.20
-            + self.candle_shape * 0.15
-            + self.consolidation * 0.20
-            + self.institutional * 0.20
+            + self.candle_shape * 0.20
+            + self.consolidation * 0.25
+            + self.institutional * 0.15
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -484,8 +489,13 @@ def compute_technical_scores_hybrid(
 ) -> TechnicalScores:
     """하이브리드 — volume v1 / candle v2 / consolidation v1 / resistance v1.
 
-    회귀에서 candle만 v2가 부호 반전(+) 됐다.
-    resistance v2는 음신호 중화에 그쳐 의미 없음 → v1 유지(가중 0으로 중립화).
+    ⚠️ DEPRECATED (2026-06-01): 라이브(direct_closing_bet.py)는 검증 백테스트와
+    일치시키기 위해 compute_technical_scores(전부 v1)로 되돌렸다. candle v2는
+    "위꼬리 클수록 高점"이라 백테스트 결론(위꼬리 작을수록 승률↑)과 부호가 반대였음.
+    이 함수는 backtest_hybrid.py 비교 실험용으로만 남겨둔다.
+
+    주의: resistance_proximity 는 composite()에서 v1 매핑으로 가중 0.20 적용된다
+    (백테스트도 0.20 유지). "중립화" 아님.
     """
     ts = TechnicalScores()
     ts.volume_surge, vs_b = score_volume_surge(ohlcv)

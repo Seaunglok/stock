@@ -9,10 +9,12 @@
 전일 종가에 매수해 다음날 시초가/장중에 청산하는 **단기 스윙(보유 1영업일)** 전략.
 
 ```
-14:50  선별 phase  →  거래대금 상위 50종목 채점
-15:20  매수 phase  →  점수 60+ 1~5종목 종가 시장가 매수
-18:05  AH phase    →  시간외 단일가로 익일 청산 우선순위 미리 산정
-09:00  매도 phase  →  evaluate_exit() 신호로 청산
+14:50  선별 phase    →  거래대금 1,000억원+ × 상위 50종목 채점
+15:15  매수 1차      →  점수 60+ 1~5종목, 의도 수량의 50% 시장가 매수
+15:19  매수 2차      →  마감 직전, 잔여 50% 시장가 매수
+18:05  AH phase      →  시간외 단일가로 익일 청산 우선순위 미리 산정
+09:00  매도 phase    →  evaluate_exit() 신호로 청산 (부분청산 가능)
+15:10  강제청산 phase →  09:00 잔량(부분청산 후 잔여/HOLD) 전량 시장가 청산 → 오버나잇 잔량 0
 ```
 
 매수 후 보유 시간 ≈ 18시간. **하룻밤 위험**을 감수하는 대신, 종가 부근의 셋업(거래대금·매물대·외인 양매수)이 익일 시초가에 추가 매수세를 끌어올 확률에 베팅.
@@ -38,12 +40,14 @@
 - 하락 추세 종목 사전 차단
 
 ### Gate 5: 당일 갭업 필터 (종목별)
-- 당일 종가가 전일 대비 +4% 이상 → 후보 제외
-- 이벤트성 급등은 익일 차익실현 압력 큼
+- 당일 갭 ≥ **+2%** → 제외 (백테스트 기반)
+- 백테스트(149종목, 6개월): +2~4% 갭 종목 승률 57.9% (가장 약함)
+- 익일 시초 진입 시 가장 강한 구간은 -2~0% (조정 후 종가, 승률 80%) 와 0~2% (76%)
 
-### Gate 6: composite 점수 ≥ 60
+### Gate 6: composite 점수 ≥ 55 (기본)
 - 모든 필터 통과 후 6개 기준 가중 합산 (아래 §3)
-- **60점 미만은 후보 0개도 허용** — 시장이 약하면 매수 안 함
+- **55점 미만은 후보 0개도 허용** — 시장이 약하면 매수 안 함
+- 백테스트: strict-gap + thr55 + top_n3 → 승률 65.8%, +0.92% (env: `CLOSING_BET_MIN_SCORE`로 조정)
 
 ## 3. 채점 — 6개 기준 + 재료 가중
 
@@ -51,32 +55,41 @@
 
 | # | 기준 | 가중 | 핵심 로직 |
 |---|------|------|-----------|
-| 1 | volume_surge | 25% | 오늘 거래대금 / 20일 평균 (3배 = 50점, 5배+ = 100점) |
+| 1 | volume_surge | 20% | 오늘 거래대금 / 20일 평균 (1.5배 = 50점, 3배 = 90점) |
 | 2 | resistance_proximity | 20% | 90일 전고점 대비 갭 (-8% ~ -3% = 만점) |
-| 3 | candle_shape (v2) | 15% | 위꼬리 비율 큼 → 익일 추격매수 여지 (회귀로 부호 반전 확인) |
-| 4 | consolidation | 20% | 90일 고점 → 조정 → 회복 패턴 (조정 30봉+ 보너스 +10) |
-| 5 | institutional | 20% | 외인·기관 5일 누적 양매수 (둘 다 = 100, 하나 = 60) |
+| 3 | candle_shape (v2) | 20% | 위꼬리 작을수록 高 (백테스트 결과 위꼬리 0-20% 구간 100% 승률) |
+| 4 | consolidation | 25% | 90일 고점 → 조정 → 회복 패턴 (백테스트 가장 높은 기여) |
+| 5 | institutional | 15% | 외인·기관 5일 누적 양매수 (둘 다 = 100, 하나 = 60) |
 | 6 | catalyst | (별도) | 트렌드 키워드 매칭 (AI/반도체, 2차전지, 방산, 바이오, 원전, 로봇, 조선, 양자) |
 
 **최종 합산 공식**:
 ```python
-cat_weight = 0.30 if cat.has_catalyst else 0.0
+# tech = compute_technical_scores(...)  # 검증 백테스트와 동일한 v1 채점식 (candle v1 포함)
+cat_weight = CATALYST_WEIGHT if cat.has_catalyst else 0.0   # CLOSING_BET_CATALYST_WEIGHT, 기본 0.0
 composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
 ```
 
-> 재료 있는 종목만 30% 가중. 조용한 종목을 페널티하지 않음.
+> **P0(2026-06-01)**: catalyst 기본 가중을 **0.0**으로 낮췄다. 검증 백테스트(`compute_technical_scores`)에는
+> catalyst가 없었고, 라이브 catalyst는 "회사명 뉴스 ≥2건"이면 켜져 대형주 대부분에서 항상 True가 돼
+> 30%를 노이즈로 대체했다. 실거래·백테스트로 검증된 뒤 `CLOSING_BET_CATALYST_WEIGHT`로 다시 올린다.
+> 또한 라이브 채점 함수를 `compute_technical_scores_hybrid`(candle **v2** = 위꼬리 클수록 高)에서
+> `compute_technical_scores`(candle **v1** = 위꼬리 작을수록 高)로 되돌려 백테스트 결론과 부호를 맞췄다.
 
 ## 4. 포지션 사이즈 — 점수 차등
 
 [direct_closing_bet.py:calc_position_qty](../scripts/direct_closing_bet.py)
 
-| composite | 투자금 배수 | 의도 |
-|-----------|-------------|------|
-| ≥ 85 | INVESTMENT_PER_TRADE × 2.0 | 초고확신 |
-| ≥ 70 | × 1.5 | 고확신 |
-| 60~70 | × 1.0 | 표준 |
+| composite | 투자금 배수 (기본) | conviction sizing on |
+|-----------|-------------------|----------------------|
+| ≥ 85 | × 1.0 | × 2.0 |
+| ≥ 70 | × 1.0 | × 1.5 |
+| 55~70 | × 1.0 | × 1.0 |
 
 기본 `INVESTMENT_PER_TRADE = 500,000원` (`.env`로 조정).
+
+> **P0(2026-06-01)**: 점수 차등 사이징을 **기본 off(전 구간 1.0x)** 로 변경. 백테스트에서 70+ 구간이
+> 오히려 부진(승률 50.0% / 평균 −0.13%, n=10)해 고확신 구간에 자본을 더 싣는 것이 금액가중 수익을 깎았다.
+> 근거가 쌓이면 `CLOSING_BET_CONVICTION_SIZING=true`로 점수 차등을 다시 켤 수 있다.
 
 ## 5. 분산 — 섹터 집중 방지
 - 섹터당 최대 **2종목** (`MAX_PER_SECTOR=2`)
@@ -89,26 +102,35 @@ composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
 
 | 조건 | 액션 | 수량 |
 |------|------|------|
-| 시간외 가격 < 평단 | `SELL_ALL` | 100% |
-| 정규장 -3% 이탈 | `STOP_LOSS` | 100% |
+| 시간외 가격 < 평단 **AND** 시초가 ≤ 평단 | `SELL_ALL` | 100% |
+| 정규장 `STOP_LOSS_PCT` 이탈 | `STOP_LOSS` | 100% |
 | 09:00~09:05 + 수익 | `PARTIAL_SELL` | 33% (1/3 익절) |
 | 09:05 이후 + +2% 이상 | `SELL_ALL` | 100% (탐욕 X) |
 | 정규장 +3% 이상 | `PARTIAL_SELL` | 50% |
-| 그 외 | `HOLD` | 0% |
+| 그 외 | `HOLD` | 0% (→ 15:10 강제청산) |
 
 **핵심 규칙**:
-1. 손절은 -3% 한도 (노이즈 손절 방지)
-2. 시초가 수익은 1/3만 익절 (러닝)
+1. 손절은 `STOP_LOSS_PCT` 한도 (기본 -2.0%, 노이즈 손절 방지)
+2. 시초가 수익은 1/3만 익절 (러닝). HOLD/부분청산 잔량은 **같은 날 15:10 강제청산** → 1영업일 보유 보장.
 3. 9:05 지나면 +2% 이상은 전량 매도 (욕심 X)
-4. 시간외 하락 시 익일 09:00 즉시 매도 (애프터마켓 신호 우선)
+4. **(P1 2026-06-01)** 시간외 하락은 시초가도 평단 이하일 때만 즉시 전량 매도. 밤사이 회복해
+   시초 갭업한 종목까지 투매하던 문제를 수정 — 시초 회복(현재가 > 평단) 시엔 정상 룰에 위임.
+
+> **승률 측정 (P1)**: 모든 포지션이 09:00 부분청산 + 15:10 강제청산으로 1영업일 내 실현되며,
+> sell.json 의 승률은 종목별 **가중 실현손익**(`exit_ledger` 합산)으로 계산된다. 과거 `HOLD`를
+> 분모에서 제외해 승률이 상향 편향되던 문제 제거.
 
 ## 7. 운영 파라미터 (튜닝 가능)
 
 | 파라미터 | 기본 | 환경변수 | 설명 |
 |----------|------|----------|------|
-| `MIN_SCORE` | 60.0 | `CLOSING_BET_MIN_SCORE` | 후보 최저 점수 |
-| `TOP_CANDIDATES` | 5 | `CLOSING_BET_TOP_CANDIDATES` | 1일 최대 종목 수 (상한) |
+| `MIN_SCORE` | 55.0 | `CLOSING_BET_MIN_SCORE` | 후보 최저 점수 (백테스트 검증) |
+| `TOP_CANDIDATES` | 3 | `CLOSING_BET_TOP_CANDIDATES` | 1일 최대 종목 수 (3개가 5개보다 승률 ↑) |
+| `MIN_VALUE_KRW` | 1,000억 | `CLOSING_BET_MIN_VALUE_KRW` | 거래대금 최저 임계 (원 단위) |
+| `STOP_LOSS_PCT` | -2.0 | `CLOSING_BET_STOP_LOSS_PCT` | 손절 % (외부 권장 -1~-2%) |
 | `INVESTMENT_PER_TRADE` | 500,000 | `INVESTMENT_PER_TRADE` | 1종목 기준 투자금 |
+| `CATALYST_WEIGHT` | 0.0 | `CLOSING_BET_CATALYST_WEIGHT` | catalyst 블렌딩 가중 (0=technical-only, 백테스트와 동일) |
+| `CONVICTION_SIZING` | false | `CLOSING_BET_CONVICTION_SIZING` | 점수 차등 사이징 on/off (기본 off=전 구간 1.0x) |
 | `MOCK_MODE` | true | `MOCK_MODE` | 모의 주문 |
 | `MAX_PER_SECTOR` | 2 | (코드) | 섹터 분산 |
 | `TOP_N_STOCKS` | 50 | (코드) | 거래대금 상위 N |
@@ -130,7 +152,7 @@ data/closing_bet/YYYY-MM-DD/
 ├── buy.json           # 매수 주문 + 총 투자금
 ├── sell.json          # 청산 결과 + 승률 summary
 └── events.jsonl       # 시계열 이벤트 (phase_start/market_filter/regime/us_market/
-                       #   selection_done/buy/after_hours/sell/skip/error)
+                       #   selection_done/buy/after_hours/sell/force_close/skip/error)
 ```
 
 **상태 파일** (in-memory state 보조): `%TEMP%/closing_bet_state_direct.json`

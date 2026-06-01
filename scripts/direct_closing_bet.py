@@ -129,6 +129,12 @@ CATALYST_WEIGHT = float(os.getenv("CLOSING_BET_CATALYST_WEIGHT", "0.0"))
 # P0: 점수 차등(확신) 사이징 — 백테스트에서 70+ 구간이 오히려 부진(50%/-0.13%, n=10)해
 #     기본 off(전 구간 1.0x). CLOSING_BET_CONVICTION_SIZING=true 일 때만 ≥70 1.5x / ≥85 2.0x.
 CONVICTION_SIZING = os.getenv("CLOSING_BET_CONVICTION_SIZING", "false").lower() == "true"
+# P2: 거래비용(편도 bps, 1bp=0.01%) — 청산 손익을 net 으로 보고하기 위한 차감.
+#     왕복 ≈ 매도세 + 수수료×2 + 슬리피지×2. 백테스트(backtest_walkforward.py)와 동일 가정.
+TAX_BPS       = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))       # 매도세 (매도 1회)
+FEE_BPS       = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))        # 위탁수수료 (편도)
+SLIPPAGE_BPS  = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))  # 시장가 슬리피지 (편도)
+ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
@@ -268,10 +274,17 @@ def _aggregate_exits(exit_date: str) -> list[dict]:
         })
     results: list[dict] = []
     for s in by_sym.values():
-        invested = s["entry_price"] * s["sell_qty"]
-        s["pnl_pct"]    = round(s["pnl_amount"] / invested * 100, 2) if invested > 0 else 0.0
-        s["exit_price"] = round(s["entry_price"] + s["pnl_amount"] / s["sell_qty"], 2) if s["sell_qty"] > 0 else s["entry_price"]
-        s["pnl_amount"] = round(s["pnl_amount"])
+        invested   = s["entry_price"] * s["sell_qty"]
+        gross_amt  = s["pnl_amount"]
+        gross_pct  = round(gross_amt / invested * 100, 2) if invested > 0 else 0.0
+        # P2: 거래비용(왕복) 차감 — pnl_pct/pnl_amount 는 net 을 기본으로 보고한다.
+        cost_amt   = invested * ROUNDTRIP_COST_PCT / 100.0
+        s["exit_price"]       = round(s["entry_price"] + gross_amt / s["sell_qty"], 2) if s["sell_qty"] > 0 else s["entry_price"]
+        s["pnl_pct_gross"]    = gross_pct
+        s["pnl_amount_gross"] = round(gross_amt)
+        s["cost_pct"]         = round(ROUNDTRIP_COST_PCT, 3)
+        s["pnl_pct"]          = round(gross_pct - ROUNDTRIP_COST_PCT, 2)   # net
+        s["pnl_amount"]       = round(gross_amt - cost_amt)               # net
         results.append(s)
     return results
 
@@ -932,6 +945,31 @@ async def _try_get_realtime_price(symbol: str) -> float | None:
     return None
 
 
+def _extract_fill_price(parsed: Any) -> float | None:
+    """주문 응답에서 실체결가를 찾는다 (있으면). 키움 kt10000/kt10001 은 보통 주문번호만
+    동기 반환하므로 대개 None — 호출자는 매수 직전 실시간가로 폴백한다.
+    어댑터/모의서버가 체결가를 echo 하면 그 값을 entry 로 쓴다.
+    """
+    _FILL_KEYS = ("ord_uv", "체결단가", "체결가", "executed_price", "fill_price",
+                  "avg_price", "prc", "cntr_pric", "stck_prpr")
+    if not isinstance(parsed, dict):
+        return None
+    d = parsed.get("data", parsed)
+    if not isinstance(d, dict):
+        return None
+    for key in _FILL_KEYS:
+        val = d.get(key)
+        if val in (None, "", "0", 0):
+            continue
+        try:
+            price = float(str(val).lstrip("+-").replace(",", ""))
+            if price > 0:
+                return price
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 async def _try_get_after_hours_price(symbol: str) -> float | None:
     """시간외 단일가 조회.
 
@@ -1266,8 +1304,11 @@ async def phase_buy(
 
             for c in candidates:
                 symbol = c["symbol"]
-                # 매수 직전 현재가 재조회 — 선별 시점 가격 대신 실시간 가격 사용
-                live_price = get_current_price(symbol)
+                # P2: 매수 직전가 — kiwoom-market 실시간가 우선(장중 정확) → pykrx 전일종가 → 선별가.
+                #     pykrx 일봉은 장중 stale 라 entry_price 가 실제 체결가와 크게 어긋났음.
+                live_price = await _try_get_realtime_price(symbol)
+                if not (live_price and live_price > 0):
+                    live_price = get_current_price(symbol)
                 price = live_price if live_price and live_price > 0 else c.get("current_price", 0.0)
                 if live_price and live_price != c.get("current_price", 0.0):
                     logger.info("[BUY] %s 가격 갱신: %.0f → %.0f원", symbol, c.get("current_price", 0.0), price)
@@ -1296,11 +1337,16 @@ async def phase_buy(
                         "account_no": ACCOUNT_NO,
                     })
                     parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    # P2: 응답에 실체결가가 있으면 entry 로 사용 (없으면 매수 직전 실시간가 유지).
+                    fill_price = _extract_fill_price(parsed)
+                    entry_price = fill_price if fill_price and fill_price > 0 else price
+                    if fill_price and abs(fill_price - price) > 0.01:
+                        logger.info("[BUY] %s 체결가 반영: %.0f → %.0f원", symbol, price, entry_price)
                     orders.append({
                         "symbol":       symbol,
                         "company_name": c["company_name"],
                         "quantity":     qty,
-                        "entry_price":  price,
+                        "entry_price":  entry_price,
                         "composite":    c["composite"],
                         "sector":       c.get("sector", "기타"),
                         "buy_date":     today_str,
@@ -1309,11 +1355,11 @@ async def phase_buy(
                     })
                     logger.info(
                         "[BUY:%s] %s %-10s  %d주 @ %s원  %s",
-                        split_label, symbol, c["company_name"][:10], qty, price, mode_tag,
+                        split_label, symbol, c["company_name"][:10], qty, entry_price, mode_tag,
                     )
                     _data_logger.log_event("buy", {
                         "symbol": symbol, "name": c["company_name"], "qty": qty,
-                        "price": price, "composite": c["composite"],
+                        "price": entry_price, "composite": c["composite"],
                         "sector": c.get("sector", "기타"), "mock": MOCK_MODE,
                         "split": split_label,
                     })

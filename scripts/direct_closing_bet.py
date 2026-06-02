@@ -1011,6 +1011,58 @@ def _order_accepted(parsed: Any) -> tuple[bool, str]:
     return False, f"return_code={rc} {str(msg)[:80]}"
 
 
+# 주문 거부 원인 분류 — return_msg 키워드 매칭 (장중 시장가 거부 원인 추적용).
+_REJECT_PATTERNS: list[tuple[tuple[str, ...], str]] = [
+    (("8005", "토큰", "token"),                                  "TOKEN_INVALID(토큰무효·#5자동복구대상)"),
+    (("rc4058", "거래시간", "장운영", "운영시간", "주문가능시간",
+      "장개시", "장종료", "동시호가", "장시작", "장마감"),         "NOT_TRADING_HOURS(장운영시간외)"),
+    (("증거금", "예수금", "잔고", "현금", "매수가능", "주문가능금액"), "INSUFFICIENT_FUNDS(증거금/잔고부족)"),
+    (("호가단위", "단위상위", "단위하위"),                          "PRICE_TICK(호가단위오류)"),
+    (("상한", "하한", "가격제한"),                                  "PRICE_LIMIT(상하한가)"),
+    (("종목", "정리매매", "거래정지", "관리종목"),                   "SYMBOL_RESTRICTED(종목제한)"),
+]
+
+
+def _classify_rejection(msg: str) -> str:
+    m = (msg or "").lower()
+    for kws, label in _REJECT_PATTERNS:
+        if any(k.lower() in m for k in kws):
+            return label
+    return "UNKNOWN(미분류 — raw 응답 확인)"
+
+
+def _rejection_detail(parsed: Any) -> tuple[Any, str, str]:
+    """(return_code, return_msg, 분류라벨) 추출."""
+    d = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
+    code = d.get("return_code") if isinstance(d, dict) else None
+    msg = str(d.get("return_msg", "")) if isinstance(d, dict) else ""
+    return code, msg, _classify_rejection(msg)
+
+
+def _log_order_reject(phase: str, symbol: str, params: dict, parsed: Any) -> tuple[str, str]:
+    """주문 거부를 원인분류·전체 코드/메시지·파라미터·raw 응답까지 기록.
+
+    closing_bet.log(ERROR) + events.jsonl(order_reject)에 동시 기록해 사후 원인분석을 가능케 한다.
+    Returns: (분류라벨, return_msg)
+    """
+    code, msg, label = _rejection_detail(parsed)
+    try:
+        raw_str = json.dumps(parsed, ensure_ascii=False)[:600]
+    except Exception:
+        raw_str = str(parsed)[:600]
+    logger.error(
+        "[REJECT] %s %s  분류=%s  rc=%s  msg=%s  params=%s  raw=%s",
+        phase, symbol, label, code, msg, params, raw_str,
+    )
+    _data_logger.log_event("order_reject", {
+        "phase": phase, "symbol": symbol, "label": label,
+        "return_code": code, "return_msg": msg, "params": params,
+        "raw": parsed if isinstance(parsed, dict) else str(parsed),
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    })
+    return label, msg
+
+
 def _extract_fill_price(parsed: Any) -> float | None:
     """주문 응답에서 실체결가를 찾는다 (있으면). 키움 kt10000/kt10001 은 보통 주문번호만
     동기 반환하므로 대개 None — 호출자는 매수 직전 실시간가로 폴백한다.
@@ -1405,13 +1457,14 @@ async def phase_buy(
                     })
                     parsed = json.loads(raw) if isinstance(raw, str) else raw
                     # #3: 주문 수락(return_code 0) 확인 — 거부 시 유령 포지션 방지.
-                    ok, why = _order_accepted(parsed)
+                    ok, _ = _order_accepted(parsed)
                     if not ok:
-                        logger.error("[BUY:%s] %s 주문 거부 — %s", split_label, symbol, why)
-                        _data_logger.log_event("error", {
-                            "phase": f"buy_{split_label}", "symbol": symbol, "error": f"order_rejected: {why}",
-                        })
-                        await notify(f"❌ 매수 거부 {symbol} — {why}")
+                        label, msg = _log_order_reject(
+                            f"buy_{split_label}", symbol,
+                            {"qty": qty, "order_type": "03(시장가)", "price": price, "account": ACCOUNT_NO[:4] + "****"},
+                            parsed,
+                        )
+                        await notify(f"❌ 매수 거부 {c['company_name']}({symbol})\n[{label}]\n{msg[:100]}")
                         continue
                     # P2: 응답에 실체결가가 있으면 entry 로 사용 (없으면 매수 직전 실시간가 유지).
                     fill_price = _extract_fill_price(parsed)
@@ -1592,10 +1645,14 @@ async def _manage_position(
     try:
         resp = await _sell_market(mcp, symbol, qty)
         # #3: 매도 수락(return_code 0) 확인 — 거부 시 포지션 유지(미실현), 다음 기회 재시도.
-        ok, why = _order_accepted(resp)
+        ok, _ = _order_accepted(resp)
         if not ok:
-            logger.error("[%s] %s 매도 거부 — %s (보유 유지, 재시도)", when_label, symbol, why)
-            _data_logger.log_event("error", {"phase": when_label, "symbol": symbol, "error": f"sell_rejected: {why}"})
+            label, msg = _log_order_reject(
+                f"sell_{when_label}", symbol,
+                {"qty": qty, "order_type": "03(시장가)", "side": "sell", "account": ACCOUNT_NO[:4] + "****"},
+                resp,
+            )
+            await notify(f"❌ 매도 거부 {name}({symbol})\n[{label}]\n{msg[:100]} (보유 유지·재시도)")
             return ("keep", {**pos, "peak_price": round(new_peak, 2), "stop_price": round(new_stop, 2)})
         _append_exit(exit_date, {
             "symbol": symbol, "company_name": name, "entry_price": entry_price,

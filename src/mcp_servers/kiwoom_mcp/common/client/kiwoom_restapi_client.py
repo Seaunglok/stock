@@ -157,6 +157,20 @@ class KiwoomRESTAPIClient:
 
     # === 인증 관리 ===
 
+    @staticmethod
+    def _is_token_invalid_body(result: dict) -> bool:
+        """응답 본문이 토큰 무효(8005 등)를 나타내는지 — HTTP 200 으로 오는 케이스 감지."""
+        if not isinstance(result, dict):
+            return False
+        try:
+            rc = result.get("return_code")
+            msg = str(result.get("return_msg", ""))
+        except AttributeError:
+            return False
+        if rc in (0, "0", None):
+            return False
+        return ("8005" in msg) or ("Token" in msg) or ("토큰" in msg)
+
     async def _get_access_token(self) -> str:
         """액세스 토큰 획득 또는 갱신"""
 
@@ -295,6 +309,7 @@ class KiwoomRESTAPIClient:
 
         # 재시도 로직
         last_error = None
+        token_refreshed = False
         for attempt in range(self.max_retries):
             try:
                 response = await self._client.request(
@@ -306,7 +321,24 @@ class KiwoomRESTAPIClient:
                 )
 
                 response.raise_for_status()
-                return response.json()
+                result = response.json()
+
+                # 토큰 무효(8005)는 HTTP 200 + return_code 로 와서 아래 401 경로를 안 탄다.
+                # 본문에서 감지하면 캐시 토큰을 폐기·재발급 후 1회 재시도 (stale 토큰 자동복구).
+                if not token_refreshed and self._is_token_invalid_body(result):
+                    logger.warning("[%s] 응답 본문 토큰 무효 감지 — 토큰 재발급 후 재시도", api_id)
+                    token_refreshed = True
+                    self._access_token = None
+                    self._token_expires_at = None
+                    new_token = await self._get_access_token()
+                    headers = KiwoomEndpoints.get_kiwoom_headers(
+                        api_id=api_id,
+                        access_token=new_token,
+                        app_key=self.app_key,
+                        app_secret=self.app_secret,
+                    )
+                    continue
+                return result
 
             except httpx.HTTPStatusError as e:
                 last_error = e

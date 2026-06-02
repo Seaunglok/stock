@@ -107,7 +107,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 _TEMP = Path(os.environ.get("TEMP", "C:/Windows/Temp"))
-STATE_FILE = _TEMP / "closing_bet_state_direct.json"
 
 # 로그: 프로젝트 내 logs/closing_bet/ 폴더에 일자별로 회전 (자정에 자동 회전)
 LOG_DIR = _ROOT / "logs" / "closing_bet"
@@ -116,6 +115,15 @@ LOG_FILE = LOG_DIR / "closing_bet.log"  # 활성 로그 (자정에 closing_bet.l
 
 DATA_DIR = _ROOT / "data" / "closing_bet"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# #2: 상태 파일을 프로젝트 영속 경로로 (구버전 %TEMP% 는 OS 정리/재부팅 시 유실 → 다일 보유 중 고아 포지션 위험).
+STATE_FILE = DATA_DIR / "state.json"
+_OLD_STATE_FILE = _TEMP / "closing_bet_state_direct.json"
+if not STATE_FILE.exists() and _OLD_STATE_FILE.exists():
+    try:
+        STATE_FILE.write_text(_OLD_STATE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
 
 TOP_N_STOCKS = 50       # 거래대금 상위 N종목 분석 (확장: 전고점 셋업 발굴 확률 향상)
 # "최고 확률 높은 종목만 1~5개" — composite >= 60 인 셋업만 후보로 인정.
@@ -143,6 +151,9 @@ ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
 HOLD_DAYS  = int(os.getenv("CLOSING_BET_HOLD_DAYS", "3"))       # 최대 보유 영업일 (시간청산)
 ATR_K      = float(os.getenv("CLOSING_BET_ATR_K", "2.0"))       # 트레일 밴드 = ATR_K × ATR
 ATR_PERIOD = int(os.getenv("CLOSING_BET_ATR_PERIOD", "14"))     # ATR 평균 기간(봉)
+# #1 장중 트레일 점검 주기(분). 백테스트는 일중 저가로 손절 이탈을 잡지만 라이브는 관측 시점에만
+#    볼 수 있으므로, 보유분이 있는 장중에는 이 주기로 폴링해 트레일 스톱을 갱신·이탈 청산한다.
+INTRADAY_POLL_MIN = int(os.getenv("CLOSING_BET_INTRADAY_POLL_MIN", "10"))
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
@@ -981,6 +992,25 @@ async def _try_get_realtime_price(symbol: str) -> float | None:
     return None
 
 
+def _order_accepted(parsed: Any) -> tuple[bool, str]:
+    """주문 응답이 실제 수락됐는지 판정 (#3 reconciliation).
+
+    키움은 MCP 레벨 success:true 라도 data.return_code != 0 이면 거부다
+    (예: 8005 토큰무효 → return_code 3). 이 경우 포지션을 state 에 기록하면 안 된다
+    (유령 포지션 → 익일 보유하지 않은 종목 청산 시도).
+    """
+    if not isinstance(parsed, dict):
+        return False, "응답 형식 오류"
+    if parsed.get("success") is False:
+        return False, str(parsed.get("error", "주문 실패"))
+    d = parsed.get("data", parsed)
+    rc = d.get("return_code") if isinstance(d, dict) else None
+    if rc in (0, "0", None):   # return_code 없으면(=구형/성공) 수락으로 간주
+        return True, ""
+    msg = d.get("return_msg", "") if isinstance(d, dict) else ""
+    return False, f"return_code={rc} {str(msg)[:80]}"
+
+
 def _extract_fill_price(parsed: Any) -> float | None:
     """주문 응답에서 실체결가를 찾는다 (있으면). 키움 kt10000/kt10001 은 보통 주문번호만
     동기 반환하므로 대개 None — 호출자는 매수 직전 실시간가로 폴백한다.
@@ -1374,6 +1404,15 @@ async def phase_buy(
                         "account_no": ACCOUNT_NO,
                     })
                     parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    # #3: 주문 수락(return_code 0) 확인 — 거부 시 유령 포지션 방지.
+                    ok, why = _order_accepted(parsed)
+                    if not ok:
+                        logger.error("[BUY:%s] %s 주문 거부 — %s", split_label, symbol, why)
+                        _data_logger.log_event("error", {
+                            "phase": f"buy_{split_label}", "symbol": symbol, "error": f"order_rejected: {why}",
+                        })
+                        await notify(f"❌ 매수 거부 {symbol} — {why}")
+                        continue
                     # P2: 응답에 실체결가가 있으면 entry 로 사용 (없으면 매수 직전 실시간가 유지).
                     fill_price = _extract_fill_price(parsed)
                     entry_price = fill_price if fill_price and fill_price > 0 else price
@@ -1504,15 +1543,16 @@ async def phase_after_hours(positions: list[dict] | None = None) -> None:
 
 # ─── Phase 3: 매도 (다일 보유 + ATR 트레일) ─────────────────────────────────────
 
-async def _sell_market(mcp: Any, symbol: str, sell_qty: int) -> None:
-    """trading-domain 시장가 매도 1건. 예외는 호출자에 전파."""
-    await mcp.call_tool("place_sell_order", {
+async def _sell_market(mcp: Any, symbol: str, sell_qty: int) -> Any:
+    """trading-domain 시장가 매도 1건. 파싱된 응답 반환. 예외는 호출자에 전파."""
+    raw = await mcp.call_tool("place_sell_order", {
         "stock_code": symbol,
         "quantity":   sell_qty,
         "price":      None,
         "order_type": "03",   # 시장가
         "account_no": ACCOUNT_NO,
     })
+    return json.loads(raw) if isinstance(raw, str) else raw
 
 
 async def _manage_position(
@@ -1550,7 +1590,13 @@ async def _manage_position(
     if qty < 1:
         return ("sold", pnl_pct)
     try:
-        await _sell_market(mcp, symbol, qty)
+        resp = await _sell_market(mcp, symbol, qty)
+        # #3: 매도 수락(return_code 0) 확인 — 거부 시 포지션 유지(미실현), 다음 기회 재시도.
+        ok, why = _order_accepted(resp)
+        if not ok:
+            logger.error("[%s] %s 매도 거부 — %s (보유 유지, 재시도)", when_label, symbol, why)
+            _data_logger.log_event("error", {"phase": when_label, "symbol": symbol, "error": f"sell_rejected: {why}"})
+            return ("keep", {**pos, "peak_price": round(new_peak, 2), "stop_price": round(new_stop, 2)})
         _append_exit(exit_date, {
             "symbol": symbol, "company_name": name, "entry_price": entry_price,
             "qty": qty, "exit_price": current,
@@ -1708,6 +1754,56 @@ async def phase_force_close(positions: list[dict] | None = None) -> None:
     logger.info("[PHASE FC] 완료 — 청산:%d  이월:%d  실현합산:%d종목", sold, len(remaining), len(results))
 
 
+# ─── Phase 3-c: 장중 트레일 점검 (#1 — 일중 손절 이탈 포착) ──────────────────────
+
+async def phase_intraday_stop() -> None:
+    """정규장 중 주기적으로 보유분의 트레일 스톱을 갱신하고 이탈 시 청산.
+
+    백테스트는 일중 저가로 손절 이탈을 잡는데 라이브는 관측 시점에만 가격을 보므로,
+    데몬이 장중 INTRADAY_POLL_MIN 주기로 이 함수를 호출해 간극을 줄인다.
+    시간청산은 하지 않는다(15:10 force_close 담당). 매도가 발생할 때만 알림/기록한다.
+    """
+    positions = get_state("positions") or []
+    if not positions:
+        return
+
+    today      = datetime.now().strftime("%Y-%m-%d")
+    exit_date  = today
+    entry_date = _entry_date_label(positions)
+    _ensure_exit_ledger(exit_date)
+    remaining: list[dict] = []
+    sold = 0
+
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                logger.warning("[INTRADAY] trading-domain 연결 실패 — 점검 스킵")
+                return
+            for pos in positions:
+                status, payload = await _manage_position(
+                    mcp, pos, exit_date, today, allow_time_exit=False, when_label="intraday",
+                )
+                if status == "keep":
+                    remaining.append(payload)
+                else:
+                    sold += 1
+    except Exception as e:
+        logger.error("[INTRADAY] 오류: %s", e)
+        return
+
+    # 갱신된 트레일 스톱(remaining)은 항상 저장 — 매도 없어도 stop 래칫 보존
+    save_state("positions", remaining)
+    if sold:
+        results = _finalize_sell_log(entry_date, exit_date)
+        save_state("sell", results)
+        lines = [f"📉 장중 트레일 청산 [{datetime.now().strftime('%m/%d %H:%M')}]  {sold}종목"]
+        for r in results:
+            icon = "🟢" if r["pnl_pct"] > 0 else "🔴"
+            lines.append(f"{icon} {r['company_name']}({r['symbol']})  실현 {r['pnl_pct']:+.2f}%")
+        await notify("\n".join(lines))
+        logger.info("[INTRADAY] 트레일 청산 %d종목, 보유 %d종목", sold, len(remaining))
+
+
 # ─── 즉시 테스트 (선별만) ───────────────────────────────────────────────────
 
 async def run_test() -> None:
@@ -1741,6 +1837,14 @@ async def run_test() -> None:
 
 def _is_weekday(dt: datetime) -> bool:
     return dt.weekday() < 5  # 0=월 ~ 4=금
+
+
+def _is_market_hours(dt: datetime) -> bool:
+    """정규장 트레일 점검 구간 (영업일 09:00~15:10). 15:10 이후는 force_close가 담당."""
+    if not _is_weekday(dt):
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    return 9 * 60 <= minutes <= 15 * 60 + 10
 
 
 def _next_run_time(hour: int, minute: int, base: datetime | None = None) -> datetime:
@@ -1807,9 +1911,18 @@ async def scheduler_daemon() -> None:
         )
 
         while wait_sec > 0:
-            sleep_time = min(wait_sec, 1800)
+            # #1: 보유분이 있고 정규장 시간이면 INTRADAY_POLL_MIN 주기로 트레일 점검.
+            has_positions = bool(get_state("positions"))
+            poll_cap = INTRADAY_POLL_MIN * 60 if (has_positions and _is_market_hours(datetime.now())) else 1800
+            sleep_time = min(wait_sec, poll_cap)
             await asyncio.sleep(sleep_time)
             wait_sec -= sleep_time
+            now2 = datetime.now()
+            if get_state("positions") and _is_market_hours(now2) and now2 < next_dt:
+                try:
+                    await phase_intraday_stop()
+                except Exception as e:
+                    logger.error("[DAEMON] 장중 트레일 점검 오류: %s", e)
             if wait_sec > 60:
                 logger.info("[DAEMON] %s까지 %.0f분 남음", next_phase, wait_sec / 60)
 
@@ -1961,7 +2074,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--phase",
-        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close"],
+        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close", "intraday_stop"],
         help="단발 실행 단계",
     )
     group.add_argument("--test",    action="store_true", help="즉시 테스트 (선별만, 주문 없음)")
@@ -2001,3 +2114,5 @@ if __name__ == "__main__":
         asyncio.run(phase_after_hours())
     elif args.phase == "force_close":
         asyncio.run(phase_force_close())
+    elif args.phase == "intraday_stop":
+        asyncio.run(phase_intraday_stop())

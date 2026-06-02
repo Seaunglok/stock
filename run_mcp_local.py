@@ -97,7 +97,8 @@ def stop_servers():
         if is_running(pid):
             try:
                 if sys.platform == "win32":
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                    # /T: 자식 프로세스(uvicorn 등)까지 트리 전체 종료 — 없으면 포트 점유 좀비 잔존
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                    capture_output=True)
                 else:
                     os.kill(pid, 15)

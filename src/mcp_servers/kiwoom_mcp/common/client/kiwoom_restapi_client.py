@@ -6,13 +6,20 @@ API Registry와 통합되어 178개 API를 자동으로 라우팅합니다.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Union
 
 import httpx
 from httpx import AsyncClient
+
+# 프로세스 간 공유 토큰 캐시 — 여러 키움 MCP 서버가 같은 appkey 로 각자 토큰을 발급해
+# 서로 무효화(8005)하던 문제 방지. 한 곳에서 발급한 토큰을 파일로 공유해 재사용한다.
+_TOKEN_CACHE_DIR = Path(os.environ.get("TEMP", "/tmp")) / "kiwoom_token_cache"
 
 from src.mcp_servers.kiwoom_mcp.common.constants import (
     KiwoomAPIID,
@@ -171,26 +178,61 @@ class KiwoomRESTAPIClient:
             return False
         return ("8005" in msg) or ("Token" in msg) or ("토큰" in msg)
 
-    async def _get_access_token(self) -> str:
-        """액세스 토큰 획득 또는 갱신"""
+    def _token_cache_path(self) -> Path:
+        key = hashlib.sha256(f"{self.mode}:{self.app_key}".encode()).hexdigest()[:16]
+        return _TOKEN_CACHE_DIR / f"token_{self.mode}_{key}.json"
 
-        # 토큰이 유효하면 재사용
-        if (
-            self._access_token
-            and self._token_expires_at
-            and datetime.now() < self._token_expires_at - timedelta(minutes=5)
-        ):
-            return self._access_token
+    def _load_cached_token(self) -> Optional[tuple[str, datetime]]:
+        """공유 캐시에서 유효 토큰 로드 (만료 5분 전까지 유효). 없거나 만료면 None."""
+        try:
+            p = self._token_cache_path()
+            if not p.exists():
+                return None
+            d = json.loads(p.read_text(encoding="utf-8"))
+            exp = datetime.fromisoformat(d["expires_at"])
+            if datetime.now() < exp - timedelta(minutes=5) and d.get("token"):
+                return d["token"], exp
+        except Exception:
+            pass
+        return None
 
-        # 새 토큰 요청
+    def _save_cached_token(self, token: str, exp: datetime) -> None:
+        try:
+            _TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._token_cache_path().write_text(
+                json.dumps({"token": token, "expires_at": exp.isoformat()}),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug(f"토큰 캐시 저장 실패(무시): {e}")
+
+    async def _get_access_token(self, force: bool = False) -> str:
+        """액세스 토큰 획득 또는 갱신.
+
+        force=False: 메모리 → 공유 캐시 → 신규발급 순. (서버 간 토큰 공유로 상호 무효화 방지)
+        force=True : 캐시 무시하고 무조건 신규발급 후 캐시 갱신. (8005 토큰무효 복구 경로)
+        """
+        if not force:
+            # 1) 메모리 토큰 유효 시 재사용
+            if (
+                self._access_token
+                and self._token_expires_at
+                and datetime.now() < self._token_expires_at - timedelta(minutes=5)
+            ):
+                return self._access_token
+            # 2) 다른 서버가 발급해 둔 공유 캐시 토큰 재사용
+            cached = self._load_cached_token()
+            if cached:
+                self._access_token, self._token_expires_at = cached
+                return self._access_token
+
+        # 3) 신규 발급
         await self._ensure_client()
-
         token_data = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
             "secretkey": self.app_secret,
         }
-
         try:
             response = await self._client.post("/oauth2/token", json=token_data)
             response.raise_for_status()
@@ -198,16 +240,14 @@ class KiwoomRESTAPIClient:
             token_info = response.json()
             self._access_token = token_info["token"]
 
-            # 토큰 만료시간 설정
             expires_dt_str = token_info.get("expires_dt", "")
             if expires_dt_str:
-                self._token_expires_at = datetime.strptime(
-                    expires_dt_str, "%Y%m%d%H%M%S"
-                )
+                self._token_expires_at = datetime.strptime(expires_dt_str, "%Y%m%d%H%M%S")
             else:
                 self._token_expires_at = datetime.now() + timedelta(hours=24)
 
-            logger.info(f"Access token acquired, expires at: {self._token_expires_at}")
+            self._save_cached_token(self._access_token, self._token_expires_at)
+            logger.info(f"Access token acquired (force={force}), expires at: {self._token_expires_at}")
             return self._access_token
 
         except httpx.HTTPStatusError as e:
@@ -326,11 +366,11 @@ class KiwoomRESTAPIClient:
                 # 토큰 무효(8005)는 HTTP 200 + return_code 로 와서 아래 401 경로를 안 탄다.
                 # 본문에서 감지하면 캐시 토큰을 폐기·재발급 후 1회 재시도 (stale 토큰 자동복구).
                 if not token_refreshed and self._is_token_invalid_body(result):
-                    logger.warning("[%s] 응답 본문 토큰 무효 감지 — 토큰 재발급 후 재시도", api_id)
+                    logger.warning("[%s] 응답 본문 토큰 무효 감지 — 토큰 강제 재발급 후 재시도", api_id)
                     token_refreshed = True
                     self._access_token = None
                     self._token_expires_at = None
-                    new_token = await self._get_access_token()
+                    new_token = await self._get_access_token(force=True)  # 캐시 무시 강제 재발급
                     headers = KiwoomEndpoints.get_kiwoom_headers(
                         api_id=api_id,
                         access_token=new_token,

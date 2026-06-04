@@ -102,6 +102,7 @@ TRADING_URL = "http://localhost:8030/mcp/"
 MARKET_URL  = "http://localhost:8031/mcp/"
 NEWS_URL = "http://localhost:8050/mcp"
 INVESTOR_URL = "http://localhost:8033/mcp/"
+PORTFOLIO_URL = "http://localhost:8034/mcp/"   # 실계좌 보유분 조회 (reconciliation)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -154,6 +155,9 @@ ATR_PERIOD = int(os.getenv("CLOSING_BET_ATR_PERIOD", "14"))     # ATR 평균 기
 # #1 장중 트레일 점검 주기(분). 백테스트는 일중 저가로 손절 이탈을 잡지만 라이브는 관측 시점에만
 #    볼 수 있으므로, 보유분이 있는 장중에는 이 주기로 폴링해 트레일 스톱을 갱신·이탈 청산한다.
 INTRADAY_POLL_MIN = int(os.getenv("CLOSING_BET_INTRADAY_POLL_MIN", "10"))
+# #2(reconciliation): 청산 phase 에서 실계좌 보유분을 조회해 state 와 대조.
+#   봇 매수이력에 있는데 state 가 잊은 종목(고아) → 청산. 매수이력에 없는 보유분 → 알림만(수동 확인).
+RECONCILE = os.getenv("CLOSING_BET_RECONCILE", "true").lower() == "true"
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
@@ -1955,6 +1959,9 @@ async def phase_force_close(positions: list[dict] | None = None) -> None:
     await notify("\n".join(lines))
     logger.info("[PHASE FC] 완료 — 청산:%d  이월:%d  실현합산:%d종목", sold, len(remaining), len(results))
 
+    # #2: 실계좌 보유분 대조 — state 가 잊은 고아 포지션 회수 (15:10 청산 직후)
+    await phase_reconcile()
+
 
 # ─── Phase 3-c: 장중 트레일 점검 (#1 — 일중 손절 이탈 포착) ──────────────────────
 
@@ -2004,6 +2011,132 @@ async def phase_intraday_stop() -> None:
             lines.append(f"{icon} {r['company_name']}({r['symbol']})  실현 {r['pnl_pct']:+.2f}%")
         await notify("\n".join(lines))
         logger.info("[INTRADAY] 트레일 청산 %d종목, 보유 %d종목", sold, len(remaining))
+
+
+# ─── #2 Reconciliation: 실계좌 보유분 ↔ 봇 state 대조 ──────────────────────────
+
+async def _get_broker_holdings() -> list[dict] | None:
+    """portfolio-domain(get_account_evaluation, kt00004)로 실계좌 보유종목 조회.
+
+    Returns: [{symbol(6자리), name, qty, avg_price}] / 조회 실패 시 None(=대조 스킵, 안전).
+    """
+    try:
+        async with MCPManager({"portfolio-domain": PORTFOLIO_URL}) as mcp:
+            if not mcp.tools:
+                return None
+            tool = next((t["name"] for t in mcp.tools if "evaluation" in t["name"].lower()), None)
+            if not tool:
+                return None
+            raw = await mcp.call_tool(tool, {})
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            d = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
+            if not isinstance(d, dict) or d.get("return_code") not in (0, "0", None):
+                return None
+            rows = d.get("stk_acnt_evlt_prst") or []
+            holdings = []
+            for r in rows:
+                code = str(r.get("stk_cd", "")).lstrip("A").strip()
+                try:
+                    qty = int(str(r.get("rmnd_qty", "0")).lstrip("0") or "0")
+                except ValueError:
+                    qty = 0
+                if not code or qty <= 0:
+                    continue
+                try:
+                    avg = float(str(r.get("avg_prc", "0")).lstrip("0") or "0")
+                except ValueError:
+                    avg = 0.0
+                holdings.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty, "avg_price": avg})
+            return holdings
+    except Exception as e:
+        logger.warning("[RECONCILE] 보유분 조회 실패 — 대조 스킵: %s", str(e)[:120])
+        return None
+
+
+def _bot_history_symbols() -> set[str]:
+    """봇이 과거에 매수한 적 있는 종목코드 집합 (data/closing_bet/*/buy.json)."""
+    syms: set[str] = set()
+    for buy_file in DATA_DIR.glob("????-??-??/buy.json"):
+        try:
+            d = json.loads(buy_file.read_text(encoding="utf-8"))
+            for o in d.get("orders", []):
+                if o.get("symbol"):
+                    syms.add(str(o["symbol"]))
+        except Exception:
+            continue
+    return syms
+
+
+async def phase_reconcile() -> None:
+    """실계좌 보유분을 state 와 대조 — 봇이 잊은 고아 포지션을 청산, 미지 보유분은 알림.
+
+    state 가 유실되거나(과거 %TEMP%) 청산 누락으로 봇이 추적 못 하는 보유분을 잡는다.
+    안전장치: 자동 청산은 '봇 매수이력에 있는' 종목만. 그 외 보유분은 절대 건드리지 않고 알림만.
+    """
+    if not RECONCILE:
+        return
+    holdings = await _get_broker_holdings()
+    if holdings is None:
+        return  # 조회 실패 → 안전하게 스킵
+
+    tracked = {p["symbol"] for p in (get_state("positions") or [])}
+    bot_syms = _bot_history_symbols()
+    orphans = [h for h in holdings if h["symbol"] not in tracked and h["symbol"] in bot_syms]
+    unknown = [h for h in holdings if h["symbol"] not in tracked and h["symbol"] not in bot_syms]
+
+    if not orphans and not unknown:
+        return
+    logger.info("[RECONCILE] 보유 %d  추적 %d  고아 %d  미지 %d",
+                len(holdings), len(tracked), len(orphans), len(unknown))
+
+    # 미지 보유분 — 봇 소관 아님(수동 매수 등). 절대 자동 청산하지 않고 알림만.
+    if unknown:
+        await notify("ℹ️ 미추적 보유분(봇 매수이력 없음 — 수동 확인):\n" +
+                     "\n".join(f"• {h['name']}({h['symbol']}) {h['qty']}주" for h in unknown))
+
+    if not orphans:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    _ensure_exit_ledger(today)
+    mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
+    closed = 0
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                await notify("❌ trading-domain 연결 실패 — 고아 청산 보류")
+                return
+            for h in orphans:
+                symbol, qty, entry = h["symbol"], h["qty"], h["avg_price"]
+                cur = await _try_get_realtime_price(symbol) or get_current_price(symbol) or entry
+                try:
+                    resp = await _sell_market(mcp, symbol, qty)
+                    ok, _ = _order_accepted(resp)
+                    if not ok:
+                        _log_order_reject("reconcile", symbol,
+                                          {"qty": qty, "side": "sell", "reason": "orphan"}, resp)
+                        continue
+                    _append_exit(today, {
+                        "symbol": symbol, "company_name": h["name"], "entry_price": entry,
+                        "qty": qty, "exit_price": cur, "composite": 0.0, "sector": "기타",
+                        "reason": "고아 포지션 청산 (state 미추적 보유분)", "when": "reconcile",
+                    })
+                    _data_logger.log_event("reconcile_close", {
+                        "symbol": symbol, "name": h["name"], "qty": qty,
+                        "entry_price": entry, "exit_price": cur, "mock": MOCK_MODE,
+                    })
+                    closed += 1
+                    logger.info("[RECONCILE] 고아 청산 %s %s %d주 (평단 %.0f)", symbol, h["name"], qty, entry)
+                except Exception as e:
+                    logger.error("[RECONCILE] %s 청산 오류: %s", symbol, e)
+    except Exception as e:
+        logger.error("[RECONCILE] 오류: %s", e)
+        return
+
+    if closed:
+        results = _finalize_sell_log(_entry_date_label(get_state("positions") or []) or today, today)
+        save_state("sell", results)
+        await notify(f"🧹 고아 포지션 청산 {mode_tag} — {closed}종목 (state 미추적분 회수)")
 
 
 # ─── 즉시 테스트 (선별만) ───────────────────────────────────────────────────
@@ -2282,7 +2415,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--phase",
-        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close", "intraday_stop"],
+        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close", "intraday_stop", "reconcile"],
         help="단발 실행 단계",
     )
     group.add_argument("--test",    action="store_true", help="즉시 테스트 (선별만, 주문 없음)")
@@ -2326,3 +2459,5 @@ if __name__ == "__main__":
         asyncio.run(phase_force_close())
     elif args.phase == "intraday_stop":
         asyncio.run(phase_intraday_stop())
+    elif args.phase == "reconcile":
+        asyncio.run(phase_reconcile())

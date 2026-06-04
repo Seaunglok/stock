@@ -237,6 +237,66 @@ def get_state(key: str) -> Any:
     return load_state().get(key, {}).get("content")
 
 
+# ─── #6 멱등성: 단일 인스턴스 락 + phase 일일 중복실행 가드 ──────────────────────
+
+LOCK_FILE = DATA_DIR / "daemon.lock"
+FORCE_PHASE = os.getenv("CLOSING_BET_FORCE_PHASE", "false").lower() == "true"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        import psutil  # noqa: PLC0415
+        return psutil.pid_exists(pid)
+    except Exception:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return True   # 판단 불가 → 살아있다고 가정(보수적)
+
+
+def acquire_daemon_lock() -> bool:
+    """데몬 단일 인스턴스 보장. 다른 살아있는 데몬이 락을 쥐고 있으면 False."""
+    if LOCK_FILE.exists():
+        try:
+            old = int(LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
+        except Exception:
+            old = 0
+        if old and old != os.getpid() and _pid_alive(old):
+            logger.error("[LOCK] 이미 데몬 실행 중 (PID=%d) — 중복 기동 차단", old)
+            return False
+        logger.warning("[LOCK] 스테일 락 발견 (PID=%s) — 회수", old)
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_daemon_lock() -> None:
+    try:
+        if LOCK_FILE.exists() and LOCK_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _phase_done_today(label: str) -> bool:
+    """오늘 해당 phase 가 이미 실행 완료됐는지 (이중 주문 방지). FORCE_PHASE 면 항상 False."""
+    if FORCE_PHASE:
+        return False
+    today = datetime.now().strftime("%Y-%m-%d")
+    done = get_state("completed_phases") or {}
+    return label in (done.get(today) or [])
+
+
+def _mark_phase_done(label: str) -> None:
+    today = datetime.now().strftime("%Y-%m-%d")
+    done = get_state("completed_phases") or {}
+    # 오늘 기록만 유지 (과거 날짜 정리)
+    done = {today: list(set((done.get(today) or []) + [label]))}
+    save_state("completed_phases", done)
+
+
 # ─── 청산 원장 ──────────────────────────────────────────────────────────────
 # 1영업일 보장: 09:00 부분청산(러닝) + 15:10 잔량 강제청산을 종목별로 합산해
 # "포지션 1건당 가중 실현손익"을 만든다. HOLD가 남지 않으므로 승률 측정 편향이 사라진다.
@@ -926,6 +986,68 @@ async def _try_get_news(symbol: str, company_name: str) -> list[str]:
         return []
 
 
+# ─── #7 선별 성능: MCP 연결 1회 재사용 (종목당 connect/teardown 제거) ──────────
+
+async def _enter_optional_mcp(key: str, url: str):
+    """선택적 MCP 를 1회 연결해 진입된 MCPManager 반환 (도구 없으면 정리 후 None).
+
+    실패/미가동 시 None — 호출자는 종목 루프 전체에서 이 연결을 재사용한다.
+    기존엔 종목마다 새로 connect 해 서버 down 시 타임아웃이 누적됐다.
+    """
+    try:
+        mgr = MCPManager({key: url})
+        await mgr.__aenter__()
+        if not mgr.tools:
+            await mgr.__aexit__(None, None, None)
+            return None
+        return mgr
+    except Exception:
+        return None
+
+
+def _find_mcp_tool(mgr, keywords: tuple[str, ...]) -> str | None:
+    return next((t["name"] for t in (mgr.tools or [])
+                 if any(kw in t["name"].lower() for kw in keywords)), None)
+
+
+async def _fetch_news_via(mgr, tool: str, company_name: str) -> list[str]:
+    """이미 연결된 naver-news mgr 로 뉴스 제목 수집."""
+    try:
+        raw = await mgr.call_tool(tool, {"query": company_name, "display": 10})
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        items: Any = parsed
+        if isinstance(parsed, dict):
+            items = parsed.get("data", parsed.get("items", []))
+            if isinstance(items, dict):
+                items = items.get("items", [])
+        titles = []
+        for item in (items or [])[:10]:
+            if isinstance(item, dict):
+                t = item.get("title", item.get("제목", ""))
+                if t:
+                    titles.append(str(t))
+        return titles
+    except Exception:
+        return []
+
+
+async def _fetch_investor_via(mgr, tool: str, symbol: str) -> tuple[float | None, float | None]:
+    """이미 연결된 investor-domain mgr 로 외인·기관 5일 순매수 수집."""
+    try:
+        raw = await mgr.call_tool(tool, {"stock_code": symbol})
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(parsed, dict):
+            d = parsed.get("data", parsed)
+            if isinstance(d, dict):
+                foreign = d.get("foreign_net_5d") or d.get("외국인_5일_순매수")
+                inst = d.get("institutional_net_5d") or d.get("기관_5일_순매수")
+                return (float(foreign) if foreign is not None else None,
+                        float(inst) if inst is not None else None)
+    except Exception:
+        pass
+    return None, None
+
+
 async def _try_get_investor_data(symbol: str) -> tuple[float | None, float | None]:
     """investor-domain 외인·기관 5일 누적 순매수. 서버 미가동 시 (None, None) 반환."""
     try:
@@ -1279,36 +1401,51 @@ async def phase_selection() -> list[dict]:
         return []
 
     # 3) 각 종목 채점
+    # #7: 선택적 MCP(news/investor)를 종목 루프 전체에서 1회 연결로 재사용.
+    #     catalyst 가중이 0이면 뉴스는 composite 에 영향 없으므로 아예 연결하지 않는다.
+    news_mgr = await _enter_optional_mcp("naver-news-mcp", NEWS_URL) if CATALYST_WEIGHT > 0 else None
+    news_tool = _find_mcp_tool(news_mgr, ("news", "search")) if news_mgr else None
+    inv_mgr = await _enter_optional_mcp("investor-domain", INVESTOR_URL)
+    inv_tool = _find_mcp_tool(inv_mgr, ("foreign", "investor", "trading")) if inv_mgr else None
+    logger.info("[SELECT] 보조데이터 연결 — news=%s investor=%s (catalyst_w=%.2f)",
+                bool(news_tool), bool(inv_tool), CATALYST_WEIGHT)
+
     scored: list[dict] = []
     ma20_filtered = 0
     gap_filtered  = 0
     value_filtered = 0
-    for idx, (symbol, name, stock_value) in enumerate(stocks, 1):
-        if stock_value < MIN_VALUE_KRW:    # B: 거래대금 1,000억원 미만 제외 (get_top_stocks_by_value에서 가져온 값 사용)
-            value_filtered += 1
-            logger.debug("[FILTER] %s %s — 거래대금 %.0f억원 < %.0f억원", symbol, name, stock_value / 1e8, MIN_VALUE_KRW / 1e8)
-            continue
-        ohlcv = get_ohlcv(symbol)
-        if not ohlcv:
-            continue
-        if not _above_ma20(ohlcv):
-            ma20_filtered += 1
-            logger.debug("[FILTER] %s %s — MA20 이하 제외", symbol, name)
-            continue
-        gap_pct = _today_gap_pct(ohlcv)
-        if gap_pct >= _GAP_LIMIT:   # +2% 이상 갭은 익일 시초 약세 가능성 높음
-            gap_filtered += 1
-            logger.debug("[FILTER] %s %s — 당일 갭 %.1f%% 제외", symbol, name, gap_pct)
-            continue
-        news = await _try_get_news(symbol, name)
-        foreign, inst = await _try_get_investor_data(symbol)
-        result = score_one_stock(symbol, name, ohlcv, news, foreign, inst)
-        if result:
-            scored.append(result)
-            logger.info(
-                "[%2d/%d] %s %-10s → %5.1f점",
-                idx, len(stocks), symbol, name[:10], result["composite"],
-            )
+    try:
+        for idx, (symbol, name, stock_value) in enumerate(stocks, 1):
+            if stock_value < MIN_VALUE_KRW:    # B: 거래대금 1,000억원 미만 제외
+                value_filtered += 1
+                logger.debug("[FILTER] %s %s — 거래대금 %.0f억원 < %.0f억원", symbol, name, stock_value / 1e8, MIN_VALUE_KRW / 1e8)
+                continue
+            ohlcv = get_ohlcv(symbol)
+            if not ohlcv:
+                continue
+            if not _above_ma20(ohlcv):
+                ma20_filtered += 1
+                logger.debug("[FILTER] %s %s — MA20 이하 제외", symbol, name)
+                continue
+            gap_pct = _today_gap_pct(ohlcv)
+            if gap_pct >= _GAP_LIMIT:   # +2% 이상 갭은 익일 시초 약세 가능성 높음
+                gap_filtered += 1
+                logger.debug("[FILTER] %s %s — 당일 갭 %.1f%% 제외", symbol, name, gap_pct)
+                continue
+            news = await _fetch_news_via(news_mgr, news_tool, name) if news_tool else []
+            foreign, inst = await _fetch_investor_via(inv_mgr, inv_tool, symbol) if inv_tool else (None, None)
+            result = score_one_stock(symbol, name, ohlcv, news, foreign, inst)
+            if result:
+                scored.append(result)
+                logger.info(
+                    "[%2d/%d] %s %-10s → %5.1f점",
+                    idx, len(stocks), symbol, name[:10], result["composite"],
+                )
+    finally:
+        if inv_mgr:
+            await inv_mgr.__aexit__(None, None, None)
+        if news_mgr:
+            await news_mgr.__aexit__(None, None, None)
 
     # 4) 최종 후보 선별 — 섹터당 최대 MAX_PER_SECTOR종목 제한 (Fix 1)
     sector_map = _load_sector_map()
@@ -1397,6 +1534,12 @@ async def phase_buy(
                 split_label, split_pct, datetime.now().strftime("%H:%M:%S"))
     logger.info("=" * 60)
     _data_logger.log_event("phase_start", {"phase": f"buy_{split_label}", "split_pct": split_pct})
+
+    # #6 멱등성: 오늘 같은 매수 회차가 이미 실행됐으면 중복 주문 방지 (수동+스케줄 충돌 등).
+    if _phase_done_today(f"buy_{split_label}"):
+        logger.warning("[PHASE 2:%s] 오늘 이미 실행됨 — 중복 매수 차단 (CLOSING_BET_FORCE_PHASE=true 로 강제)", split_label)
+        _data_logger.log_event("skip", {"reason": "already_done", "phase": f"buy_{split_label}"})
+        return []
 
     if candidates is None:
         candidates = get_state("selection") or []
@@ -1524,6 +1667,8 @@ async def phase_buy(
         save_state("buy", orders)
 
     save_state("buy_date", today_str)
+    if orders:
+        _mark_phase_done(f"buy_{split_label}")   # #6: 실주문 발생 시에만 완료 표시 (0건이면 재시도 허용)
     _data_logger.log_buy(today_str, orders if split_label != "second" else (get_state("buy") or orders), MOCK_MODE)
 
     if orders:
@@ -1922,6 +2067,12 @@ async def scheduler_daemon() -> None:
     logger.info("  14:50 선별 / 15:15·15:19 매수 / 18:05 시간외 / 09:00 청산 / 15:10 잔량 강제청산 (다음날)")
     logger.info("  Ctrl+C 로 종료  |  MOCK_MODE=%s", MOCK_MODE)
     logger.info("=" * 60)
+
+    # #6: 단일 인스턴스 보장 — 이미 다른 데몬이 돌고 있으면 즉시 종료 (이중 주문 방지).
+    if not acquire_daemon_lock():
+        await notify("⚠️ 데몬 중복 기동 차단 — 이미 실행 중인 인스턴스가 있습니다.")
+        return
+
     await notify(
         f"🚀 종가매매 데몬 시작\n"
         f"{'🧪 MOCK 모의투자' if MOCK_MODE else '💰 실거래'}\n"
@@ -2157,6 +2308,8 @@ if __name__ == "__main__":
             asyncio.run(scheduler_daemon())
         except KeyboardInterrupt:
             logger.info("[DAEMON] 종료")
+        finally:
+            release_daemon_lock()   # #6: 자기 PID 락만 해제
     elif args.phase == "selection":
         asyncio.run(phase_selection())
     elif args.phase == "buy":

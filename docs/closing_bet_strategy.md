@@ -138,6 +138,8 @@ composite = cat.score * cat_weight + tech.composite() * (1.0 - cat_weight)
 | `CATALYST_WEIGHT` | 0.0 | `CLOSING_BET_CATALYST_WEIGHT` | catalyst 블렌딩 가중 (0=technical-only, 백테스트와 동일) |
 | `CONVICTION_SIZING` | false | `CLOSING_BET_CONVICTION_SIZING` | 점수 차등 사이징 on/off (기본 off=전 구간 1.0x) |
 | `HOLD_DAYS` | 3 | `CLOSING_BET_HOLD_DAYS` | 최대 보유 영업일 (시간청산 기한). 1이면 사실상 구 1일 청산 |
+| `INTRADAY_POLL_MIN` | 10 | `CLOSING_BET_INTRADAY_POLL_MIN` | 장중 트레일 점검 주기(분) — 일중 손절 이탈 포착 |
+| `FORCE_PHASE` | false | `CLOSING_BET_FORCE_PHASE` | true 시 phase 일일 중복실행 가드 무시(수동 강제 재실행) |
 | `ATR_K` | 2.0 | `CLOSING_BET_ATR_K` | 트레일 손절 밴드 = ATR_K × ATR |
 | `ATR_PERIOD` | 14 | `CLOSING_BET_ATR_PERIOD` | ATR 평균 기간(봉) |
 | `TAX/FEE/SLIPPAGE_BPS` | 18/1.5/10 | `CLOSING_BET_*_BPS` | 거래비용(편도 bps) — net 손익 차감 (왕복 ≈0.41%) |

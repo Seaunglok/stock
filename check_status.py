@@ -14,11 +14,7 @@ import urllib.request
 import urllib.error
 
 SERVICES = [
-    # (이름, 포트, 종류, 확인URL)
-    ("Supervisor",       8000, "agent",  "http://localhost:8000/.well-known/agent.json"),
-    ("DataCollector",    8001, "agent",  "http://localhost:8001/.well-known/agent.json"),
-    ("Analysis",         8002, "agent",  "http://localhost:8002/.well-known/agent.json"),
-    ("Trading",          8003, "agent",  "http://localhost:8003/.well-known/agent.json"),
+    # (이름, 포트, 종류, 확인URL)  — A2A 에이전트(8000~8003) 제거: 종가매매 트랙은 MCP만 사용.
     ("kiwoom-trading",   8030, "mcp",    "http://localhost:8030/mcp/"),
     ("kiwoom-market",    8031, "mcp",    "http://localhost:8031/mcp/"),
     ("kiwoom-info",      8032, "mcp",    "http://localhost:8032/mcp/"),

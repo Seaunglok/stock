@@ -51,15 +51,6 @@ else
     pkill -f "next dev" && log_success "Frontend 프로세스 종료" || log_info "실행 중인 Frontend 프로세스 없음"
 fi
 
-# A2A 에이전트 종료
-log_info "A2A 에이전트 종료 중..."
-docker compose --env-file .env -f docker/a2a_agents/docker-compose.yml down
-if [ $? -eq 0 ]; then
-    log_success "A2A 에이전트 종료 완료"
-else
-    log_error "A2A 에이전트 종료 중 오류 발생"
-fi
-
 # MCP 서버 종료
 log_info "MCP 서버 종료 중..."
 docker compose --env-file .env -f docker/mcp_servers/docker-compose.yml down

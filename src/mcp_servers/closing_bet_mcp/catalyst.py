@@ -44,12 +44,20 @@ class CatalystResult:
         }
 
 
-def match_trends(texts: list[str]) -> tuple[list[str], list[str]]:
-    """텍스트들에서 트렌드 키워드 매칭"""
+def match_trends(
+    texts: list[str],
+    trend_keywords: dict[str, list[str]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """텍스트들에서 트렌드 키워드 매칭.
+
+    trend_keywords 미지정 시 기본 TREND_KEYWORDS(정적). 호출자가 시장에서 자동 도출한
+    동적 테마 딕셔너리를 넘기면 그걸 사용한다(테마 로테이션 추종).
+    """
+    table = trend_keywords if trend_keywords is not None else TREND_KEYWORDS
     blob = " ".join(t for t in texts if t).lower()
     matched_trends: list[str] = []
     matched_keywords: list[str] = []
-    for trend, kws in TREND_KEYWORDS.items():
+    for trend, kws in table.items():
         for kw in kws:
             if kw.lower() in blob:
                 if trend not in matched_trends:

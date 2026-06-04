@@ -79,7 +79,7 @@ with _ctx.redirect_stdout(_io.StringIO()):
 del _ctx, _io
 
 # closing_bet_mcp 스코어링 함수 직접 임포트 (MCP 서버 불필요)
-from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst, match_trends  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst, match_trends, TREND_KEYWORDS  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import (  # noqa: E402
     classify_regime,
     evaluate_exit,
@@ -173,11 +173,62 @@ _NEWS_NEGATIVE = [
     "유상증자", "감자", "전환사채", "최대주주 변경", "감사의견 거절", "횡령·배임",
 ]
 DART_CACHE_DIR = _ROOT / "docs_cache" / "dart"
+# 동적 테마(트렌드) — 매일 거래대금 주도주들의 뉴스 빈출 키워드로 자동 생성 (테마 로테이션 추종).
+TRENDS_FILE = DATA_DIR / "market_trends.json"
+TRENDS_LEADERS_N = int(os.getenv("CLOSING_BET_TRENDS_LEADERS", "30"))    # 주도주 표본 수
+TREND_MIN_STOCKS = int(os.getenv("CLOSING_BET_TREND_MIN_STOCKS", "3"))   # 키워드가 핫이 되려면 N개 종목 뉴스에 등장
+TREND_TOP_KEYWORDS = int(os.getenv("CLOSING_BET_TREND_TOP", "25"))       # 동적 핫키워드 상한
+TRENDS_STALE_DAYS = int(os.getenv("CLOSING_BET_TRENDS_STALE_DAYS", "4")) # 이 일수 지나면 정적 fallback
+# 테마 추출 시 제외할 일반/시황/기능어 (종목명은 런타임에 추가)
+_TREND_STOPWORDS = {
+    # 시황/거래
+    "종목", "주가", "증시", "코스피", "코스닥", "상승", "하락", "강세", "약세", "급등", "급락",
+    "오늘", "장중", "마감", "개장", "전망", "발표", "공시", "기록", "돌파", "신고가", "투자", "매수",
+    "매도", "외국인", "기관", "개인", "순매수", "순매도", "거래량", "거래대금", "실적", "분기", "영업이익",
+    "매출", "증가", "감소", "출시", "계약", "체결", "그룹", "회장", "대표", "사장", "억원", "조원",
+    "관련", "수혜", "테마", "부각", "이슈", "소식", "뉴스", "기업", "회사", "시장", "한국", "국내",
+    "글로벌", "미국", "중국", "일본", "유럽", "사업", "최대", "역대", "사상", "전년", "대비", "올해",
+    "내년", "예상", "기대", "확대", "전일", "보합", "종가", "시가", "주식", "증권", "목표가", "리포트",
+    "최고", "최저", "신규", "전체", "이상", "이하", "가능", "주요", "추진", "계획", "결정", "공개",
+    # 기능어/필러
+    "있다", "없다", "한다", "된다", "됐다", "했다", "이다", "이번", "지난", "최근", "당시", "현재",
+    "위해", "통해", "대한", "위한", "관련해", "따라", "또한", "특히", "그리고", "하지만", "반면",
+    "같은", "다른", "모든", "여러", "각각", "대해", "에서", "으로", "라며", "이라고", "라고", "면서",
+    "기자", "사진", "제공", "단독", "속보", "종합", "오전", "오후", "지난해", "올해도", "관계자",
+    "quot", "amp", "nbsp",
+    "등이", "이어", "이후", "것으로", "있는", "핵심", "에는", "에도", "까지", "부터", "보다",
+    "한다는", "했다는", "된다는", "라는", "이라는", "그는", "그의", "우리", "지금", "다시", "함께",
+}
+# 신규(자동) 테마 발굴 — 한국어 NLP 없이는 노이즈가 있어 기본 off. 원시 hot 키워드는 파일에 항상 남겨
+# 운영자가 보고 정적 TREND_KEYWORDS 에 직접 승격하도록 한다. true 면 실험적으로 자동 버킷 추가.
+TREND_AUTO_NEW = os.getenv("CLOSING_BET_TREND_AUTO_NEW", "false").lower() == "true"
+import re as _re  # noqa: E402
+_TREND_TOKEN_RE = _re.compile(r"[A-Za-z가-힣]{2,12}")
+_HTML_ENTITY_RE = _re.compile(r"&[a-z]+;|&#\d+;")
+_HANGUL_RE = _re.compile(r"[가-힣]")
+
+
+def _tokenize_news(text: str) -> set[str]:
+    text = _HTML_ENTITY_RE.sub(" ", text or "")
+    return {m.group(0) for m in _TREND_TOKEN_RE.finditer(text)}
+
+
+def _looks_like_theme(tok: str, company_tokens: set[str]) -> bool:
+    """신규 테마 후보 적격성 — 한글 포함 명사형(또는 대문자 약어), 종목명/접미 변형 배제."""
+    if tok in _TREND_STOPWORDS:
+        return False
+    # 종목명 접두(예: '삼성전자와') 배제
+    if any(tok.startswith(c) for c in company_tokens if len(c) >= 2):
+        return False
+    has_hangul = bool(_HANGUL_RE.search(tok))
+    is_acronym = tok.isupper() and len(tok) >= 2          # HBM, SMR, ESS 등
+    return (has_hangul and len(tok) >= 2) or is_acronym
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
 
 SCHEDULE: list[tuple[int, int, str]] = [
+    (14, 45, "trends"),       # 동적 테마 갱신 (선별 직전)
     (14, 50, "selection"),
     (15, 15, "buy_first"),    # E: 분할 매수 — 첫 50% (외부 권장 15:10~15:19)
     (15, 19, "buy_second"),   # E: 분할 매수 — 나머지 50% (마감 직전)
@@ -1100,7 +1151,7 @@ async def analyze_candidate_info(
         if hit:
             news_neg.append({"keyword": hit, "title": t})
 
-    trends, _kw = match_trends(titles + descs)
+    trends, _kw = match_trends(titles + descs, load_active_trends())   # 동적 테마(시장 자동 도출)
 
     negative_events = (
         [{"src": "공시", "keyword": m["keyword"], "title": m.get("report_nm", "")} for m in disc_neg]
@@ -1131,6 +1182,105 @@ async def analyze_candidate_info(
         "foreign_net": foreign_net, "inst_net": inst_net,
         "summary": " / ".join(parts) if parts else "특이사항 없음",
     }
+
+
+# ─── 동적 테마(트렌드) — 시장 주도주 뉴스에서 자동 도출 ──────────────────────────
+
+def _curated_norms() -> set[str]:
+    """정적 TREND_KEYWORDS 의 단일토큰 키워드(공백제거·소문자) 집합 — '신규' 판정용."""
+    out = set()
+    for kws in TREND_KEYWORDS.values():
+        for kw in kws:
+            k = kw.replace(" ", "").lower()
+            if " " not in kw:
+                out.add(k)
+    return out
+
+
+async def refresh_market_trends() -> dict:
+    """거래대금 주도주 N개의 뉴스에서 빈출 키워드를 집계해 '오늘의 동적 테마' 생성·저장.
+
+    - 키워드 핫 판정: 서로 다른 종목 ≥ TREND_MIN_STOCKS 의 뉴스에 등장 (한 종목 단독 이슈 배제).
+    - 동적 테마 = 핫한 정적 테마(전체 키워드 유지) + '신규(자동)'(정적에 없는 핫키워드).
+    뉴스/표본 부족 시 빈 themes → load_active_trends 가 정적으로 폴백.
+    """
+    logger.info("[TRENDS] 동적 테마 갱신 시작 %s", datetime.now().strftime("%H:%M:%S"))
+    _data_logger.log_event("phase_start", {"phase": "trends"})
+    leaders = get_top_stocks_by_value(TRENDS_LEADERS_N)
+    if not leaders:
+        logger.warning("[TRENDS] 주도주 수집 실패 — 스킵")
+        return {}
+    stop = set(_TREND_STOPWORDS)
+    for _c, nm, _v in leaders:
+        stop |= _tokenize_news(nm)   # 종목명 자체는 테마에서 제외
+
+    from collections import Counter
+    kw_stock = Counter()
+    news_mgr = await _enter_optional_mcp("naver-news-mcp", NEWS_URL)
+    news_tool = _find_mcp_tool(news_mgr, ("news", "search")) if news_mgr else None
+    if not news_tool:
+        if news_mgr:
+            await news_mgr.__aexit__(None, None, None)
+        logger.warning("[TRENDS] naver-news 미가동 — 동적 테마 생성 불가(정적 유지)")
+        return {}
+    try:
+        for code, name, _v in leaders:
+            items = await _fetch_news_items_via(news_mgr, news_tool, name)
+            toks: set[str] = set()
+            for it in items:
+                toks |= _tokenize_news(it["title"] + " " + it["description"])
+            for t in toks:
+                if t not in stop:
+                    kw_stock[t] += 1
+    finally:
+        if news_mgr:
+            await news_mgr.__aexit__(None, None, None)
+
+    hot = [(k, c) for k, c in kw_stock.most_common(200) if c >= TREND_MIN_STOCKS][:TREND_TOP_KEYWORDS]
+    hot_norm = {k.replace(" ", "").lower() for k, _ in hot}
+    curated = _curated_norms()
+
+    # 핫한 정적 테마 (키워드 토큰이 hot 에 포함) → 전체 키워드 유지
+    themes: dict[str, list[str]] = {}
+    for theme, kws in TREND_KEYWORDS.items():
+        if any(kw.replace(" ", "").lower() in hot_norm for kw in kws):
+            themes[theme] = kws
+    # 정적에 없는 신규 핫키워드 (한글 명사형/약어만). 기본 off(노이즈) — true 일 때만 매칭에 포함.
+    company_tokens = {tok for _c, nm, _v in leaders for tok in _tokenize_news(nm)}
+    new_kws = [
+        k for k, _ in hot
+        if k.replace(" ", "").lower() not in curated and _looks_like_theme(k, company_tokens)
+    ]
+    if new_kws and TREND_AUTO_NEW:
+        themes["신규(자동)"] = new_kws
+
+    payload = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "leaders_sampled": len(leaders),
+        "hot": hot,                          # 원시 핫키워드(빈도) — 운영자 검토/큐레이션용
+        "new_candidates": new_kws[:15],      # 정적에 없는 신규 후보 (TREND_AUTO_NEW=true 면 매칭에 포함)
+        "themes": themes,                    # 실제 매칭에 쓰는 테마 (기본: 핫한 정적테마만)
+    }
+    TRENDS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[TRENDS] 갱신 완료 — 핫테마 %s | 신규 %s",
+                list(themes.keys()), new_kws[:8])
+    _data_logger.log_event("trends_done", {"hot_themes": list(themes.keys()),
+                                           "new_keywords": new_kws[:12], "leaders": len(leaders)})
+    return payload
+
+
+def load_active_trends() -> dict[str, list[str]]:
+    """현행 동적 테마 딕셔너리. 파일 없음/오래됨/비었음이면 정적 TREND_KEYWORDS 로 폴백."""
+    try:
+        if TRENDS_FILE.exists():
+            d = json.loads(TRENDS_FILE.read_text(encoding="utf-8"))
+            age = (datetime.now() - datetime.strptime(d.get("date", "1970-01-01"), "%Y-%m-%d")).days
+            themes = d.get("themes") or {}
+            if age <= TRENDS_STALE_DAYS and themes:
+                return themes
+    except Exception as e:
+        logger.debug("[TRENDS] 로드 실패 → 정적: %s", e)
+    return TREND_KEYWORDS
 
 
 async def _try_get_realtime_price(symbol: str) -> float | None:
@@ -2308,6 +2458,7 @@ async def scheduler_daemon() -> None:
     )
 
     phase_funcs = {
+        "trends":      lambda: refresh_market_trends(),
         "selection":   lambda: phase_selection(),
         "buy":         lambda: phase_buy(),
         "buy_first":   lambda: phase_buy(split_pct=50, split_label="first"),
@@ -2510,7 +2661,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--phase",
-        choices=["selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close", "intraday_stop", "reconcile"],
+        choices=["trends", "selection", "buy", "buy_first", "buy_second", "sell", "after_hours", "force_close", "intraday_stop", "reconcile"],
         help="단발 실행 단계",
     )
     group.add_argument("--test",    action="store_true", help="즉시 테스트 (선별만, 주문 없음)")
@@ -2556,3 +2707,5 @@ if __name__ == "__main__":
         asyncio.run(phase_intraday_stop())
     elif args.phase == "reconcile":
         asyncio.run(phase_reconcile())
+    elif args.phase == "trends":
+        asyncio.run(refresh_market_trends())

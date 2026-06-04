@@ -4,6 +4,7 @@ direct_closing_bet 모듈은 import 시 .env/pykrx 를 로드하므로 무겁지
 STATE_FILE 을 tmp 로 바꿔 원장 집계를 격리 테스트한다.
 """
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -89,3 +90,32 @@ def test_info_negative_news_veto(dcb, monkeypatch):
     info = asyncio.run(dcb.analyze_candidate_info(object(), "news_tool", "000001", "TST", None, None, today))
     assert info["has_negative"] is True
     assert any(e["src"] == "뉴스" for e in info["negative_events"])
+
+
+# ── 동적 테마(트렌드) 자동 도출 ──────────────────────────────────────────────
+
+def test_tokenize_news_strips_html_entities(dcb):
+    toks = dcb._tokenize_news("삼성전자 &quot;HBM&quot; 반도체 호재")
+    assert "반도체" in toks and "HBM" in toks and "quot" not in toks
+
+
+def test_looks_like_theme(dcb):
+    assert dcb._looks_like_theme("원전", set()) is True
+    assert dcb._looks_like_theme("HBM", set()) is True       # 대문자 약어
+    assert dcb._looks_like_theme("있다", set()) is False      # 불용어
+    assert dcb._looks_like_theme("삼성전자와", {"삼성전자"}) is False  # 종목명 접두
+
+
+def test_load_active_trends_uses_recent_file(dcb, tmp_path, monkeypatch):
+    f = tmp_path / "mt.json"
+    f.write_text(json.dumps({"date": date.today().isoformat(),
+                             "themes": {"원전/전력": ["원전", "SMR"]}}), encoding="utf-8")
+    monkeypatch.setattr(dcb, "TRENDS_FILE", f)
+    assert dcb.load_active_trends() == {"원전/전력": ["원전", "SMR"]}
+
+
+def test_load_active_trends_stale_falls_back_static(dcb, tmp_path, monkeypatch):
+    f = tmp_path / "mt.json"
+    f.write_text(json.dumps({"date": "2020-01-01", "themes": {"원전/전력": ["원전"]}}), encoding="utf-8")
+    monkeypatch.setattr(dcb, "TRENDS_FILE", f)
+    assert dcb.load_active_trends() is dcb.TREND_KEYWORDS   # 오래됨 → 정적

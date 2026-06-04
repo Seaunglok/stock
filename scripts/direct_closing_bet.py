@@ -956,41 +956,7 @@ def apply_sector_limit(
     return selected
 
 
-# ─── 선택적 MCP 데이터 ──────────────────────────────────────────────────────
-
-async def _try_get_news(symbol: str, company_name: str) -> list[str]:
-    """naver-news-mcp 뉴스 제목 수집. 서버 미가동 시 빈 리스트 반환."""
-    try:
-        async with MCPManager({"naver-news-mcp": NEWS_URL}) as mcp:
-            if not mcp.tools:
-                return []
-            tool = next(
-                (t["name"] for t in mcp.tools
-                 if any(kw in t["name"].lower() for kw in ("news", "search"))),
-                None,
-            )
-            if not tool:
-                return []
-            raw = await mcp.call_tool(tool, {"query": company_name, "display": 10})
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            # 다양한 응답 구조 처리
-            items: Any = parsed
-            if isinstance(parsed, dict):
-                items = parsed.get("data", parsed.get("items", []))
-                if isinstance(items, dict):
-                    items = items.get("items", [])
-            titles = []
-            for item in (items or [])[:10]:
-                if isinstance(item, dict):
-                    t = item.get("title", item.get("제목", ""))
-                    if t:
-                        titles.append(str(t))
-            return titles
-    except Exception:
-        return []
-
-
-# ─── #7 선별 성능: MCP 연결 1회 재사용 (종목당 connect/teardown 제거) ──────────
+# ─── 선택적 MCP 데이터 (#7: 종목 루프 전체에서 1회 연결 재사용) ──────────────────
 
 async def _enter_optional_mcp(key: str, url: str):
     """선택적 MCP 를 1회 연결해 진입된 MCPManager 반환 (도구 없으면 정리 후 None).
@@ -1047,35 +1013,6 @@ async def _fetch_investor_via(mgr, tool: str, symbol: str) -> tuple[float | None
                 inst = d.get("institutional_net_5d") or d.get("기관_5일_순매수")
                 return (float(foreign) if foreign is not None else None,
                         float(inst) if inst is not None else None)
-    except Exception:
-        pass
-    return None, None
-
-
-async def _try_get_investor_data(symbol: str) -> tuple[float | None, float | None]:
-    """investor-domain 외인·기관 5일 누적 순매수. 서버 미가동 시 (None, None) 반환."""
-    try:
-        async with MCPManager({"investor-domain": INVESTOR_URL}) as mcp:
-            if not mcp.tools:
-                return None, None
-            tool = next(
-                (t["name"] for t in mcp.tools
-                 if any(kw in t["name"].lower() for kw in ("foreign", "investor", "trading"))),
-                None,
-            )
-            if not tool:
-                return None, None
-            raw = await mcp.call_tool(tool, {"stock_code": symbol})
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, dict):
-                d = parsed.get("data", parsed)
-                if isinstance(d, dict):
-                    foreign = d.get("foreign_net_5d") or d.get("외국인_5일_순매수")
-                    inst = d.get("institutional_net_5d") or d.get("기관_5일_순매수")
-                    return (
-                        float(foreign) if foreign is not None else None,
-                        float(inst) if inst is not None else None,
-                    )
     except Exception:
         pass
     return None, None

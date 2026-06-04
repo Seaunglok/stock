@@ -79,7 +79,7 @@ with _ctx.redirect_stdout(_io.StringIO()):
 del _ctx, _io
 
 # closing_bet_mcp 스코어링 함수 직접 임포트 (MCP 서버 불필요)
-from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.catalyst import score_catalyst, match_trends  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import (  # noqa: E402
     classify_regime,
     evaluate_exit,
@@ -88,7 +88,10 @@ from src.mcp_servers.closing_bet_mcp.exit_rules import (  # noqa: E402
     init_stop_price,
     ratchet_stop,
 )
-from src.mcp_servers.closing_bet_mcp.scorer import compute_technical_scores  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.scorer import (  # noqa: E402
+    compute_technical_scores,
+    score_catalyst as score_disclosure_catalyst,   # DART 공시 기반(호재/악재)
+)
 
 # MCPManager — trading-domain 주문 실행 전용
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
@@ -158,6 +161,18 @@ INTRADAY_POLL_MIN = int(os.getenv("CLOSING_BET_INTRADAY_POLL_MIN", "10"))
 # #2(reconciliation): 청산 phase 에서 실계좌 보유분을 조회해 state 와 대조.
 #   봇 매수이력에 있는데 state 가 잊은 종목(고아) → 청산. 매수이력에 없는 보유분 → 알림만(수동 확인).
 RECONCILE = os.getenv("CLOSING_BET_RECONCILE", "true").lower() == "true"
+# 정보 수집·분석(뉴스/DART 공시/수급) — 기술점수 후보에 한해 분석.
+#  악재(부정 공시/뉴스) 종목은 후보에서 제외(veto), 호재/재료는 표시만 (composite 미반영 = 검증된 기술엣지 보존).
+NEWS_VETO = os.getenv("CLOSING_BET_NEWS_VETO", "true").lower() == "true"   # 악재 종목 후보 제외
+INFO_LOOKBACK_DAYS = int(os.getenv("CLOSING_BET_INFO_LOOKBACK_DAYS", "5")) # 공시/뉴스 조회 기간(일)
+INFO_MAX_CANDIDATES = int(os.getenv("CLOSING_BET_INFO_MAX", "8"))          # 정보분석 대상 상한(상위 N)
+# 뉴스 제목/공시에서 잡는 악재 키워드 (DART _CATALYST_NEGATIVE 보완 — 뉴스 텍스트용)
+_NEWS_NEGATIVE = [
+    "횡령", "배임", "분식", "상장폐지", "상폐", "거래정지", "관리종목", "불성실공시",
+    "영업정지", "압수수색", "검찰", "소송", "고소", "고발", "부도", "회생절차", "법정관리",
+    "유상증자", "감자", "전환사채", "최대주주 변경", "감사의견 거절", "횡령·배임",
+]
+DART_CACHE_DIR = _ROOT / "docs_cache" / "dart"
 OHLCV_DAYS = 120        # 일봉 조회 일수 (consolidation 90봉 + 여유 30봉)
 MAX_PER_SECTOR = 2      # 섹터당 최대 선정 종목 수 (집중 리스크 방지)
 US_MARKET_WEAK_THR = -1.5  # S&P500 AND NASDAQ 모두 이 값 이하 시 종베 중단
@@ -981,24 +996,8 @@ def _find_mcp_tool(mgr, keywords: tuple[str, ...]) -> str | None:
 
 
 async def _fetch_news_via(mgr, tool: str, company_name: str) -> list[str]:
-    """이미 연결된 naver-news mgr 로 뉴스 제목 수집."""
-    try:
-        raw = await mgr.call_tool(tool, {"query": company_name, "display": 10})
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-        items: Any = parsed
-        if isinstance(parsed, dict):
-            items = parsed.get("data", parsed.get("items", []))
-            if isinstance(items, dict):
-                items = items.get("items", [])
-        titles = []
-        for item in (items or [])[:10]:
-            if isinstance(item, dict):
-                t = item.get("title", item.get("제목", ""))
-                if t:
-                    titles.append(str(t))
-        return titles
-    except Exception:
-        return []
+    """이미 연결된 naver-news mgr 로 뉴스 제목 수집 (제목만)."""
+    return [i["title"] for i in await _fetch_news_items_via(mgr, tool, company_name)]
 
 
 async def _fetch_investor_via(mgr, tool: str, symbol: str) -> tuple[float | None, float | None]:
@@ -1016,6 +1015,122 @@ async def _fetch_investor_via(mgr, tool: str, symbol: str) -> tuple[float | None
     except Exception:
         pass
     return None, None
+
+
+# ─── 정보 수집·분석 (뉴스 + DART 공시 + 수급) — 후보 한정 ────────────────────────
+
+def _load_disclosures(symbol: str, days: int = INFO_LOOKBACK_DAYS) -> list[dict]:
+    """DART 공시 [{date,report_nm,rcept_no}] (최근 days일). 디스크 캐시. 키 미설정/오류 시 빈 리스트."""
+    if not os.getenv("DART_API_KEY"):
+        return []
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=days + 3)).strftime("%Y-%m-%d")
+    cache = DART_CACHE_DIR / f"{symbol}_{start}_{end}.json"
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        import OpenDartReader  # noqa: PLC0415
+        df = OpenDartReader(os.getenv("DART_API_KEY")).list(symbol, start, end)
+        out: list[dict] = []
+        if df is not None and len(df):
+            for _, row in df.iterrows():
+                dt = str(row.get("rcept_dt", ""))
+                if len(dt) == 8 and dt.isdigit():
+                    out.append({"date": f"{dt[:4]}-{dt[4:6]}-{dt[6:8]}",
+                                "report_nm": str(row.get("report_nm", "")),
+                                "rcept_no": str(row.get("rcept_no", ""))})
+        DART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        return out
+    except Exception as e:
+        logger.debug("[DART] %s 공시 조회 실패: %s", symbol, str(e)[:80])
+        return []
+
+
+async def _fetch_news_items_via(mgr, tool: str, company_name: str) -> list[dict]:
+    """이미 연결된 naver-news mgr 로 뉴스 [{title, description}] 수집.
+
+    naver-news-mcp `search_news_articles(query, max_articles, sort_by)` → data.articles.
+    """
+    try:
+        raw = await mgr.call_tool(tool, {"query": company_name, "max_articles": 10})
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        items: Any = []
+        if isinstance(parsed, dict):
+            d = parsed.get("data", parsed)
+            if isinstance(d, dict):
+                items = d.get("articles") or d.get("items") or []
+            elif isinstance(d, list):
+                items = d
+        out = []
+        for it in (items or [])[:10]:
+            if isinstance(it, dict):
+                # 네이버 title 은 <b> 태그 포함 — 태그 제거
+                title = str(it.get("title", it.get("제목", ""))).replace("<b>", "").replace("</b>", "")
+                desc = str(it.get("description", it.get("설명", ""))).replace("<b>", "").replace("</b>", "")
+                if title:
+                    out.append({"title": title, "description": desc})
+        return out
+    except Exception:
+        return []
+
+
+async def analyze_candidate_info(
+    news_mgr, news_tool, symbol: str, name: str,
+    foreign_net: float | None, inst_net: float | None, target_date: str,
+) -> dict:
+    """후보 1건의 뉴스+DART공시+수급을 모아 분석. 악재 감지(veto용) + 호재/재료 요약(표시용)."""
+    news_items = await _fetch_news_items_via(news_mgr, news_tool, name) if news_tool else []
+    titles = [i["title"] for i in news_items]
+    descs = [i["description"] for i in news_items]
+
+    disclosures = _load_disclosures(symbol)
+    disc_score, disc_bd = score_disclosure_catalyst(disclosures, target_date, lookback_days=INFO_LOOKBACK_DAYS)
+    matched = disc_bd.get("matched", [])
+    disc_pos = [m for m in matched if m.get("kind") == "+"]
+    disc_neg = [m for m in matched if m.get("kind") == "-"]
+
+    news_neg = []
+    for t in titles:
+        tt = t.replace(" ", "")
+        hit = next((k for k in _NEWS_NEGATIVE if k.replace(" ", "") in tt), None)
+        if hit:
+            news_neg.append({"keyword": hit, "title": t})
+
+    trends, _kw = match_trends(titles + descs)
+
+    negative_events = (
+        [{"src": "공시", "keyword": m["keyword"], "title": m.get("report_nm", "")} for m in disc_neg]
+        + [{"src": "뉴스", "keyword": n["keyword"], "title": n["title"]} for n in news_neg]
+    )
+    positive_events = [{"src": "공시", "keyword": m["keyword"], "title": m.get("report_nm", "")} for m in disc_pos]
+
+    parts: list[str] = []
+    if trends:
+        parts.append("테마:" + ",".join(trends))
+    if disc_pos:
+        parts.append("호재공시:" + ",".join(sorted({m["keyword"] for m in disc_pos})))
+    if negative_events:
+        parts.append("⚠️악재:" + ",".join(sorted({e["keyword"] for e in negative_events})))
+    flow = ("외인+기관" if (foreign_net or 0) > 0 and (inst_net or 0) > 0 else
+            "외인" if (foreign_net or 0) > 0 else "기관" if (inst_net or 0) > 0 else "")
+    if flow:
+        parts.append(flow + " 순매수")
+
+    return {
+        "has_negative": bool(negative_events),
+        "negative_events": negative_events,
+        "positive_events": positive_events,
+        "trends": trends,
+        "news_count": len(titles),
+        "disclosure_count": len(disclosures),
+        "disclosure_score": round(disc_score, 1),
+        "foreign_net": foreign_net, "inst_net": inst_net,
+        "summary": " / ".join(parts) if parts else "특이사항 없음",
+    }
 
 
 async def _try_get_realtime_price(symbol: str) -> float | None:
@@ -1241,6 +1356,8 @@ def score_one_stock(
             "technical_composite": round(tech.composite(), 1),
             "current_price":       float(ohlcv[-1]["close"]) if ohlcv else 0.0,
             "atr":                 round(_compute_atr(ohlcv), 2),   # (c) 트레일 손절 밴드용
+            "foreign_net":         foreign_net,    # 수급 — 정보 표시용
+            "inst_net":            inst_net,
         }
     except Exception as e:
         logger.debug("[SCORE] %s 오류: %s", symbol, e)
@@ -1394,7 +1511,40 @@ async def phase_selection() -> list[dict]:
         [s for s in scored if s["composite"] >= MIN_SCORE],
         key=lambda x: -x["composite"],
     )
-    candidates = apply_sector_limit(qualified_pool, sector_map)
+
+    # 4-b) 정보 수집·분석 (뉴스 + DART 공시 + 수급) — 상위 후보 한정.
+    #      악재(부정 공시/뉴스)는 후보 제외(veto). 호재/재료/수급은 표시만(composite 미반영 = 검증 기술엣지 보존).
+    info_target_date = datetime.now().strftime("%Y-%m-%d")
+    info_by_symbol: dict[str, dict] = {}
+    vetoed: list[dict] = []
+    if qualified_pool:
+        info_news_mgr = await _enter_optional_mcp("naver-news-mcp", NEWS_URL)
+        info_news_tool = _find_mcp_tool(info_news_mgr, ("news", "search")) if info_news_mgr else None
+        try:
+            for c in qualified_pool[:INFO_MAX_CANDIDATES]:
+                info = await analyze_candidate_info(
+                    info_news_mgr, info_news_tool, c["symbol"], c["company_name"],
+                    c.get("foreign_net"), c.get("inst_net"), info_target_date,
+                )
+                info_by_symbol[c["symbol"]] = info
+                if NEWS_VETO and info["has_negative"]:
+                    vetoed.append(c)
+                    kws = ",".join(sorted({e["keyword"] for e in info["negative_events"]}))
+                    logger.info("[INFO] 🚫 악재 veto %s %-10s — %s", c["symbol"], c["company_name"][:10], kws)
+                    _data_logger.log_event("news_veto", {
+                        "symbol": c["symbol"], "name": c["company_name"], "negative": info["negative_events"],
+                    })
+                else:
+                    logger.info("[INFO] %s %-10s — %s", c["symbol"], c["company_name"][:10], info["summary"])
+        finally:
+            if info_news_mgr:
+                await info_news_mgr.__aexit__(None, None, None)
+
+    vetoed_syms = {c["symbol"] for c in vetoed}
+    survivors = [c for c in qualified_pool if c["symbol"] not in vetoed_syms]
+    candidates = apply_sector_limit(survivors, sector_map)
+    for c in candidates:   # 후보에 정보 분석 첨부 (selection.json / 알림용)
+        c["info"] = info_by_symbol.get(c["symbol"], {})
     save_state("selection", candidates)
 
     # 일별 데이터 저장 (전체 채점 결과 + 예비 후보 포함)
@@ -1411,18 +1561,20 @@ async def phase_selection() -> list[dict]:
         "ma20_filtered":   ma20_filtered,
         "gap_filtered":    gap_filtered,
         "value_filtered":  value_filtered,
+        "news_vetoed":     [{"symbol": c["symbol"], "name": c["company_name"]} for c in vetoed],
     }
     _data_logger.log_selection(today_str, market_info, scored, candidates)
     _data_logger.log_event("selection_done", {
         "analyzed": len(scored), "qualified": len(qualified_pool), "candidates": len(candidates),
         "ma20_filtered": ma20_filtered, "gap_filtered": gap_filtered, "value_filtered": value_filtered,
-        "regime": regime, "candidate_symbols": [c["symbol"] for c in candidates],
+        "news_vetoed": len(vetoed), "regime": regime, "candidate_symbols": [c["symbol"] for c in candidates],
     })
 
-    # 5) 알림 — 섹터 정보 + 채점 분포 통합 포맷
+    # 5) 알림 — 섹터 정보 + 채점 분포 + 정보분석(악재 veto/재료)
+    veto_str = f"  악재veto:{len(vetoed)}" if vetoed else ""
     filter_summary = (
         f"분석:{len(scored)}  거래대금제외:{value_filtered}  "
-        f"MA20제외:{ma20_filtered}  갭제외:{gap_filtered}  "
+        f"MA20제외:{ma20_filtered}  갭제외:{gap_filtered}{veto_str}  "
         f"US ES{sp_pct:+.1f}%/NQ{nq_pct:+.1f}%"
     )
     if not candidates:
@@ -1441,13 +1593,19 @@ async def phase_selection() -> list[dict]:
         for i, c in enumerate(candidates, 1):
             qty = calc_position_qty(c["composite"], c["current_price"])
             sector = c.get("sector", "기타")
-            cat_tag = "📰" if c.get("has_catalyst") else "—"
+            info = c.get("info") or {}
+            info_line = info.get("summary", "")
             lines.append(
-                f"{i}. {c['company_name']}({c['symbol']}) [{sector}] {cat_tag}\n"
+                f"{i}. {c['company_name']}({c['symbol']}) [{sector}]\n"
                 f"   점수 {c['composite']}  "
                 f"가 {c['current_price']:,.0f}원  "
                 f"수량 {qty}주"
+                + (f"\n   📰 {info_line}" if info_line and info_line != "특이사항 없음" else "")
             )
+        if vetoed:
+            lines.append("🚫 악재 제외: " + ", ".join(
+                f"{c['company_name']}({','.join(sorted({e['keyword'] for e in (info_by_symbol.get(c['symbol'],{}).get('negative_events') or [])}))})"
+                for c in vetoed))
         msg = "\n".join(lines)
         logger.info("[PHASE 1] 완료 — 후보 %d종목", len(candidates))
 

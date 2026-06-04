@@ -55,3 +55,37 @@ def test_aggregate_exits_weighted_net(dcb, tmp_path, monkeypatch):
     # net = gross - 왕복비용
     assert r["pnl_pct"] == pytest.approx(0.33 - dcb.ROUNDTRIP_COST_PCT, abs=0.01)
     assert r["action"] == "REALIZED"
+
+
+# ── 정보 수집·분석 (뉴스/DART 공시) — 악재 veto ──────────────────────────────
+import asyncio
+from datetime import date
+
+
+def test_info_negative_disclosure_veto(dcb, monkeypatch):
+    today = date.today().isoformat()
+    monkeypatch.setattr(dcb, "_load_disclosures",
+                        lambda sym, days=5: [{"date": today, "report_nm": "유상증자결정", "rcept_no": "1"}])
+    info = asyncio.run(dcb.analyze_candidate_info(None, None, "000001", "TST", 1, 1, today))
+    assert info["has_negative"] is True
+    assert any("유상증자" in e["keyword"] for e in info["negative_events"])
+
+
+def test_info_positive_disclosure_no_veto(dcb, monkeypatch):
+    today = date.today().isoformat()
+    monkeypatch.setattr(dcb, "_load_disclosures",
+                        lambda sym, days=5: [{"date": today, "report_nm": "단일판매ㆍ공급계약체결", "rcept_no": "1"}])
+    info = asyncio.run(dcb.analyze_candidate_info(None, None, "000001", "TST", 1, 1, today))
+    assert info["has_negative"] is False
+    assert info["positive_events"]
+
+
+def test_info_negative_news_veto(dcb, monkeypatch):
+    today = date.today().isoformat()
+    async def fake_news(mgr, tool, name):
+        return [{"title": "OO전자 횡령 혐의 압수수색", "description": ""}]
+    monkeypatch.setattr(dcb, "_fetch_news_items_via", fake_news)
+    monkeypatch.setattr(dcb, "_load_disclosures", lambda sym, days=5: [])
+    info = asyncio.run(dcb.analyze_candidate_info(object(), "news_tool", "000001", "TST", None, None, today))
+    assert info["has_negative"] is True
+    assert any(e["src"] == "뉴스" for e in info["negative_events"])

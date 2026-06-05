@@ -2163,6 +2163,7 @@ async def phase_force_close(positions: list[dict] | None = None) -> None:
     if not positions:
         logger.info("[PHASE FC] 보유 포지션 없음")
         _finalize_sell_log(entry_date, exit_date)
+        await phase_reconcile()   # 봇 포지션 없어도 실계좌 고아 포지션은 대조·청산해야 함
         return
 
     _ensure_exit_ledger(exit_date)

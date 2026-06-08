@@ -414,6 +414,5 @@ curl http://localhost:3020/tools/search_social_sentiment \
 ## 🔗 관련 문서
 
 - [상위: MCP Servers](../code_index.md)
-- [DataCollectorAgent](../../a2a_agents/data_collector/code_index.md)
 - [Naver News MCP](../naver_news_mcp/code_index.md)
 - [Tavily API 공식 문서](https://tavily.com/docs)

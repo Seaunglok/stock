@@ -382,6 +382,4 @@ curl http://localhost:8050/tools/analyze_sentiment \
 ## 🔗 관련 문서
 
 - [상위: MCP Servers](../code_index.md)
-- [DataCollectorAgent](../../a2a_agents/data_collector/code_index.md)
-- [AnalysisAgent](../../a2a_agents/analysis/code_index.md)
 - [Tavily Search MCP](../tavily_search_mcp/code_index.md)

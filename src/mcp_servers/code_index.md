@@ -28,6 +28,9 @@ Model Context Protocol(MCP) 서버 생태계의 핵심 구현체들입니다. Fa
 - **[naver_news_mcp/](naver_news_mcp/)** - 네이버 뉴스 수집 서버
 - **[tavily_search_mcp/](tavily_search_mcp/)** - 웹 검색 서버
 
+### 🎯 종가매매
+- **[closing_bet_mcp/](closing_bet_mcp/)** - :8060 종가매매 채점·청산 규칙 (순수 함수). 데몬이 직접 임포트하거나 HTTP로 호출. scorer/catalyst/exit_rules/server
+
 ## 📁 디렉토리 트리
 
 ```text
@@ -244,6 +247,5 @@ pytest tests/mcp_servers/integration/
 ## 🔗 관련 문서
 
 - [상위: src](../code_index.md)
-- [LangGraph Agents](../lg_agents/code_index.md) - MCP 도구 사용자
-- [A2A Integration](../a2a_integration/code_index.md) - 에이전트 통합
+- [종가매매 데몬](../../scripts/direct_closing_bet.py) - MCP 서버를 사용하는 standalone 자동매매
 - [FastMCP 공식 문서](https://github.com/fastmcp/fastmcp)

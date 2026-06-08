@@ -437,8 +437,13 @@ async def phase_entry() -> None:
     save_state("positions", positions)
     if bought:
         _mark_done("entry")
-        await notify(f"✅ 추세추종 진입 {mode_tag}\n" +
-                     "\n".join(f"• {p['name']}({p['symbol']}) {p['qty']}주 @{p['entry_price']:,.0f} 손절{p['stop_price']:,.0f}" for p in bought))
+        def _entry_line(p: dict) -> str:
+            e, s, t = p["entry_price"], p["stop_price"], p["target"]
+            rr = (t - e) / (e - s) if e > s else 0.0
+            amt = e * p["qty"]
+            return (f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 @{e:,.0f} (≈{amt:,.0f}원)\n"
+                    f"   손절 {s:,.0f} / 목표 {t:,.0f} (손익비 1:{rr:.1f}) · 점수 {p['score']}")
+        await notify(f"✅ 추세추종 진입 {mode_tag}\n" + "\n".join(_entry_line(p) for p in bought))
 
 
 # ─── 포지션 관리 공통 (트레일/목표/청산) ──────────────────────────────────────
@@ -489,12 +494,15 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                     journal_append({"type": "partial", "id": pos["journal_id"], "symbol": sym, "qty": sell_qty,
                                     "price": cur, "pnl_pct": pnl_pct, "reason": reason})
                     log_event("partial", {"symbol": sym, "qty": sell_qty, "price": cur, "pnl_pct": pnl_pct})
-                    await notify(f"📈 부분익절 {pos['name']}({sym}) {sell_qty}주 @{cur:,.0f} ({pnl_pct:+.2f}%)")
+                    await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{cur:,.0f} "
+                                 f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
                 else:
                     hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
                     net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
                     rr_real = round((cur - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
-                    closed.append((pos, cur, net, reason))
+                    pnl_amt = round((cur - entry) * sell_qty)
+                    closed.append({"pos": pos, "cur": cur, "net": net, "reason": reason, "qty": sell_qty,
+                                   "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
                     journal_append({"type": "exit", "id": pos["journal_id"], "symbol": sym, "name": pos["name"],
                                     "qty": sell_qty, "entry_price": entry, "exit_price": cur, "pnl_pct": pnl_pct,
                                     "net_pct": net, "pnl_amount": round((cur - entry) * sell_qty), "rr_realized": rr_real,
@@ -504,8 +512,13 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
         logger.error("[%s] %s", when, e); return
     save_state("positions", remaining)
     if closed:
+        def _exit_line(x: dict) -> str:
+            p, n = x["pos"], x["net"]
+            rr = f" 손익비 {x['rr']}" if x["rr"] is not None else ""
+            return (f"{'🟢' if n>0 else '🔴'} <b>{p['name']}</b>({p['symbol']}) {x['qty']}주 @{x['cur']:,.0f}\n"
+                    f"   net {n:+.2f}% ({x['pnl_amt']:+,}원{rr}) · {x['hold']}일 보유 — {x['reason']}")
         await notify(f"📤 추세추종 청산 [{datetime.now().strftime('%m/%d %H:%M')}]\n" +
-                     "\n".join(f"{'🟢' if n>0 else '🔴'} {p['name']}({p['symbol']}) net{n:+.2f}% — {r}" for p, c, n, r in closed))
+                     "\n".join(_exit_line(x) for x in closed))
 
 
 async def phase_intraday() -> None:

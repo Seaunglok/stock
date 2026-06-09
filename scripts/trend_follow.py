@@ -57,7 +57,7 @@ with _ctx.redirect_stdout(_io.StringIO()):
 del _ctx, _io
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
-from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import TrendConfig, entry_signal, atr, moving_average  # noqa: E402
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────
@@ -451,8 +451,10 @@ async def phase_entry() -> None:
                 d = resp.get("data", {}) if isinstance(resp, dict) else {}
                 fill = d.get("cntr_pric") or d.get("체결가")
                 entry = float(str(fill).lstrip("+-").replace(",", "")) if fill else price
-                stop = c["stop"]
-                target = c["target"]
+                # 손절/목표는 '실제 체결가' 기준으로 재계산 — 손익비 1:3 보존(백테스트와 동일).
+                # 스크린 시점가(c["stop"]/c["target"])는 진입가와 달라 1:3 이 틀어질 수 있음.
+                stop = round(init_stop_price(entry, float(c["atr"]), CFG.atr_k, -CFG.stop_pct), 2)
+                target = round(entry + CFG.rr * (entry - stop), 2)
                 jid = uuid.uuid4().hex[:8]
                 pos = {"symbol": c["symbol"], "name": c["name"], "mode": UNIVERSE_MODE, "qty": qty,
                        "entry_price": entry, "stop_price": stop, "target": target, "peak_price": entry,

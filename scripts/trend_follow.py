@@ -245,18 +245,31 @@ def get_ohlcv(symbol: str, days: int = 320) -> list[dict]:
         return []
 
 
+def _clean_index_closes(pairs: list[tuple[str, float]], days: int) -> list[float]:
+    """지수 (date, close) → NaN/0 제거 + 장중 미완성 오늘봉 제거 후 마지막 days개."""
+    out = [(d, c) for d, c in pairs if c == c and c > 0]   # c==c → NaN 제거
+    if out and _market_open_now() and out[-1][0] == datetime.now().strftime("%Y-%m-%d"):
+        out = out[:-1]
+    return [c for _, c in out][-days:]
+
+
 def get_kospi_closes(days: int = 320) -> list[float]:
     try:
         with _suppress():
             df = krx.get_index_ohlcv_by_date(_days_ago(days + 60), _today(), "1001")
-        return [float(c) for c in df["종가"].tail(days).values]
+        pairs = [(d.strftime("%Y-%m-%d"), float(row["종가"])) for d, row in df.iterrows()]
+        res = _clean_index_closes(pairs, days)
+        if res:
+            return res
     except Exception:
-        try:
-            import FinanceDataReader as fdr
-            df = fdr.DataReader("^KS11", _days_ago(days + 60), _today())
-            return [float(c) for c in df["Close"].tail(days).values]
-        except Exception:
-            return []
+        pass
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.DataReader("^KS11", _days_ago(days + 60), _today())
+        pairs = [(d.strftime("%Y-%m-%d"), float(c)) for d, c in zip(df.index, df["Close"])]
+        return _clean_index_closes(pairs, days)
+    except Exception:
+        return []
 
 
 def _broad_codes() -> list[str]:

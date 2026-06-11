@@ -60,6 +60,7 @@ from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, entry_signal, atr, moving_average, classify_zone,
+    fundamentals_bonus, leading_sectors,
 )
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────
@@ -67,6 +68,7 @@ ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
 MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
 TRADING_URL = "http://localhost:8030/mcp/"
 MARKET_URL  = "http://localhost:8031/mcp/"
+INFO_URL = "http://localhost:8032/mcp/"
 INVESTOR_URL = "http://localhost:8033/mcp/"
 PORTFOLIO_URL = "http://localhost:8034/mcp/"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -89,6 +91,15 @@ ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "t
 ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
 # 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
 HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
+# 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
+FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
+# 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.
+SECTOR_BONUS = float(os.getenv("TREND_SECTOR_BONUS", "5") or 0)
+# true 면 주도섹터 소속 후보만 진입(하드 게이트). 기본 false(가점만) — 검증된 게이트 엣지 보존.
+SECTOR_GATE = os.getenv("TREND_SECTOR_GATE", "false").lower() == "true"
+SECTOR_MIN_AVG = float(os.getenv("TREND_SECTOR_MIN_AVG", "1.0"))     # 주도 판정: 섹터 평균 등락률 하한 %
+SECTOR_BREADTH = float(os.getenv("TREND_SECTOR_BREADTH", "0.6"))    # 주도 판정: 상승종목 비율 하한 (집단상승)
+SECTOR_TOP_K = int(os.getenv("TREND_SECTOR_TOP_K", "3"))
 TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
 FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
 SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
@@ -547,6 +558,140 @@ async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
     return json.loads(raw) if isinstance(raw, str) else raw
 
 
+# ─── 실적(DART YoY) / 주도섹터 데이터 ────────────────────────────────────────
+FUND_CACHE_DIR = _ROOT / "docs_cache" / "dart_fin"
+
+
+def _fundamentals_yoy(symbol: str) -> dict | None:
+    """DART 최신 사업보고서의 매출·영업이익 YoY(%) — finstate 당기/전기 비교.
+
+    30일 디스크 캐시(재무는 분기 단위 갱신). DART_API_KEY 없음/조회 실패 시 None(가점 생략, veto 아님).
+    """
+    if not os.getenv("DART_API_KEY"):
+        return None
+    cache = FUND_CACHE_DIR / f"{symbol}.json"
+    if cache.exists():
+        try:
+            d = json.loads(cache.read_text(encoding="utf-8"))
+            if (datetime.now() - datetime.fromisoformat(d["cached"])).days < 30:
+                return d["yoy"]
+        except Exception:
+            pass
+    try:
+        import OpenDartReader
+        dart = OpenDartReader(os.getenv("DART_API_KEY"))
+        df = None
+        for year in (datetime.now().year - 1, datetime.now().year - 2):
+            df = dart.finstate(symbol, year)
+            if df is not None and not df.empty:
+                break
+        if df is None or df.empty:
+            return None
+        fs = df[df["fs_div"] == "CFS"]          # 연결 우선, 없으면 개별
+        if fs.empty:
+            fs = df[df["fs_div"] == "OFS"]
+
+        def _yoy(names: list[str]) -> float | None:
+            for nm in names:
+                row = fs[fs["account_nm"] == nm]
+                if row.empty:
+                    continue
+                try:
+                    cur = float(str(row.iloc[0]["thstrm_amount"]).replace(",", ""))
+                    prv = float(str(row.iloc[0]["frmtrm_amount"]).replace(",", ""))
+                except Exception:
+                    continue
+                if prv:
+                    return round((cur - prv) / abs(prv) * 100, 1)
+            return None
+
+        yoy = {"revenue_yoy": _yoy(["매출액", "수익(매출액)", "영업수익"]),
+               "op_income_yoy": _yoy(["영업이익", "영업이익(손실)"])}
+        FUND_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"cached": datetime.now().isoformat(), "yoy": yoy},
+                                    ensure_ascii=False), encoding="utf-8")
+        return yoy
+    except Exception as e:
+        logger.debug("[FUND] %s YoY 조회 실패: %s", symbol, str(e)[:80])
+        return None
+
+
+def _sector_map() -> dict[str, str]:
+    """KOSPI 종목→업종 매핑 (fdr StockListing, 일별 캐시 → Kiwoom universe 캐시 폴백)."""
+    cache_path = DATA_DIR / f"_sector_map_{datetime.now().strftime('%Y%m%d')}.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.StockListing("KOSPI")
+        if not df.empty:
+            sector_col = next((c for c in ["Sector", "업종", "Industry"] if c in df.columns), None)
+            code_col = next((c for c in ["Symbol", "Code", "종목코드"] if c in df.columns), None)
+            if sector_col and code_col:
+                result = {str(row[code_col]): str(row[sector_col]) for _, row in df.iterrows() if row.get(code_col)}
+                cache_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                return result
+    except Exception as e:
+        logger.debug("[SECTOR] fdr 업종 맵 실패 → Kiwoom 캐시: %s", e)
+    try:
+        cache_files = sorted(_ROOT.glob("docs_cache/universe_kiwoom_*.json"), reverse=True)
+        if cache_files:
+            data = json.loads(cache_files[0].read_text(encoding="utf-8"))
+            result = {r["code"]: r.get("sector", "기타") for r in data if r.get("code")}
+            cache_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            return result
+    except Exception as e2:
+        logger.warning("[SECTOR] Kiwoom 캐시도 실패: %s — 주도섹터 비활성", e2)
+    return {}
+
+
+_SECTOR_SKIP = {"종합(KOSPI)", "대형주", "중형주", "소형주"}   # 업종 아님(시장 구분 지수)
+
+
+async def _sector_index_rows() -> list[dict] | None:
+    """키움 업종지수 당일 스냅샷 [{sector, change_pct, rising, falling, flat}] (ka20001).
+
+    KOSPI 전 업종의 지수 등락률 + 상승/하락/보합 종목수 — 집단상승(breadth) 판정 소스.
+    info-domain(:8032) 미가동/실패 시 None(판정 불가 → fail-open).
+    """
+    def _f(v: Any) -> float:
+        try:
+            return float(str(v).replace(",", "").replace("+", ""))
+        except Exception:
+            return float("nan")
+
+    try:
+        async with MCPManager({"kiwoom-info-mcp": INFO_URL}) as mcp:
+            if not mcp.tools:
+                return None
+            raw = await mcp.call_tool("get_sector_code_list", {"market_type": "0"})
+            p = json.loads(raw) if isinstance(raw, str) else raw
+            codes = (p.get("data", {}) or {}).get("list", []) if isinstance(p, dict) else []
+            rows = []
+            for it in codes:
+                name = str(it.get("name", ""))
+                if not name or name in _SECTOR_SKIP:
+                    continue
+                try:
+                    raw2 = await mcp.call_tool("get_sector_current_price",
+                                               {"sector_code": it.get("code", ""), "market_type": "0"})
+                    p2 = json.loads(raw2) if isinstance(raw2, str) else raw2
+                    d = p2.get("data", {}) if isinstance(p2, dict) else {}
+                    rows.append({"sector": name, "change_pct": _f(d.get("flu_rt")),
+                                 "rising": int(_f(d.get("rising")) or 0),
+                                 "falling": int(_f(d.get("fall")) or 0),
+                                 "flat": int(_f(d.get("stdns")) or 0)})
+                except Exception:
+                    continue
+            return rows or None
+    except Exception as e:
+        logger.debug("[SECTOR] 업종지수 조회 실패: %s", e)
+        return None
+
+
 # ─── Phase: 스크리닝 ────────────────────────────────────────────────────────
 async def phase_screen() -> list[dict]:
     logger.info("=" * 56); logger.info("[SCREEN] %s  모드=%s", datetime.now().strftime("%H:%M:%S"), UNIVERSE_MODE)
@@ -587,6 +732,17 @@ async def phase_screen() -> list[dict]:
             logger.info("[SCREEN] ✗ %s %s 프리장 갭다운 %.1f%% → 제외", c["symbol"], c["name"][:10], pm["gap_pct"])
     if vetoed:
         log_event("premarket_veto", {"symbols": vetoed})
+    # 실적(재무) 자동 가점 — 후보 한정(차수재시실 '실적'). 게이트 미변경, 순위만 반영.
+    if FUND_BONUS > 0:
+        for c in cands:
+            yoy = _fundamentals_yoy(c["symbol"])
+            if not yoy:
+                continue
+            pts, det = fundamentals_bonus(yoy.get("revenue_yoy"), yoy.get("op_income_yoy"), FUND_BONUS)
+            c["fundamental"] = {**det, "bonus": pts}
+            if pts > 0:
+                c["score"] = round(c["score"] + pts, 1)
+        cands.sort(key=lambda x: -x["score"])
     save_state("candidates", cands)
     log_event("screen_done", {"universe": len(universe), "candidates": len(cands),
                               "symbols": [c["symbol"] for c in cands]})
@@ -597,6 +753,9 @@ async def phase_screen() -> list[dict]:
         pm = c.get("premarket")
         if pm:
             s += f"\n   프리장 예상 {pm['exp_price']:,.0f} ({pm['gap_pct']:+.1f}%) 예상량 {pm['exp_qty']:,.0f}"
+        f = c.get("fundamental")
+        if f and f.get("bonus", 0) > 0:
+            s += f"\n   실적 YoY 매출{f['revenue_yoy']:+.1f}% 영업{f['op_income_yoy']:+.1f}% (+{f['bonus']:g}점)"
         return s
     lines = [f"🔭 추세추종 스크리닝 [{datetime.now().strftime('%m/%d %H:%M')}] 모드:{UNIVERSE_MODE}"]
     lines += [_scr_line(c) for c in cands[:8]] or ["진입 후보 없음"]
@@ -644,11 +803,14 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     pos = {"symbol": sym, "name": c["name"], "mode": UNIVERSE_MODE, "qty": qty,
            "entry_price": entry, "stop_price": stop, "target": target, "peak_price": entry,
            "atr": c["atr"], "score": c["score"], "buy_date": datetime.now().strftime("%Y-%m-%d"),
-           "partial_done": False, "journal_id": jid}
+           "partial_done": False, "journal_id": jid,
+           "sector": c.get("sector"), "sector_lead": c.get("sector_lead", False)}
     journal_append({"type": "entry", "id": jid, "symbol": sym, "name": c["name"],
                     "mode": UNIVERSE_MODE, "qty": qty, "entry_price": entry, "stop": stop,
                     "target": target, "score": c["score"], "rationale": c.get("gates"),
-                    "breakdown": c.get("breakdown"), "premarket": c.get("premarket")})
+                    "breakdown": c.get("breakdown"), "premarket": c.get("premarket"),
+                    "fundamental": c.get("fundamental"), "sector": c.get("sector"),
+                    "sector_lead": c.get("sector_lead", False)})
     log_event("entry", {"symbol": sym, "qty": qty, "entry": entry, "stop": stop, "target": target})
     logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
                 sym, c["name"][:10], qty, entry, stop, target, mode_tag)
@@ -658,8 +820,45 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
 def _entry_notify_line(p: dict) -> str:
     e, s, t = p["entry_price"], p["stop_price"], p["target"]
     rr = (t - e) / (e - s) if e > s else 0.0
-    return (f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 @{e:,.0f} (≈{e*p['qty']:,.0f}원)\n"
+    line = (f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 @{e:,.0f} (≈{e*p['qty']:,.0f}원)\n"
             f"   손절 {s:,.0f} / 목표 {t:,.0f} (손익비 1:{rr:.1f}) · 점수 {p['score']}")
+    if p.get("sector_lead"):
+        line += f" · 🔥주도섹터({p.get('sector','')})"
+    return line
+
+
+async def _apply_sector_rally(cands: list[dict]) -> list[dict]:
+    """주도섹터 집단상승(차수재시실 '시황') — 09:30 키움 업종지수 스냅샷 기준.
+
+    주도섹터 소속 후보 +SECTOR_BONUS 가점 후 재정렬. SECTOR_GATE=true 면 주도섹터만 남김.
+    업종지수 미확보(서버 다운/조회 실패) 시 판정 불가 → 원본 그대로(fail-open, 게이트도 미적용).
+    """
+    if SECTOR_BONUS <= 0 and not SECTOR_GATE:
+        return cands
+    rows = await _sector_index_rows()
+    if rows is None:                # 데이터 없음 — 주도섹터 판정 불가 → fail-open
+        logger.info("[SECTOR] 업종지수 데이터 없음 — 주도섹터 판정 생략")
+        return cands
+    leaders = leading_sectors(rows, min_avg_pct=SECTOR_MIN_AVG,
+                              min_breadth=SECTOR_BREADTH, top_k=SECTOR_TOP_K)
+    log_event("sector_rally", {"leaders": leaders})
+    smap = _sector_map()
+    lead_names = {x["sector"] for x in leaders}
+    for c in cands:
+        c["sector"] = smap.get(c["symbol"], "기타")
+        if c["sector"] in lead_names:
+            c["sector_lead"] = True
+            if SECTOR_BONUS > 0:
+                c["score"] = round(c["score"] + SECTOR_BONUS, 1)
+            logger.info("[SECTOR] ✓ %s %s 주도섹터(%s) 가점 +%g", c["symbol"], c["name"][:10], c["sector"], SECTOR_BONUS)
+    cands.sort(key=lambda x: -x["score"])
+    if SECTOR_GATE:
+        skipped = [c for c in cands if not c.get("sector_lead")]
+        cands = [c for c in cands if c.get("sector_lead")]
+        if skipped:
+            log_event("entry_skip", {"symbols": [c["symbol"] for c in skipped],
+                                     "reason": "주도섹터 아님(SECTOR_GATE)"})
+    return cands
 
 
 async def phase_entry() -> None:
@@ -673,6 +872,10 @@ async def phase_entry() -> None:
     slots = MAX_POS - len(positions)
     if not cands or slots <= 0:
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
+        return
+    cands = await _apply_sector_rally(cands)
+    if not cands:
+        await notify("⏭️ 주도섹터 게이트: 주도섹터 소속 후보 없음 — 진입 스킵")
         return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     bought, pending = [], []

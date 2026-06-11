@@ -191,6 +191,49 @@ def entry_signal(
     return TrendSignal(passed, score, stop, target, reason, gates, bd)
 
 
+# ─── 라이브 가점 레이어 ("차수재시실"의 실적·시황 — 게이트 아님, 순위 가점만) ──────
+
+def fundamentals_bonus(revenue_yoy: float | None, op_income_yoy: float | None,
+                       bonus: float = 5.0) -> tuple[float, dict]:
+    """실적 가점 (블로그B '실적': 매출·영업이익 YoY↑).
+
+    둘 다 증가 → bonus, 영업이익만 증가 → bonus/2, 그 외/데이터 없음 → 0.
+    검증된 진입 게이트는 건드리지 않고 후보 순위에만 반영(악재 veto 아님).
+    """
+    detail = {"revenue_yoy": revenue_yoy, "op_income_yoy": op_income_yoy}
+    if revenue_yoy is None or op_income_yoy is None:
+        return 0.0, {**detail, "why": "데이터 없음"}
+    if revenue_yoy > 0 and op_income_yoy > 0:
+        return round(bonus, 1), {**detail, "why": "매출·영업이익 YoY 동반 증가"}
+    if op_income_yoy > 0:
+        return round(bonus / 2, 1), {**detail, "why": "영업이익 YoY 증가"}
+    return 0.0, {**detail, "why": "YoY 증가 없음"}
+
+
+def leading_sectors(sector_rows: list[dict], *,
+                    min_avg_pct: float = 1.0, min_breadth: float = 0.6,
+                    min_count: int = 3, top_k: int = 3) -> list[dict]:
+    """당일 주도섹터(집단상승) 판정 (블로그B '시황') — 업종지수 스냅샷 기반.
+
+    sector_rows: [{sector, change_pct(지수 등락률%), rising, falling, flat(구성종목 수)}]
+    (키움 ka20001 업종현재가의 flu_rt/rising/fall/stdns).
+    집단상승 = 등락률 ≥ min_avg_pct AND 상승종목 비율 ≥ min_breadth AND 구성종목 ≥ min_count.
+    등락률 내림차순 top_k. 반환: [{sector, change_pct, breadth, count}].
+    """
+    out = []
+    for r in sector_rows:
+        total = int(r.get("rising", 0)) + int(r.get("falling", 0)) + int(r.get("flat", 0))
+        chg = r.get("change_pct")
+        if total < min_count or chg is None or chg != chg:   # 표본 부족/NaN 제외
+            continue
+        breadth = int(r.get("rising", 0)) / total
+        if chg >= min_avg_pct and breadth >= min_breadth:
+            out.append({"sector": r.get("sector", ""), "change_pct": round(float(chg), 2),
+                        "breadth": round(breadth, 2), "count": total})
+    out.sort(key=lambda x: -x["change_pct"])
+    return out[:top_k]
+
+
 # ─── 청산 신호 ──────────────────────────────────────────────────────────────
 
 def trend_exit(

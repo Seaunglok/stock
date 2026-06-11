@@ -16,8 +16,8 @@
 | **차트** | 현재가>MA200 & 기울기↑; 횡보 후 첫 장대양봉(몸통≥4% & 위꼬리≤0.3) | `scorer.score_consolidation/score_candle_shape` + 신규 MA200·장대양봉 |
 | **수급** | 외인5일·기관5일 순매수>0 | `scorer.score_institutional`, investor-domain MCP |
 | **재료** | DART 공시 호재 + 뉴스 테마 | `catalyst.match_trends`, 정보레이어 (라이브 가점) |
-| **시황** | 당일 주도섹터 집단상승 | 동적테마 패턴 (라이브) |
-| **실적** | 매출/영업이익 YoY↑·어닝서프라이즈 | financial MCP (v2) |
+| **시황** | 당일 주도섹터 집단상승 | ✅ `leading_sectors`(순수함수) + 09:30 장중 등락 스냅샷 — 가점(기본)/게이트(opt-in) |
+| **실적** | 매출/영업이익 YoY↑·어닝서프라이즈 | ✅ `fundamentals_bonus`(순수함수) + DART finstate 당기/전기 YoY — 가점 |
 
 거래량 폭발(2배+)은 `scorer.score_volume_surge` 재사용. **백테스트는 차트+거래량+수급+RS 코어만**
 (재료/실적/뉴스는 point-in-time 불가 → 라이브 가점·악재 veto로만 반영).
@@ -47,13 +47,13 @@
 **스케줄** (영업일):
 | 시각 | phase | 동작 |
 |------|-------|------|
-| 08:50 | `screen` | 모드별 유니버스 스캔 → entry_signal 게이트·점수 → 후보 |
-| 09:30 | `entry` | 동일비중 매수(최대 `TREND_MAX_POS`=5). return_code 게이트(유령 방지) |
-| (장중) | `intraday` | `TREND_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 |
-| 15:20 | `exit` | MA50 이탈 / 외인 5일 순매도전환 / 트레일 이탈 청산 |
+| 08:50 | `screen` | 모드별 유니버스 스캔(완성봉) → entry_signal 게이트·점수 → 후보. 프리장 예상가·JH ZONE·실적 YoY 가점 표시 |
+| 09:30 | `entry` | 동일비중 매수(최대 `TREND_MAX_POS`=5). 주도섹터 가점 재정렬. **하락 중 후보 보류→장중 반등 시 진입(10:30 컷오프 후 스킵)**. return_code 게이트(유령 방지) |
+| (장중) | `intraday` | `TREND_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 + 하드손절(`TREND_HARD_STOP_PCT`, 기본off) + 보류분 반등 점검 |
+| 15:20 | `exit` | 계좌 보유분 편입(reconcile) → MA50 이탈 / 외인 5일 순매도전환 / 트레일 이탈 청산 |
 
 **안전장치**: 주문 `return_code` 검증 + `[REJECT]` 로깅, 단일 인스턴스 락(`data/trend_follow/daemon.lock`),
-exit_ledger net 손익, 자정 회전 로그(`logs/trend_follow/`, 30일), `events.jsonl`, 텔레그램.
+물타기 금지(1종목 1진입), 텔레그램 HTML 안전화, exit_ledger net 손익, 자정 회전 로그(`logs/trend_follow/`, 30일), `events.jsonl`.
 
 **매매일지** (`data/trend_follow/journal.jsonl`, append-only):
 - 자동(진입/부분/청산): 일시·종목·모드·진입가/손절/목표·청산가·수량·**손익률·net·손익비·청산사유·진입근거(게이트)·보유일수**.
@@ -74,6 +74,10 @@ TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_PULLBACK_PCT=3 TRE
 TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
 TREND_STOP_PCT=7 TREND_ATR_K=2.0 TREND_RR=3 TREND_PARTIAL_PCT=30
 TREND_USE_FOREIGN_EXIT=true TREND_NEWS_VETO=true   # 라이브. MOCK_MODE 공유.
+TREND_FUND_BONUS=5                  # 실적 가점: 매출·영업이익 YoY 동반↑ +5점(영업이익만 +2.5) — 순위만, 0=off
+TREND_SECTOR_BONUS=5                # 주도섹터 가점: 집단상승 섹터 소속 후보 +5점 — 0=off
+TREND_SECTOR_GATE=false             # true 면 주도섹터 소속 후보만 진입(하드 게이트) — 기본 가점만
+TREND_SECTOR_MIN_AVG=1.0 TREND_SECTOR_BREADTH=0.6 TREND_SECTOR_TOP_K=3  # 주도 판정: 평균등락/상승비율/상위K
 ```
 
 ## 실행
@@ -93,11 +97,11 @@ python -m pytest tests/test_trend_signals.py -q
 ```
 
 ## 파일
-- `src/mcp_servers/trend_mcp/signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산). scorer·exit_rules 재사용.
-- `scripts/backtest_trend.py` — 비용포함 백테스트(3모드). `backtest_dynamic`·`backtest_walkforward` 재사용.
-- `scripts/trend_follow.py` — MOCK 라이브 데몬 + 매매일지 + 일별로그.
-- `scripts/trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지).
-- `tests/test_trend_signals.py` — 순수함수 회귀(13).
+- `src/mcp_servers/trend_mcp/signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산 + `classify_zone` JH ZONE + `fundamentals_bonus` 실적 + `leading_sectors` 주도섹터). scorer·exit_rules 재사용.
+- `scripts/backtest_trend.py` — 비용포함 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`). `backtest_dynamic`·`backtest_walkforward` 재사용.
+- `scripts/trend_follow.py` — MOCK 라이브 데몬(스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 실적·섹터 가점) + 매매일지 + 일별로그.
+- `scripts/trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지, 프리장·근거 표시).
+- `tests/test_trend_signals.py` — 순수함수 회귀(54: 지표/진입/청산 + JH ZONE 6 + 실적 3 + 주도섹터 3).
 
 ## PDF 설계가이드(이종호 대형주 추세추종) 대조
 
@@ -127,7 +131,20 @@ python -m pytest tests/test_trend_signals.py -q
 ④ 하드손절 −5% 상시. 이들은 검증된 largecap +2.00%/watchlist +4.29% 설정을 바꾸므로 `backtest_trend` 로
 A/B 비교 후 채택 결정(현재 기본값은 검증 설정 유지).
 
+## 라이브 가점 레이어 (v2, 2026-06-11) — 차수재시실 '실적'·'시황' 기계화
+
+검증된 진입 게이트/점수(백테스트 엣지)는 **무변경** — 후보 **순위 가점**으로만 반영 (closing-bet 정보레이어와 동일 철학).
+- **실적 자동 가점** (`fundamentals_bonus` 순수함수): 08:50 screen 에서 후보 한정 DART `finstate` 당기/전기 비교 →
+  매출·영업이익 YoY 동반 증가 +5점, 영업이익만 +2.5점. 30일 디스크 캐시(`docs_cache/dart_fin/`).
+  `DART_API_KEY` 없음/조회 실패 시 가점 생략(veto 아님). Telegram·journal 에 YoY 표시.
+- **주도섹터 집단상승** (`leading_sectors` 순수함수): 09:30 entry 직전 키움 **업종지수 스냅샷**(ka20001,
+  info-domain :8032 — KOSPI 27개 업종의 등락률+상승/하락/보합 종목수) → 등락률 ≥1.0% AND 상승비율 ≥60%
+  AND 구성 ≥3 인 상위 3개 섹터를 주도섹터로 판정. 소속 후보 +5점 재정렬(기본). `TREND_SECTOR_GATE=true` 면
+  주도섹터 소속만 진입(하드 게이트, opt-in). 업종지수 미확보(서버 다운) 시 **fail-open**(판정 생략, 게이트도
+  미적용). `sector_rally` 이벤트 기록. ※ KRX 전종목 스냅샷(pykrx by_ticker)은 KRX 로그인 필요로 불가 → 키움 소스 채택.
+
 ## TODO (v2)
 - gainers 모드 음(−)기대값 재설계(등락률 진짜 상위 소형주 유니버스 + 재료/수급 라이브 반영).
-- 실적(재무) 자동 가점, 주도섹터 집단상승 라이브 게이트.
+- ~~실적(재무) 자동 가점, 주도섹터 집단상승 라이브 게이트~~ → 2026-06-11 구현(위 '라이브 가점 레이어').
+- 어닝서프라이즈(분기 컨센서스 대비) 가점 — 현재는 연간 YoY 만.
 - MOCK 며칠 관찰 후 실전 전환 논의.

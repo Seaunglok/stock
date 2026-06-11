@@ -66,6 +66,7 @@ MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
 TRADING_URL = "http://localhost:8030/mcp/"
 MARKET_URL  = "http://localhost:8031/mcp/"
 INVESTOR_URL = "http://localhost:8033/mcp/"
+PORTFOLIO_URL = "http://localhost:8034/mcp/"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -412,6 +413,87 @@ async def _premarket_snapshot(symbol: str) -> dict | None:
         return None
 
 
+def _kint(s: Any) -> int:
+    """키움 제로패딩/부호 문자열 → int."""
+    s = str(s); neg = s.startswith("-")
+    s = s.lstrip("+-").lstrip("0") or "0"
+    try:
+        v = int(s)
+    except Exception:
+        v = 0
+    return -v if neg else v
+
+
+async def _broker_holdings() -> list[dict]:
+    """계좌 보유종목 [{symbol,name,qty,avg,cur}]. get_account_evaluation 파싱."""
+    try:
+        async with MCPManager({"portfolio-domain": PORTFOLIO_URL}) as mcp:
+            tool = next((t["name"] for t in (mcp.tools or []) if "evaluation" in t["name"].lower()), None)
+            if not tool:
+                return []
+            raw = await mcp.call_tool(tool, {})
+            p = json.loads(raw) if isinstance(raw, str) else raw
+            d = p.get("data", {}) if isinstance(p, dict) else {}
+            rows = d.get("stk_acnt_evlt_prst", []) if isinstance(d, dict) else []
+            out = []
+            for r in rows:
+                code = str(r.get("stk_cd", "")).lstrip("A")
+                qty = _kint(r.get("rmnd_qty", 0))
+                if not code or qty <= 0:
+                    continue
+                out.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty,
+                            "avg": _kint(r.get("avg_prc", 0)), "cur": _kint(r.get("cur_prc", 0))})
+            return out
+    except Exception as e:
+        logger.warning("[RECONCILE] 계좌조회 실패: %s", e)
+        return []
+
+
+async def phase_reconcile() -> None:
+    """계좌 보유분 중 데몬 미추적분을 추세 청산규칙 관리 대상으로 편입(adopt).
+
+    트레일 stop 은 '현재가' 기준으로 새로 잡아 편입 즉시 손절을 방지한다(편입 시점부터 추적).
+    손익(entry_price)은 실제 평단 기준. 이후 _manage 가 MA50이탈/트레일/외인전환 시 처분.
+    """
+    log_event("phase_start", {"phase": "reconcile"})
+    holdings = await _broker_holdings()
+    if not holdings:
+        return
+    positions = get_state("positions", [])
+    held = {p["symbol"] for p in positions}
+    adopted = []
+    for h in holdings:
+        if h["symbol"] in held:
+            continue
+        cur = h["cur"] or h["avg"]
+        entry = h["avg"] or cur
+        if cur <= 0 or entry <= 0:
+            continue
+        ohlcv = get_ohlcv(h["symbol"])
+        a = round(atr(ohlcv, CFG.atr_period), 2) if ohlcv else round(cur * 0.02, 2)
+        stop = round(init_stop_price(cur, a, CFG.atr_k, -CFG.stop_pct), 2)      # 현재가 기준 트레일
+        e_stop = init_stop_price(entry, a, CFG.atr_k, -CFG.stop_pct)
+        target = round(entry + CFG.rr * (entry - e_stop), 2)                    # 1:3 (평단 기준)
+        jid = uuid.uuid4().hex[:8]
+        pos = {"symbol": h["symbol"], "name": h["name"], "mode": "adopted", "qty": h["qty"],
+               "entry_price": entry, "stop_price": stop, "target": target,
+               "peak_price": max(cur, entry), "atr": a, "score": 0,
+               "buy_date": datetime.now().strftime("%Y-%m-%d"), "partial_done": False, "journal_id": jid}
+        positions.append(pos)
+        adopted.append(pos)
+        journal_append({"type": "entry", "id": jid, "symbol": h["symbol"], "name": h["name"],
+                        "mode": "adopted", "qty": h["qty"], "entry_price": entry, "stop": stop,
+                        "target": target, "score": 0, "rationale": {"adopted": True}})
+        log_event("reconcile_adopt", {"symbol": h["symbol"], "qty": h["qty"], "entry": entry, "stop": stop})
+        logger.info("[RECONCILE] 편입 %s %-10s %d주 평단%.0f 트레일stop%.0f",
+                    h["symbol"], h["name"][:10], h["qty"], entry, stop)
+    if adopted:
+        save_state("positions", positions)
+        await notify("📥 계좌 보유분 추세관리 편입 (MA50이탈/트레일/외인 시 처분)\n" +
+                     "\n".join(f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 평단{p['entry_price']:,.0f} 트레일{p['stop_price']:,.0f}"
+                               for p in adopted))
+
+
 async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
     tool = "place_buy_order" if side == "buy" else "place_sell_order"
     raw = await mcp.call_tool(tool, {"stock_code": symbol, "quantity": qty,
@@ -635,6 +717,7 @@ async def phase_intraday() -> None:
 async def phase_exit() -> None:
     logger.info("=" * 56); logger.info("[EXIT] %s", datetime.now().strftime("%H:%M:%S"))
     log_event("phase_start", {"phase": "exit"})
+    await phase_reconcile()   # 신규 계좌 보유분 편입 후 청산판단
     await _manage(do_exit_signals=True, when="exit")
 
 
@@ -667,6 +750,10 @@ async def scheduler_daemon() -> None:
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
     await notify(f"🚀 추세추종 데몬 시작 ({'🧪 MOCK' if MOCK_MODE else '💰 REAL'}) 모드:{UNIVERSE_MODE}")
+    try:
+        await phase_reconcile()   # 기동 시 계좌 보유분 편입(추세 청산규칙 관리)
+    except Exception as e:
+        logger.error("[DAEMON] reconcile %s", e)
     funcs = {"screen": phase_screen, "entry": phase_entry, "exit": phase_exit}
     while True:
         now = datetime.now()
@@ -706,7 +793,7 @@ def print_status() -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit"])
+    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile"])
     g.add_argument("--daemon", action="store_true")
     g.add_argument("--status", action="store_true")
     g.add_argument("--journal-note", metavar="ID")
@@ -726,4 +813,5 @@ if __name__ == "__main__":
             release_lock()
     else:
         asyncio.run({"screen": phase_screen, "entry": phase_entry,
-                     "intraday": phase_intraday, "exit": phase_exit}[args.phase]())
+                     "intraday": phase_intraday, "exit": phase_exit,
+                     "reconcile": phase_reconcile}[args.phase]())

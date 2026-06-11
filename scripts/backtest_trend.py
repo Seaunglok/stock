@@ -46,8 +46,17 @@ def _gap_pct(full: list[dict], i: int) -> float:
     return (full[i]["close"] - full[i - 1]["close"]) / full[i - 1]["close"] * 100.0
 
 
+# ─── A/B 변형 노브(검증대기 항목 비교용) ─────────────────────────────────────
+V_FIRST_PARTIAL_R: float | None = None   # 첫 30% 익절 지점(R배수). None=cfg.rr(1:3). 1.0=1:1
+V_EXIT_MA: int | None = None             # 청산 이평선. None=cfg.ma_support(50). 120 등
+V_HARD_STOP_PCT: float = 0.0             # 진입가 -X% 하드 손절(트레일 floor). 0=off
+
+
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
-    """신호 봉 i 다음날 시가 진입 → 트레일/목표/MA50 청산. net 수익률(%) 반환."""
+    """신호 봉 i 다음날 시가 진입 → 트레일/목표/MA 청산. net 수익률(%) 반환.
+
+    변형 노브: V_FIRST_PARTIAL_R(첫익절 지점), V_EXIT_MA(청산선), V_HARD_STOP_PCT(하드손절).
+    """
     if i + 1 >= len(full):
         return None
     entry = full[i + 1]["open"]
@@ -55,7 +64,10 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
         return None
     a = atr(full[:i + 1], cfg.atr_period)
     stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
-    target = entry + cfg.rr * (entry - stop)
+    first_r = V_FIRST_PARTIAL_R if V_FIRST_PARTIAL_R is not None else cfg.rr
+    first_target = entry + first_r * (entry - stop)
+    exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support
+    hard_floor = entry * (1 - V_HARD_STOP_PCT / 100.0) if V_HARD_STOP_PCT > 0 else None
     closes = [b["close"] for b in full]
     peak = entry
     realized = 0.0       # 가중 실현 수익률(%)
@@ -68,20 +80,21 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
         b = full[j]
         last_j = j
         # 첫 목표 도달(장중 고가) → 부분 익절
-        if not partial and b["high"] >= target:
-            realized += (cfg.partial_pct / 100) * (target - entry) / entry * 100
+        if not partial and b["high"] >= first_target:
+            realized += (cfg.partial_pct / 100) * (first_target - entry) / entry * 100
             rem -= cfg.partial_pct / 100
             partial = True
         # 트레일 갱신(종가)
         peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
-        # 손절/트레일 이탈(장중 저가)
-        if b["low"] <= stop:
-            realized += rem * (stop - entry) / entry * 100
+        # 손절/트레일 이탈(장중 저가) — 하드손절은 트레일 floor 로 적용
+        eff_stop = max(stop, hard_floor) if hard_floor is not None else stop
+        if b["low"] <= eff_stop:
+            realized += rem * (eff_stop - entry) / entry * 100
             rem = 0.0
             break
-        # MA50 이평선 하방 돌파(종가)
-        ma50 = moving_average(closes[:j + 1], cfg.ma_support)
-        if ma50 is not None and b["close"] < ma50:
+        # 청산 이평선 하방 돌파(종가)
+        ma = moving_average(closes[:j + 1], exit_ma)
+        if ma is not None and b["close"] < ma:
             realized += rem * (b["close"] - entry) / entry * 100
             rem = 0.0
             break
@@ -90,28 +103,36 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
     return realized - costs.roundtrip_pct
 
 
+_UNIV_CACHE: dict = {}   # A/B 스윕에서 유니버스 재로드 방지
+
+
 def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg: TrendConfig) -> list[tuple[float, float]]:
     """반환: 진입별 (gap_pct, net_pct). gap_pct = 진입일 시가 / 신호일 종가 − 1 (프리장 갭의 백테스트 대용)."""
-    kospi = fdr.DataReader("^KS11", start, end)
-    dates = [d.strftime("%Y%m%d") for d in kospi.index]
-    kospi_close = [float(c) for c in kospi["Close"].values]
-    kdate_close = dict(zip(dates, kospi_close))
-    print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs}")
-
-    if mode == "watchlist":
-        universe = watchlist
+    key = (mode, tuple(watchlist), start, end, cfg_top)
+    if key in _UNIV_CACHE:
+        dates, kospi_close, broad = _UNIV_CACHE[key]
+        print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} (캐시 재사용 {len(broad)}종목)")
     else:
-        universe = get_broad_universe()           # KOSPI 시총 상위 ~150 (cap 정렬)
-        if mode == "largecap":
-            universe = universe[:cfg_top]
-    broad: dict[str, list[dict]] = {}
-    for idx, code in enumerate(universe, 1):
-        h = get_ohlcv(code, dates[-1] if dates else end.replace("-", ""), days=320)
-        if h:
-            broad[code] = h
-        if idx % 40 == 0:
-            print(f"  유니버스 로드 {idx}/{len(universe)}")
-    print(f"  → {len(broad)}종목 로드 완료")
+        kospi = fdr.DataReader("^KS11", start, end)
+        dates = [d.strftime("%Y%m%d") for d in kospi.index]
+        kospi_close = [float(c) for c in kospi["Close"].values]
+        print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs}")
+
+        if mode == "watchlist":
+            universe = watchlist
+        else:
+            universe = get_broad_universe()           # KOSPI 시총 상위 ~150 (cap 정렬)
+            if mode == "largecap":
+                universe = universe[:cfg_top]
+        broad = {}
+        for idx, code in enumerate(universe, 1):
+            h = get_ohlcv(code, dates[-1] if dates else end.replace("-", ""), days=320)
+            if h:
+                broad[code] = h
+            if idx % 40 == 0:
+                print(f"  유니버스 로드 {idx}/{len(universe)}")
+        print(f"  → {len(broad)}종목 로드 완료")
+        _UNIV_CACHE[key] = (dates, kospi_close, broad)
 
     trades: list[tuple[float, float]] = []
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
@@ -191,6 +212,34 @@ def report_gapdown_sweep(trades: list[tuple[float, float]], label: str,
 cfg_top = 100   # 모드별 런타임에 갱신
 
 
+def report_abtest(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """검증대기 항목 A/B 비교 — 첫익절 1:1 vs 1:3 / 청산선 MA120 vs MA50 / 하드손절 -5% (유니버스 1회 로드)."""
+    global V_FIRST_PARTIAL_R, V_EXIT_MA, V_HARD_STOP_PCT
+    variants = [
+        ("기준(1:3·MA50·ATR)", None, None, 0.0),
+        ("첫익절 1:1",          1.0,  None, 0.0),
+        ("청산선 MA120",        None, 120,  0.0),
+        ("하드손절 -5%",        None, None, 5.0),
+        ("PDF종합(1:1·MA120·-5%)", 1.0, 120, 5.0),
+    ]
+    print("\n" + "=" * 92)
+    print(f"검증대기 항목 A/B 비교 — {label} (비용 차감 후)")
+    print("=" * 92)
+    print(f"  {'변형':24} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
+    for vlabel, fp, ma, hard in variants:
+        V_FIRST_PARTIAL_R, V_EXIT_MA, V_HARD_STOP_PCT = fp, ma, hard
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:24} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:24} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+9.1f}%")
+    V_FIRST_PARTIAL_R, V_EXIT_MA, V_HARD_STOP_PCT = None, None, 0.0
+    print("  ※ 기준 = 현재 검증·운영 설정. 변형이 기대값·손익비·P10(꼬리손실)을 개선하는지 확인.")
+
+
 def main():
     global cfg_top
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -203,6 +252,7 @@ def main():
     p.add_argument("--fee-bps", type=float, default=1.5)
     p.add_argument("--slippage-bps", type=float, default=10.0)
     p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
+    p.add_argument("--abtest", action="store_true", help="검증대기 항목 A/B 비교(첫익절/청산선/하드손절)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -210,11 +260,14 @@ def main():
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
     watch = [c.strip() for c in args.watchlist.split(",") if c.strip()]
 
-    trades = run(args.mode, args.start, args.end, watch, costs, cfg)
-    nets = [net for _, net in trades]
-    report(nets, f"mode={args.mode} top_n={cfg_top}")
-    if args.gapdown_sweep:
-        report_gapdown_sweep(trades, f"mode={args.mode} top_n={cfg_top}")
+    if args.abtest:
+        report_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    else:
+        trades = run(args.mode, args.start, args.end, watch, costs, cfg)
+        nets = [net for _, net in trades]
+        report(nets, f"mode={args.mode} top_n={cfg_top}")
+        if args.gapdown_sweep:
+            report_gapdown_sweep(trades, f"mode={args.mode} top_n={cfg_top}")
     print("\n주의: 익일 시가 진입·일봉 청산 근사. 재료/실적/외인수급 미반영(코어 검증).")
 
 

@@ -90,7 +90,8 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
     return realized - costs.roundtrip_pct
 
 
-def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg: TrendConfig) -> list[float]:
+def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg: TrendConfig) -> list[tuple[float, float]]:
+    """반환: 진입별 (gap_pct, net_pct). gap_pct = 진입일 시가 / 신호일 종가 − 1 (프리장 갭의 백테스트 대용)."""
     kospi = fdr.DataReader("^KS11", start, end)
     dates = [d.strftime("%Y%m%d") for d in kospi.index]
     kospi_close = [float(c) for c in kospi["Close"].values]
@@ -112,7 +113,7 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             print(f"  유니버스 로드 {idx}/{len(universe)}")
     print(f"  → {len(broad)}종목 로드 완료")
 
-    nets: list[float] = []
+    trades: list[tuple[float, float]] = []
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
     # KOSPI 종가 시계열(상대강도용)
     for i_day, date_str in enumerate(dates[:-1]):
@@ -139,12 +140,15 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             sig = entry_signal(full[:idx + 1], kospi_upto, cfg)
             if not sig.passed:
                 continue
+            if idx + 1 >= len(full) or full[idx]["close"] <= 0:
+                continue
+            gap = (full[idx + 1]["open"] - full[idx]["close"]) / full[idx]["close"] * 100.0
             net = simulate_trade(full, idx, cfg, costs)
             if net is not None:
-                nets.append(net)
+                trades.append((gap, net))
         if (i_day + 1) % 40 == 0:
-            print(f"  [{i_day+1}/{len(dates)}] {date_fmt}: 누적 진입 {len(nets)}건")
-    return nets
+            print(f"  [{i_day+1}/{len(dates)}] {date_fmt}: 누적 진입 {len(trades)}건")
+    return trades
 
 
 def report(nets: list[float], label: str) -> None:
@@ -162,6 +166,28 @@ def report(nets: list[float], label: str) -> None:
     print("  ※ 비교: closing-bet atr2_h3 OOS 기대값 +1.15% (동일 진입 55/3)")
 
 
+def report_gapdown_sweep(trades: list[tuple[float, float]], label: str,
+                         thresholds=(0.0, 1.0, 2.0, 3.0, 5.0)) -> None:
+    """프리장 갭다운 veto 임계값 스윕 — 진입일 시가 갭 < -임계값 인 거래를 제외하고 성과 비교."""
+    print("\n" + "=" * 86)
+    print(f"갭다운 veto 검증 — {label} (진입일 시가 갭 기준, 비용 차감 후)")
+    print("=" * 86)
+    print(f"  {'veto(%)':>8} {'진입':>5} {'제외':>4} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>9}")
+    base_n = len(trades)
+    for thr in thresholds:
+        kept = [net for gap, net in trades if thr <= 0 or gap >= -thr]
+        m = metrics(kept)
+        if not m.get("n"):
+            print(f"  {thr:>8.1f} {0:>5} {base_n:>4}  진입 0건")
+            continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        tag = "  (veto off)" if thr <= 0 else ""
+        print(f"  {thr:>8.1f} {m['n']:>5} {base_n - m['n']:>4} {m['win']:>5.1f}% "
+              f"{m['avg']:>+7.2f}% {po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+8.1f}%{tag}")
+    print("  ※ veto=0 은 미적용(전체). 임계값↑ → 갭다운 진입 제외. 기대값·손익비·P10(꼬리손실) 개선 여부 확인.")
+
+
 cfg_top = 100   # 모드별 런타임에 갱신
 
 
@@ -176,6 +202,7 @@ def main():
     p.add_argument("--tax-bps", type=float, default=18.0)
     p.add_argument("--fee-bps", type=float, default=1.5)
     p.add_argument("--slippage-bps", type=float, default=10.0)
+    p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -183,8 +210,11 @@ def main():
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
     watch = [c.strip() for c in args.watchlist.split(",") if c.strip()]
 
-    nets = run(args.mode, args.start, args.end, watch, costs, cfg)
+    trades = run(args.mode, args.start, args.end, watch, costs, cfg)
+    nets = [net for _, net in trades]
     report(nets, f"mode={args.mode} top_n={cfg_top}")
+    if args.gapdown_sweep:
+        report_gapdown_sweep(trades, f"mode={args.mode} top_n={cfg_top}")
     print("\n주의: 익일 시가 진입·일봉 청산 근사. 재료/실적/외인수급 미반영(코어 검증).")
 
 

@@ -58,7 +58,9 @@ del _ctx, _io
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
-from src.mcp_servers.trend_mcp.signals import TrendConfig, entry_signal, atr, moving_average  # noqa: E402
+from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
+    TrendConfig, entry_signal, atr, moving_average, classify_zone,
+)
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────
 ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
@@ -83,6 +85,10 @@ INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
 PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
 # 09:30 진입 시 하락 중(현재가<시가)인 후보는 보류 → 장중 반등(시가 회복) 시 진입, 끝까지 안 돌면 그날 스킵.
 ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "true"
+# 신규 진입 허용 마감 시각(PDF: 09:30~10:30만 진입). 이후 보류분은 그날 스킵. "HH:MM".
+ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
+# 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
+HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
 TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
 FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
 SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
@@ -558,11 +564,13 @@ async def phase_screen() -> list[dict]:
         foreign, inst = None, None
         sig = entry_signal(ohlcv, kospi, CFG, foreign, inst)
         if sig.passed:
+            cl = [b["close"] for b in ohlcv]
+            zone = classify_zone(cl[-1], moving_average(cl, 60), moving_average(cl, 120))
             cands.append({"symbol": code, "name": name, "score": sig.score,
                           "price": ohlcv[-1]["close"], "stop": sig.stop, "target": sig.target,
                           "atr": round(atr(ohlcv, CFG.atr_period), 2), "gates": sig.gates,
-                          "breakdown": sig.breakdown})
-            logger.info("[SCREEN] ✓ %s %-10s 점수%.1f 손절%.0f 목표%.0f", code, name[:10], sig.score, sig.stop, sig.target)
+                          "breakdown": sig.breakdown, "zone": zone})
+            logger.info("[SCREEN] ✓ %s %-10s 점수%.1f [%s] 손절%.0f 목표%.0f", code, name[:10], sig.score, zone, sig.stop, sig.target)
         else:
             logger.debug("[SCREEN] %s %s — %s", code, name, sig.reason)
     cands.sort(key=lambda x: -x["score"])
@@ -584,7 +592,8 @@ async def phase_screen() -> list[dict]:
                               "symbols": [c["symbol"] for c in cands]})
 
     def _scr_line(c: dict) -> str:
-        s = f"• {c['name']}({c['symbol']}) 점수{c['score']} 손절{c['stop']:,.0f} 목표{c['target']:,.0f}"
+        z = f"[{c['zone']}] " if c.get("zone") else ""
+        s = f"• {z}{c['name']}({c['symbol']}) 점수{c['score']} 손절{c['stop']:,.0f} 목표{c['target']:,.0f}"
         pm = c.get("premarket")
         if pm:
             s += f"\n   프리장 예상 {pm['exp_price']:,.0f} ({pm['gap_pct']:+.1f}%) 예상량 {pm['exp_qty']:,.0f}"
@@ -612,6 +621,10 @@ def _mark_done(label: str) -> None:
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
+    # 물타기 금지(PDF 절대원칙 #1) — 이미 보유 종목엔 재진입 안 함(1종목 1진입)
+    if any(p["symbol"] == sym for p in get_state("positions", [])):
+        logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
+        return None
     price = await _realtime_price(sym) or c["price"]
     qty = max(1, int(INVEST_PER_TRADE / price))
     resp = await _place(mcp, "buy", sym, qty)
@@ -693,10 +706,26 @@ async def phase_entry() -> None:
                      "\n".join(f"• {c['name']}({c['symbol']}) 점수{c['score']}" for c in pending))
 
 
+def _past_entry_cutoff() -> bool:
+    """진입 마감 시각(PDF 09:30~10:30) 경과 여부."""
+    try:
+        ch, cm = map(int, ENTRY_CUTOFF.split(":"))
+        now = datetime.now()
+        return now >= now.replace(hour=ch, minute=cm, second=0, microsecond=0)
+    except Exception:
+        return False
+
+
 async def _try_pending() -> None:
-    """보류(하락중) 후보 재점검 — 시가 회복(반등) 시 슬롯 한도 내 진입."""
+    """보류(하락중) 후보 재점검 — 시가 회복(반등) 시 슬롯 한도 내 진입. 진입 마감 경과 시 스킵."""
     pending = get_state("pending_entries", [])
     if not pending:
+        return
+    if _past_entry_cutoff():
+        log_event("entry_skip", {"symbols": [c["symbol"] for c in pending], "reason": f"진입마감({ENTRY_CUTOFF}) 경과"})
+        await notify(f"⏭️ 보류 후보 진입마감({ENTRY_CUTOFF}) 경과 → 스킵: " +
+                     ", ".join(f"{c['name']}({c['symbol']})" for c in pending))
+        save_state("pending_entries", [])
         return
     positions = get_state("positions", [])
     slots = MAX_POS - len(positions)
@@ -748,8 +777,12 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
                 pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
                 action, reason, sell_qty = None, "", 0
+                pnl_now = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
+                # 하드 손절(PDF 절대원칙) — ATR 트레일과 무관하게 진입가 대비 -HARD_STOP_PCT% 즉시 청산
+                if HARD_STOP_PCT > 0 and pnl_now <= -HARD_STOP_PCT:
+                    sell_qty, action, reason = qty, "EXIT", f"하드 손절 ({pnl_now:.2f}% ≤ -{HARD_STOP_PCT:.0f}%)"
                 # 첫 목표 → 30% 부분익절
-                if not pos.get("partial_done") and cur >= pos["target"]:
+                elif not pos.get("partial_done") and cur >= pos["target"]:
                     sell_qty = max(1, int(qty * CFG.partial_pct / 100))
                     action, reason = "PARTIAL", f"첫 목표 도달 {CFG.partial_pct:.0f}% 익절"
                 # 트레일/손절 이탈
@@ -890,7 +923,14 @@ def print_status() -> None:
     pos = st.get("positions", [])
     print(f"보유 {len(pos)}종목:")
     for p in pos:
-        print(f"  • {p['name']}({p['symbol']}) {p['qty']}주 @{p['entry_price']:,.0f} 손절{p['stop_price']:,.0f} 목표{p['target']:,.0f} {'(부분익절)' if p.get('partial_done') else ''}")
+        cl = [b["close"] for b in get_ohlcv(p["symbol"], 130)]
+        zone = classify_zone(cl[-1], moving_average(cl, 60), moving_average(cl, 120),
+                             held=True, stop_price=p.get("stop_price")) if cl else "?"
+        print(f"  • [{zone}] {p['name']}({p['symbol']}) {p['qty']}주 @{p['entry_price']:,.0f} "
+              f"손절{p['stop_price']:,.0f} 목표{p['target']:,.0f} {'(부분익절)' if p.get('partial_done') else ''} [{p.get('mode','')}]")
+    pend = st.get("pending_entries", [])
+    if pend:
+        print(f"보류(하락중·반등대기) {len(pend)}종목: " + ", ".join(f"{c['name']}({c['symbol']})" for c in pend))
     print(f"매매일지: {JOURNAL_FILE}")
 
 

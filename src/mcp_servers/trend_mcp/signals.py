@@ -213,3 +213,32 @@ def trend_exit(
     if use_foreign_exit and foreign_net_5d is not None and foreign_net_5d < 0:
         return {"action": "SELL_ALL", "reason": f"외국인 5일 순매도 전환 ({pnl:+.2f}%)"}
     return {"action": "HOLD", "reason": f"보유 ({pnl:+.2f}%)"}
+
+
+# ─── JH ZONE (PDF 매매구역 모델) ─────────────────────────────────────────────
+
+def classify_zone(price: float, ma60: float | None, ma120: float | None, *,
+                  held: bool = False, stop_price: float | None = None) -> str:
+    """JH ZONE 판정 (PDF 모델) — GO/HOLD/CAUTION/STOP_LOSS/WATCH.
+
+    미보유(후보): GO=60일선 부근(±3%) 정배열 지지 진입최적 / WATCH=추세 위지만 진입존 밖 /
+                  CAUTION=MA60 이탈 / STOP_LOSS=MA120 이탈.
+    보유: STOP_LOSS=손절가 이탈 or MA120 이탈 / CAUTION=MA60 이탈 / HOLD=추세 유지.
+    """
+    if held:
+        if stop_price and price <= stop_price:
+            return "STOP_LOSS"
+        if ma120 is not None and price < ma120:
+            return "STOP_LOSS"
+        if ma60 is not None and price < ma60:
+            return "CAUTION"
+        return "HOLD"
+    if ma60 is None or ma120 is None:
+        return "WATCH"
+    if price < ma120:
+        return "STOP_LOSS"
+    if price < ma60:
+        return "CAUTION"
+    if ma60 > ma120 and price <= ma60 * 1.03:   # 정배열 + 60일선 ±3% 지지
+        return "GO"
+    return "WATCH"

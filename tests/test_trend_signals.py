@@ -1,6 +1,7 @@
 """trend_mcp.signals 순수함수 회귀 테스트."""
 from src.mcp_servers.trend_mcp.signals import (
     TrendConfig,
+    classify_zone,
     entry_signal,
     is_big_bullish_candle,
     is_consolidation,
@@ -109,3 +110,28 @@ def test_trend_exit_foreign():
 def test_trend_exit_hold():
     d = trend_exit(100, current_price=110, ma_support=95, stop_price=90)
     assert d["action"] == "HOLD"
+
+
+# ── JH ZONE ─────────────────────────────────────────────────────────────────
+
+def test_zone_go():
+    # 정배열(MA60>MA120) + 60일선 ±3% 지지 → GO
+    assert classify_zone(102, ma60=100, ma120=90) == "GO"
+
+
+def test_zone_watch_above_zone():
+    # 추세 위지만 60일선에서 멀리(>3%) → 진입존 밖 WATCH
+    assert classify_zone(120, ma60=100, ma120=90) == "WATCH"
+
+
+def test_zone_caution_below_ma60():
+    assert classify_zone(95, ma60=100, ma120=90) == "CAUTION"
+
+
+def test_zone_stoploss_below_ma120():
+    assert classify_zone(85, ma60=100, ma120=90) == "STOP_LOSS"
+
+
+def test_zone_held_hold_and_stop():
+    assert classify_zone(110, ma60=100, ma120=90, held=True, stop_price=95) == "HOLD"
+    assert classify_zone(94, ma60=100, ma120=90, held=True, stop_price=95) == "STOP_LOSS"

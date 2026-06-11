@@ -114,6 +114,13 @@ SCHEDULE = [(8, 50, "screen"), (9, 30, "entry"), (15, 20, "exit")]
 
 
 # ─── 알림/상태/락 ──────────────────────────────────────────────────────────
+def _html_safe(msg: str) -> str:
+    """의도한 <b>/</b> 외의 < > & 를 이스케이프 — 사유의 '<'(예: 가격비교) 가 HTML 파싱 깨뜨려
+    텔레그램 400(can't parse entities) 되던 문제 방지."""
+    return (msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+               .replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>"))
+
+
 async def notify(msg: str) -> None:
     logger.info("[NOTIFY] %s", msg[:200].replace("\n", " "))
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -121,8 +128,10 @@ async def notify(msg: str) -> None:
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
-            await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"})
+            r = await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                             json={"chat_id": TELEGRAM_CHAT_ID, "text": _html_safe(msg), "parse_mode": "HTML"})
+            if r.status_code != 200:
+                logger.warning("[TELEGRAM] 전송 실패 %s: %s", r.status_code, r.text[:200])
     except Exception as e:
         logger.warning("[TELEGRAM] %s", e)
 

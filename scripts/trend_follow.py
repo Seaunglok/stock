@@ -91,6 +91,8 @@ ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "t
 ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
 # 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
 HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
+# 청산 이평선(하방돌파 시 청산). A/B 검증(2026-06-12): MA120 >> MA50(기대값·누적 2~4배, 추세 끝까지 탑승).
+EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
 # 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
 FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
 # 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.
@@ -992,11 +994,11 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 elif cur <= stop:
                     sell_qty, action, reason = qty, "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}"
                 elif do_exit_signals:
-                    ohlcv = get_ohlcv(sym, 80)
-                    ma50 = moving_average([b["close"] for b in ohlcv] + [cur], CFG.ma_support) if ohlcv else None
+                    ohlcv = get_ohlcv(sym, EXIT_MA + 40)
+                    ma_exit = moving_average([b["close"] for b in ohlcv] + [cur], EXIT_MA) if ohlcv else None
                     foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
-                    if ma50 is not None and cur < ma50:
-                        sell_qty, action, reason = qty, "EXIT", f"MA50 이평선 하방돌파 ({cur:,.0f}<{ma50:,.0f})"
+                    if ma_exit is not None and cur < ma_exit:
+                        sell_qty, action, reason = qty, "EXIT", f"MA{EXIT_MA} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})"
                     elif USE_FOREIGN_EXIT and foreign is not None and foreign < 0:
                         sell_qty, action, reason = qty, "EXIT", "외국인 5일 순매도 전환"
                 if not action:

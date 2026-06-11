@@ -78,6 +78,8 @@ INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
 NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
+# 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).
+PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
 TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
 FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
 SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
@@ -376,6 +378,40 @@ async def _foreign_net_5d(symbol: str) -> float | None:
         return None
 
 
+async def _premarket_snapshot(symbol: str) -> dict | None:
+    """프리장(장전 동시호가, 08:00~09:00) 예상체결가·예상수량·갭%(기준가 대비).
+
+    키움 get_stock_basic_info 의 exp_cntr_pric(예상체결가)/exp_cntr_qty/base_pric 사용.
+    장전 외 시간대엔 보통 exp_cntr_pric=0 → None 반환(표시 생략).
+    """
+    try:
+        async with MCPManager({"kiwoom-market-mcp": MARKET_URL}) as mcp:
+            tool = next((t["name"] for t in (mcp.tools or []) if "basic_info" in t["name"].lower()), None)
+            if not tool:
+                return None
+            raw = await mcp.call_tool(tool, {"stock_code": symbol})
+            p = json.loads(raw) if isinstance(raw, str) else raw
+            d = p.get("data", p) if isinstance(p, dict) else {}
+            if not isinstance(d, dict):
+                return None
+
+            def _num(k: str) -> float:
+                v = d.get(k)
+                try:
+                    return abs(float(str(v).replace(",", ""))) if v not in (None, "", "0") else 0.0
+                except Exception:
+                    return 0.0
+
+            exp = _num("exp_cntr_pric")
+            base = _num("base_pric") or _num("cur_prc")
+            if exp <= 0 or base <= 0:
+                return None
+            return {"exp_price": exp, "exp_qty": _num("exp_cntr_qty"),
+                    "gap_pct": round((exp - base) / base * 100, 2)}
+    except Exception:
+        return None
+
+
 async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
     tool = "place_buy_order" if side == "buy" else "place_sell_order"
     raw = await mcp.call_tool(tool, {"stock_code": symbol, "quantity": qty,
@@ -408,11 +444,31 @@ async def phase_screen() -> list[dict]:
         else:
             logger.debug("[SCREEN] %s %s — %s", code, name, sig.reason)
     cands.sort(key=lambda x: -x["score"])
+    # 프리장(장전 동시호가) 정보 부착 — 후보에만(표시용). 검증 게이트/점수엔 미반영.
+    vetoed = []
+    for c in list(cands):
+        pm = await _premarket_snapshot(c["symbol"])
+        if not pm:
+            continue
+        c["premarket"] = pm
+        if PREMARKET_GAPDOWN_VETO > 0 and pm["gap_pct"] < -PREMARKET_GAPDOWN_VETO:
+            cands.remove(c)
+            vetoed.append((c["symbol"], c["name"], pm["gap_pct"]))
+            logger.info("[SCREEN] ✗ %s %s 프리장 갭다운 %.1f%% → 제외", c["symbol"], c["name"][:10], pm["gap_pct"])
+    if vetoed:
+        log_event("premarket_veto", {"symbols": vetoed})
     save_state("candidates", cands)
     log_event("screen_done", {"universe": len(universe), "candidates": len(cands),
                               "symbols": [c["symbol"] for c in cands]})
+
+    def _scr_line(c: dict) -> str:
+        s = f"• {c['name']}({c['symbol']}) 점수{c['score']} 손절{c['stop']:,.0f} 목표{c['target']:,.0f}"
+        pm = c.get("premarket")
+        if pm:
+            s += f"\n   프리장 예상 {pm['exp_price']:,.0f} ({pm['gap_pct']:+.1f}%) 예상량 {pm['exp_qty']:,.0f}"
+        return s
     lines = [f"🔭 추세추종 스크리닝 [{datetime.now().strftime('%m/%d %H:%M')}] 모드:{UNIVERSE_MODE}"]
-    lines += [f"• {c['name']}({c['symbol']}) 점수{c['score']} 손절{c['stop']:,.0f} 목표{c['target']:,.0f}" for c in cands[:8]] or ["진입 후보 없음"]
+    lines += [_scr_line(c) for c in cands[:8]] or ["진입 후보 없음"]
     await notify("\n".join(lines))
     return cands
 
@@ -478,7 +534,7 @@ async def phase_entry() -> None:
                 journal_append({"type": "entry", "id": jid, "symbol": c["symbol"], "name": c["name"],
                                 "mode": UNIVERSE_MODE, "qty": qty, "entry_price": entry, "stop": stop,
                                 "target": target, "score": c["score"], "rationale": c.get("gates"),
-                                "breakdown": c.get("breakdown")})
+                                "breakdown": c.get("breakdown"), "premarket": c.get("premarket")})
                 log_event("entry", {"symbol": c["symbol"], "qty": qty, "entry": entry, "stop": stop, "target": target})
                 logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
                             c["symbol"], c["name"][:10], qty, entry, stop, target, mode_tag)

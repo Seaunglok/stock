@@ -49,7 +49,7 @@ def _trades() -> list[dict]:
         rec["id"] = jid
         if t == "entry":
             rec.update({k: r.get(k) for k in ("symbol", "name", "mode", "qty", "entry_price",
-                                              "stop", "target", "score", "rationale", "ts")})
+                                              "stop", "target", "score", "rationale", "premarket", "ts")})
         elif t == "partial":
             rec["partials"].append({"qty": r.get("qty"), "price": r.get("price"), "pnl_pct": r.get("pnl_pct")})
         elif t == "exit":
@@ -132,6 +132,7 @@ async function load(){
   return `<div class="bg-slate-800 rounded p-3 mb-2"><b>${r.name||r.symbol}(${r.symbol})</b> <span class=text-xs>${r.mode||''} · id ${r.id}</span>
    ${r.closed?`<span class="${(r.net_pct||0)>0?'text-emerald-400':'text-rose-400'}"> net ${r.net_pct}% (손익비 ${r.rr_realized??'-'})</span>`:'<span class=text-amber-400> 보유중</span>'}<br>
    <span class=text-xs>진입 ${f(r.entry_price)} 손절 ${f(r.stop)} 목표 ${f(r.target)} · 근거: ${r.rationale?Object.keys(r.rationale).filter(k=>r.rationale[k]).join(','):''}</span>
+   ${r.premarket?`<br><span class="text-xs text-sky-400">프리장 예상 ${f(r.premarket.exp_price)} (${r.premarket.gap_pct>0?'+':''}${r.premarket.gap_pct}%)</span>`:''}
    <div class="grid grid-cols-3 gap-1 mt-2">
     <input id="ps_${r.id}" placeholder="심리상태" value="${last.psych||''}" class="bg-slate-700 text-xs p-1 rounded">
     <input id="mk_${r.id}" placeholder="실수분석" value="${last.mistake||''}" class="bg-slate-700 text-xs p-1 rounded">

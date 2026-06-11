@@ -81,6 +81,8 @@ NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
 # 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).
 PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
+# 09:30 진입 시 하락 중(현재가<시가)인 후보는 보류 → 장중 반등(시가 회복) 시 진입, 끝까지 안 돌면 그날 스킵.
+ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "true"
 TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
 FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
 SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
@@ -388,6 +390,35 @@ async def _foreign_net_5d(symbol: str) -> float | None:
         return None
 
 
+async def _cur_and_open(symbol: str) -> tuple[float, float]:
+    """현재가·당일 시가 (장중 방향 판정용). get_stock_basic_info cur_prc/open_pric."""
+    try:
+        async with MCPManager({"kiwoom-market-mcp": MARKET_URL}) as mcp:
+            tool = next((t["name"] for t in (mcp.tools or []) if "basic_info" in t["name"].lower()), None)
+            if not tool:
+                return 0.0, 0.0
+            raw = await mcp.call_tool(tool, {"stock_code": symbol})
+            p = json.loads(raw) if isinstance(raw, str) else raw
+            d = p.get("data", p) if isinstance(p, dict) else {}
+
+            def _num(k: str) -> float:
+                v = d.get(k) if isinstance(d, dict) else None
+                try:
+                    return abs(float(str(v).replace(",", ""))) if v not in (None, "", "0") else 0.0
+                except Exception:
+                    return 0.0
+            return _num("cur_prc"), _num("open_pric")
+    except Exception:
+        return 0.0, 0.0
+
+
+def _is_rising(cur: float, opn: float) -> bool:
+    """상승 중 = 현재가 ≥ 당일 시가. 시가/현재가 불명이면 True(차단 안 함, fail-open)."""
+    if cur <= 0 or opn <= 0:
+        return True
+    return cur >= opn
+
+
 async def _premarket_snapshot(symbol: str) -> dict | None:
     """프리장(장전 동시호가, 08:00~09:00) 예상체결가·예상수량·갭%(기준가 대비).
 
@@ -578,6 +609,46 @@ def _mark_done(label: str) -> None:
     save_state("done", done)
 
 
+async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
+    """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
+    sym = c["symbol"]
+    price = await _realtime_price(sym) or c["price"]
+    qty = max(1, int(INVEST_PER_TRADE / price))
+    resp = await _place(mcp, "buy", sym, qty)
+    ok, why = _order_accepted(resp)
+    if not ok:
+        logger.error("[REJECT] entry %s — %s", sym, why)
+        log_event("order_reject", {"phase": "entry", "symbol": sym, "why": why, "raw": resp})
+        await notify(f"❌ 진입 거부 {c['name']}({sym}) — {why}")
+        return None
+    d = resp.get("data", {}) if isinstance(resp, dict) else {}
+    fill = d.get("cntr_pric") or d.get("체결가")
+    entry = float(str(fill).lstrip("+-").replace(",", "")) if fill else price
+    # 손절/목표는 '실제 체결가' 기준 재계산 — 손익비 1:3 보존(백테스트와 동일).
+    stop = round(init_stop_price(entry, float(c["atr"]), CFG.atr_k, -CFG.stop_pct), 2)
+    target = round(entry + CFG.rr * (entry - stop), 2)
+    jid = uuid.uuid4().hex[:8]
+    pos = {"symbol": sym, "name": c["name"], "mode": UNIVERSE_MODE, "qty": qty,
+           "entry_price": entry, "stop_price": stop, "target": target, "peak_price": entry,
+           "atr": c["atr"], "score": c["score"], "buy_date": datetime.now().strftime("%Y-%m-%d"),
+           "partial_done": False, "journal_id": jid}
+    journal_append({"type": "entry", "id": jid, "symbol": sym, "name": c["name"],
+                    "mode": UNIVERSE_MODE, "qty": qty, "entry_price": entry, "stop": stop,
+                    "target": target, "score": c["score"], "rationale": c.get("gates"),
+                    "breakdown": c.get("breakdown"), "premarket": c.get("premarket")})
+    log_event("entry", {"symbol": sym, "qty": qty, "entry": entry, "stop": stop, "target": target})
+    logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
+                sym, c["name"][:10], qty, entry, stop, target, mode_tag)
+    return pos
+
+
+def _entry_notify_line(p: dict) -> str:
+    e, s, t = p["entry_price"], p["stop_price"], p["target"]
+    rr = (t - e) / (e - s) if e > s else 0.0
+    return (f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 @{e:,.0f} (≈{e*p['qty']:,.0f}원)\n"
+            f"   손절 {s:,.0f} / 목표 {t:,.0f} (손익비 1:{rr:.1f}) · 점수 {p['score']}")
+
+
 async def phase_entry() -> None:
     logger.info("=" * 56); logger.info("[ENTRY] %s", datetime.now().strftime("%H:%M:%S"))
     log_event("phase_start", {"phase": "entry"})
@@ -591,56 +662,72 @@ async def phase_entry() -> None:
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
         return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
-    bought = []
+    bought, pending = [], []
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
                 await notify("❌ trading-domain 연결 실패")
                 return
-            for c in cands[:slots]:
-                price = await _realtime_price(c["symbol"]) or c["price"]
-                qty = max(1, int(INVEST_PER_TRADE / price))
-                resp = await _place(mcp, "buy", c["symbol"], qty)
-                ok, why = _order_accepted(resp)
-                if not ok:
-                    logger.error("[REJECT] entry %s — %s", c["symbol"], why)
-                    log_event("order_reject", {"phase": "entry", "symbol": c["symbol"], "why": why, "raw": resp})
-                    await notify(f"❌ 진입 거부 {c['name']}({c['symbol']}) — {why}")
-                    continue
-                # 실체결가 추정 (없으면 직전가)
-                d = resp.get("data", {}) if isinstance(resp, dict) else {}
-                fill = d.get("cntr_pric") or d.get("체결가")
-                entry = float(str(fill).lstrip("+-").replace(",", "")) if fill else price
-                # 손절/목표는 '실제 체결가' 기준으로 재계산 — 손익비 1:3 보존(백테스트와 동일).
-                # 스크린 시점가(c["stop"]/c["target"])는 진입가와 달라 1:3 이 틀어질 수 있음.
-                stop = round(init_stop_price(entry, float(c["atr"]), CFG.atr_k, -CFG.stop_pct), 2)
-                target = round(entry + CFG.rr * (entry - stop), 2)
-                jid = uuid.uuid4().hex[:8]
-                pos = {"symbol": c["symbol"], "name": c["name"], "mode": UNIVERSE_MODE, "qty": qty,
-                       "entry_price": entry, "stop_price": stop, "target": target, "peak_price": entry,
-                       "atr": c["atr"], "score": c["score"], "buy_date": datetime.now().strftime("%Y-%m-%d"),
-                       "partial_done": False, "journal_id": jid}
-                positions.append(pos)
-                bought.append(pos)
-                journal_append({"type": "entry", "id": jid, "symbol": c["symbol"], "name": c["name"],
-                                "mode": UNIVERSE_MODE, "qty": qty, "entry_price": entry, "stop": stop,
-                                "target": target, "score": c["score"], "rationale": c.get("gates"),
-                                "breakdown": c.get("breakdown"), "premarket": c.get("premarket")})
-                log_event("entry", {"symbol": c["symbol"], "qty": qty, "entry": entry, "stop": stop, "target": target})
-                logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
-                            c["symbol"], c["name"][:10], qty, entry, stop, target, mode_tag)
+            for c in cands:
+                if len(bought) >= slots:
+                    break
+                if ENTRY_WAIT_FALLING:
+                    cur, opn = await _cur_and_open(c["symbol"])
+                    if not _is_rising(cur, opn):
+                        pending.append(c)
+                        logger.info("[ENTRY] %s %-10s 하락중(현재%.0f<시가%.0f) → 보류", c["symbol"], c["name"][:10], cur, opn)
+                        continue
+                pos = await _buy_one(mcp, c, mode_tag)
+                if pos:
+                    positions.append(pos); bought.append(pos)
     except Exception as e:
         logger.error("[ENTRY] %s", e); await notify(f"❌ 진입 오류: {e}"); return
     save_state("positions", positions)
-    if bought:
+    save_state("pending_entries", pending)
+    if bought or pending:
         _mark_done("entry")
-        def _entry_line(p: dict) -> str:
-            e, s, t = p["entry_price"], p["stop_price"], p["target"]
-            rr = (t - e) / (e - s) if e > s else 0.0
-            amt = e * p["qty"]
-            return (f"• <b>{p['name']}</b>({p['symbol']}) {p['qty']}주 @{e:,.0f} (≈{amt:,.0f}원)\n"
-                    f"   손절 {s:,.0f} / 목표 {t:,.0f} (손익비 1:{rr:.1f}) · 점수 {p['score']}")
-        await notify(f"✅ 추세추종 진입 {mode_tag}\n" + "\n".join(_entry_line(p) for p in bought))
+    if bought:
+        await notify(f"✅ 추세추종 진입 {mode_tag}\n" + "\n".join(_entry_notify_line(p) for p in bought))
+    if pending:
+        await notify("⏳ 하락 중 보류 (반등=시가 회복 시 진입, 끝까지 미반등 시 그날 스킵)\n" +
+                     "\n".join(f"• {c['name']}({c['symbol']}) 점수{c['score']}" for c in pending))
+
+
+async def _try_pending() -> None:
+    """보류(하락중) 후보 재점검 — 시가 회복(반등) 시 슬롯 한도 내 진입."""
+    pending = get_state("pending_entries", [])
+    if not pending:
+        return
+    positions = get_state("positions", [])
+    slots = MAX_POS - len(positions)
+    if slots <= 0:
+        save_state("pending_entries", [])
+        return
+    mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
+    still, bought = [], []
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                return
+            for c in pending:
+                if len(bought) >= slots:
+                    still.append(c); continue
+                cur, opn = await _cur_and_open(c["symbol"])
+                if _is_rising(cur, opn):
+                    pos = await _buy_one(mcp, c, mode_tag)
+                    if pos:
+                        positions.append(pos); bought.append(pos)
+                    else:
+                        still.append(c)
+                else:
+                    still.append(c)
+    except Exception as e:
+        logger.error("[PENDING] %s", e); return
+    if bought:
+        save_state("positions", positions)
+    save_state("pending_entries", still)
+    if bought:
+        await notify(f"✅ 추세추종 보류분 진입(반등 확인) {mode_tag}\n" + "\n".join(_entry_notify_line(p) for p in bought))
 
 
 # ─── 포지션 관리 공통 (트레일/목표/청산) ──────────────────────────────────────
@@ -720,12 +807,20 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
 
 async def phase_intraday() -> None:
     log_event("phase_start", {"phase": "intraday"})
+    await _try_pending()      # 보류(하락중) 후보 반등 시 진입
     await _manage(do_exit_signals=False, when="intraday")
 
 
 async def phase_exit() -> None:
     logger.info("=" * 56); logger.info("[EXIT] %s", datetime.now().strftime("%H:%M:%S"))
     log_event("phase_start", {"phase": "exit"})
+    # 장중 끝까지 반등 못한 보류 후보 → 그날 진입 스킵
+    pend = get_state("pending_entries", [])
+    if pend:
+        log_event("entry_skip", {"symbols": [c["symbol"] for c in pend], "reason": "장중 미반등"})
+        await notify("⏭️ 보류 후보 진입 스킵 (장중 시가 회복 실패): " +
+                     ", ".join(f"{c['name']}({c['symbol']})" for c in pend))
+        save_state("pending_entries", [])
     await phase_reconcile()   # 신규 계좌 보유분 편입 후 청산판단
     await _manage(do_exit_signals=True, when="exit")
 
@@ -773,9 +868,10 @@ async def scheduler_daemon() -> None:
         wait = (nxt - now).total_seconds()
         logger.info("[DAEMON] 다음: %s @ %s (%.0f분)", phase, nxt.strftime("%m/%d %H:%M"), wait / 60)
         while wait > 0:
-            cap = INTRADAY_POLL_MIN * 60 if (get_state("positions") and _is_market_hours(datetime.now())) else 1800
+            active = bool(get_state("positions") or get_state("pending_entries"))
+            cap = INTRADAY_POLL_MIN * 60 if (active and _is_market_hours(datetime.now())) else 1800
             await asyncio.sleep(min(wait, cap)); wait -= min(wait, cap)
-            if get_state("positions") and _is_market_hours(datetime.now()) and datetime.now() < nxt:
+            if (get_state("positions") or get_state("pending_entries")) and _is_market_hours(datetime.now()) and datetime.now() < nxt:
                 try:
                     await phase_intraday()
                 except Exception as e:

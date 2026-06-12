@@ -70,7 +70,13 @@ TREND_UNIVERSE=watchlist            # watchlist(기본) | largecap | gainers(v2)
 TREND_WATCHLIST=005930,000660       # watchlist 모드 종목 (삼성전자·SK하이닉스)
 TREND_TOP_N=100                     # largecap 시총상위 / gainers 등락률상위(30)
 TREND_MIN_VALUE_KRW=1e11            # 거래대금 floor 1,000억 (잡주/저유동 배제)
-TREND_MAX_POS=5  TREND_INVEST_PER_TRADE=500000
+TREND_MAX_POS=10                    # 최대 동시 보유(편입분 포함). .env 영속
+TREND_SIZING_MODE=pct_equity        # pct_equity(예탁자산 %) | fixed(고정금액)
+TREND_POSITION_PCT=8                 # 종목당 예탁자산의 8% (현금 한도 내). 10종목 ≈ 80% 투입·20% 버퍼
+TREND_INVEST_PER_TRADE=500000       # fixed 모드 또는 예탁자산 조회 실패 시 폴백
+TREND_EXIT_MA=120                   # 청산 이평선(A/B 검증 채택). MA50→MA120
+TREND_ENTRY_WAIT_FALLING=true TREND_ENTRY_CUTOFF=10:30  # 하락 보류→반등 진입, 마감시각
+TREND_HARD_STOP_PCT=0               # 하드손절 %(0=off, ATR 트레일 우월)
 TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_PULLBACK_PCT=3 TREND_RS_DAYS=60
 TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
 TREND_STOP_PCT=7 TREND_ATR_K=2.0 TREND_RR=3 TREND_PARTIAL_PCT=30

@@ -80,6 +80,9 @@ TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 1
 MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
 MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
+# 포지션 사이징: pct_equity=예탁자산의 POSITION_PCT% (현금 한도 내) / fixed=INVEST_PER_TRADE 고정.
+SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
+POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "8"))
 USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
 NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
@@ -553,6 +556,48 @@ async def phase_reconcile() -> None:
                                for p in adopted))
 
 
+async def _account_equity() -> tuple[float, float]:
+    """(추정예탁자산, 예수금현금) — 포지션 사이징용. 실패 시 (0,0)."""
+    try:
+        async with MCPManager({"portfolio-domain": PORTFOLIO_URL}) as mcp:
+            names = [t["name"] for t in (mcp.tools or [])]
+            tool = (next((n for n in names if "evaluation" in n.lower()), None)
+                    or next((n for n in names if "balance" in n.lower()), None))
+            if not tool:
+                return 0.0, 0.0
+            raw = await mcp.call_tool(tool, {})
+            d = (json.loads(raw) if isinstance(raw, str) else raw).get("data", {}) if raw else {}
+            if not isinstance(d, dict):
+                return 0.0, 0.0
+
+            def _num(k: str) -> float:
+                s = str(d.get(k, "0")); neg = s.startswith("-"); s = s.lstrip("+-").lstrip("0") or "0"
+                try:
+                    return -float(s) if neg else float(s)
+                except Exception:
+                    return 0.0
+            equity = _num("prsm_dpst_aset_amt") or _num("tot_est_amt")
+            cash = _num("entr") or _num("d2_entra")
+            return equity, cash
+    except Exception:
+        return 0.0, 0.0
+
+
+async def _size_qty(price: float) -> int:
+    """가격 → 매수 수량. pct_equity: 예탁자산 POSITION_PCT% (현금 한도 내). fixed: INVEST_PER_TRADE."""
+    if price <= 0:
+        return 0
+    if SIZING_MODE == "pct_equity":
+        equity, cash = await _account_equity()
+        if equity > 0:
+            qty = int(equity * POSITION_PCT / 100.0 / price)
+            if cash > 0:
+                qty = min(qty, int(cash / price))     # 현금 한도
+            return max(0, qty)
+        logger.warning("[SIZE] 예탁자산 조회 실패 → 고정금액 폴백")
+    return max(1, int(INVEST_PER_TRADE / price))
+
+
 async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
     tool = "place_buy_order" if side == "buy" else "place_sell_order"
     raw = await mcp.call_tool(tool, {"stock_code": symbol, "quantity": qty,
@@ -787,7 +832,10 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
         return None
     price = await _realtime_price(sym) or c["price"]
-    qty = max(1, int(INVEST_PER_TRADE / price))
+    qty = await _size_qty(price)
+    if qty < 1:
+        logger.warning("[ENTRY] %s 현금 부족/수량 0 — 스킵 (price %.0f)", sym, price)
+        return None
     resp = await _place(mcp, "buy", sym, qty)
     ok, why = _order_accepted(resp)
     if not ok:

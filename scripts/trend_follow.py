@@ -374,64 +374,63 @@ def _order_accepted(parsed: Any) -> tuple[bool, str]:
     return False, f"rc={rc} {str(d.get('return_msg',''))[:80]}"
 
 
+async def _kiwoom_call(server_key: str, url: str, tool_kw, args: dict) -> dict:
+    """키움 MCP 단일 호출 → data dict. tool_kw: 도구명 부분일치 키워드(str/tuple). 실패 시 {}.
+
+    헬퍼들의 'MCPManager 열기 → tool 검색 → call → json → data' 보일러플레이트 단일화.
+    """
+    kws = (tool_kw,) if isinstance(tool_kw, str) else tuple(tool_kw)
+    try:
+        async with MCPManager({server_key: url}) as mcp:
+            tool = next((t["name"] for t in (mcp.tools or [])
+                         if any(k in t["name"].lower() for k in kws)), None)
+            if not tool:
+                return {}
+            raw = await mcp.call_tool(tool, args)
+            p = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(p, dict):
+                return {}
+            d = p.get("data", p)
+            return d if isinstance(d, dict) else {}
+    except Exception as e:
+        logger.debug("[KIWOOM] %s %s 실패: %s", server_key, kws, e)
+        return {}
+
+
+def _num(d: dict, key: str, abs_val: bool = False) -> float:
+    """키움 숫자필드 파싱(콤마/부호/제로패딩 처리). 없으면 0.0. abs_val=True면 절대값."""
+    v = d.get(key) if isinstance(d, dict) else None
+    if v in (None, ""):
+        return 0.0
+    try:
+        f = float(str(v).replace(",", ""))
+    except Exception:
+        return 0.0
+    return abs(f) if abs_val else f
+
+
 async def _realtime_price(symbol: str) -> float | None:
     for key, url in [("kiwoom-market-mcp", MARKET_URL), ("trading-domain", TRADING_URL)]:
-        try:
-            async with MCPManager({key: url}) as mcp:
-                if not mcp.tools:
-                    continue
-                tool = next((t["name"] for t in mcp.tools
-                             if any(k in t["name"].lower() for k in ("basic_info", "current_price", "quote"))), None)
-                if not tool:
-                    continue
-                raw = await mcp.call_tool(tool, {"stock_code": symbol})
-                p = json.loads(raw) if isinstance(raw, str) else raw
-                d = p.get("data", p) if isinstance(p, dict) else {}
-                for k in ("cur_prc", "current_price", "현재가", "stck_prpr", "price", "close"):
-                    v = d.get(k) if isinstance(d, dict) else None
-                    if v:
-                        return float(str(v).lstrip("+-").replace(",", ""))
-        except Exception:
-            continue
+        d = await _kiwoom_call(key, url, ("basic_info", "current_price", "quote"), {"stock_code": symbol})
+        for k in ("cur_prc", "current_price", "현재가", "stck_prpr", "price", "close"):
+            f = _num(d, k, abs_val=True)
+            if f:
+                return f
     return None
 
 
 async def _foreign_net_5d(symbol: str) -> float | None:
-    try:
-        async with MCPManager({"investor-domain": INVESTOR_URL}) as mcp:
-            tool = next((t["name"] for t in (mcp.tools or [])
-                         if any(k in t["name"].lower() for k in ("foreign", "investor", "trading"))), None)
-            if not tool:
-                return None
-            raw = await mcp.call_tool(tool, {"stock_code": symbol})
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            d = p.get("data", p) if isinstance(p, dict) else {}
-            v = d.get("foreign_net_5d") or d.get("외국인_5일_순매수") if isinstance(d, dict) else None
-            return float(v) if v is not None else None
-    except Exception:
-        return None
+    d = await _kiwoom_call("investor-domain", INVESTOR_URL, ("foreign", "investor", "trading"), {"stock_code": symbol})
+    for k in ("foreign_net_5d", "외국인_5일_순매수"):
+        if d.get(k) not in (None, ""):
+            return _num(d, k)
+    return None
 
 
 async def _cur_and_open(symbol: str) -> tuple[float, float]:
     """현재가·당일 시가 (장중 방향 판정용). get_stock_basic_info cur_prc/open_pric."""
-    try:
-        async with MCPManager({"kiwoom-market-mcp": MARKET_URL}) as mcp:
-            tool = next((t["name"] for t in (mcp.tools or []) if "basic_info" in t["name"].lower()), None)
-            if not tool:
-                return 0.0, 0.0
-            raw = await mcp.call_tool(tool, {"stock_code": symbol})
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            d = p.get("data", p) if isinstance(p, dict) else {}
-
-            def _num(k: str) -> float:
-                v = d.get(k) if isinstance(d, dict) else None
-                try:
-                    return abs(float(str(v).replace(",", ""))) if v not in (None, "", "0") else 0.0
-                except Exception:
-                    return 0.0
-            return _num("cur_prc"), _num("open_pric")
-    except Exception:
-        return 0.0, 0.0
+    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": symbol})
+    return _num(d, "cur_prc", abs_val=True), _num(d, "open_pric", abs_val=True)
 
 
 def _is_rising(cur: float, opn: float) -> bool:
@@ -447,68 +446,32 @@ async def _premarket_snapshot(symbol: str) -> dict | None:
     키움 get_stock_basic_info 의 exp_cntr_pric(예상체결가)/exp_cntr_qty/base_pric 사용.
     장전 외 시간대엔 보통 exp_cntr_pric=0 → None 반환(표시 생략).
     """
-    try:
-        async with MCPManager({"kiwoom-market-mcp": MARKET_URL}) as mcp:
-            tool = next((t["name"] for t in (mcp.tools or []) if "basic_info" in t["name"].lower()), None)
-            if not tool:
-                return None
-            raw = await mcp.call_tool(tool, {"stock_code": symbol})
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            d = p.get("data", p) if isinstance(p, dict) else {}
-            if not isinstance(d, dict):
-                return None
-
-            def _num(k: str) -> float:
-                v = d.get(k)
-                try:
-                    return abs(float(str(v).replace(",", ""))) if v not in (None, "", "0") else 0.0
-                except Exception:
-                    return 0.0
-
-            exp = _num("exp_cntr_pric")
-            base = _num("base_pric") or _num("cur_prc")
-            if exp <= 0 or base <= 0:
-                return None
-            return {"exp_price": exp, "exp_qty": _num("exp_cntr_qty"),
-                    "gap_pct": round((exp - base) / base * 100, 2)}
-    except Exception:
+    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": symbol})
+    exp = _num(d, "exp_cntr_pric", abs_val=True)
+    base = _num(d, "base_pric", abs_val=True) or _num(d, "cur_prc", abs_val=True)
+    if exp <= 0 or base <= 0:
         return None
+    return {"exp_price": exp, "exp_qty": _num(d, "exp_cntr_qty", abs_val=True),
+            "gap_pct": round((exp - base) / base * 100, 2)}
 
 
 def _kint(s: Any) -> int:
     """키움 제로패딩/부호 문자열 → int."""
-    s = str(s); neg = s.startswith("-")
-    s = s.lstrip("+-").lstrip("0") or "0"
-    try:
-        v = int(s)
-    except Exception:
-        v = 0
-    return -v if neg else v
+    return int(_num({"_": s}, "_"))
 
 
 async def _broker_holdings() -> list[dict]:
     """계좌 보유종목 [{symbol,name,qty,avg,cur}]. get_account_evaluation 파싱."""
-    try:
-        async with MCPManager({"portfolio-domain": PORTFOLIO_URL}) as mcp:
-            tool = next((t["name"] for t in (mcp.tools or []) if "evaluation" in t["name"].lower()), None)
-            if not tool:
-                return []
-            raw = await mcp.call_tool(tool, {})
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            d = p.get("data", {}) if isinstance(p, dict) else {}
-            rows = d.get("stk_acnt_evlt_prst", []) if isinstance(d, dict) else []
-            out = []
-            for r in rows:
-                code = str(r.get("stk_cd", "")).lstrip("A")
-                qty = _kint(r.get("rmnd_qty", 0))
-                if not code or qty <= 0:
-                    continue
-                out.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty,
-                            "avg": _kint(r.get("avg_prc", 0)), "cur": _kint(r.get("cur_prc", 0))})
-            return out
-    except Exception as e:
-        logger.warning("[RECONCILE] 계좌조회 실패: %s", e)
-        return []
+    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
+    out = []
+    for r in (d.get("stk_acnt_evlt_prst") or []):
+        code = str(r.get("stk_cd", "")).lstrip("A")
+        qty = _kint(r.get("rmnd_qty", 0))
+        if not code or qty <= 0:
+            continue
+        out.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty,
+                    "avg": _kint(r.get("avg_prc", 0)), "cur": _kint(r.get("cur_prc", 0))})
+    return out
 
 
 async def phase_reconcile() -> None:
@@ -557,30 +520,14 @@ async def phase_reconcile() -> None:
 
 
 async def _account_equity() -> tuple[float, float]:
-    """(추정예탁자산, 예수금현금) — 포지션 사이징용. 실패 시 (0,0)."""
-    try:
-        async with MCPManager({"portfolio-domain": PORTFOLIO_URL}) as mcp:
-            names = [t["name"] for t in (mcp.tools or [])]
-            tool = (next((n for n in names if "evaluation" in n.lower()), None)
-                    or next((n for n in names if "balance" in n.lower()), None))
-            if not tool:
-                return 0.0, 0.0
-            raw = await mcp.call_tool(tool, {})
-            d = (json.loads(raw) if isinstance(raw, str) else raw).get("data", {}) if raw else {}
-            if not isinstance(d, dict):
-                return 0.0, 0.0
+    """(추정예탁자산, 예수금현금) — 포지션 사이징용. 실패 시 (0,0).
 
-            def _num(k: str) -> float:
-                s = str(d.get(k, "0")); neg = s.startswith("-"); s = s.lstrip("+-").lstrip("0") or "0"
-                try:
-                    return -float(s) if neg else float(s)
-                except Exception:
-                    return 0.0
-            equity = _num("prsm_dpst_aset_amt") or _num("tot_est_amt")
-            cash = _num("entr") or _num("d2_entra")
-            return equity, cash
-    except Exception:
-        return 0.0, 0.0
+    반드시 get_account_evaluation 사용(get_account_balance 엔 prsm_dpst_aset_amt 없음 → 예탁자산 0 폴백 버그).
+    """
+    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
+    equity = _num(d, "prsm_dpst_aset_amt") or _num(d, "tot_est_amt")
+    cash = _num(d, "entr") or _num(d, "d2_entra")
+    return equity, cash
 
 
 async def _size_qty(price: float) -> int:

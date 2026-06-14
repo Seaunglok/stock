@@ -376,6 +376,33 @@ def _mark_done(label: str) -> None:
     save_state("done", done)
 
 
+async def _circuit_broken() -> tuple[bool, str]:
+    """일일 최대손실 서킷브레이커 — 당일 실현손실(net)이 예탁자산의 DAILY_LOSS_LIMIT_PCT% 초과 시 (True, 사유).
+
+    신규 진입만 차단(보유분 청산은 계속). DAILY_LOSS_LIMIT_PCT=0 이면 off.
+    """
+    if DAILY_LOSS_LIMIT_PCT <= 0 or not JOURNAL_FILE.exists():
+        return False, ""
+    today = datetime.now().strftime("%Y-%m-%d")
+    realized = 0.0
+    try:
+        for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r.get("type") == "exit" and str(r.get("ts", "")).startswith(today):
+                realized += r.get("entry_price", 0) * r.get("qty", 0) * r.get("net_pct", 0) / 100.0
+    except Exception:
+        return False, ""
+    if realized >= 0:
+        return False, ""
+    equity, _ = await _account_equity()
+    if equity <= 0:
+        return False, ""
+    limit = equity * DAILY_LOSS_LIMIT_PCT / 100.0
+    if -realized >= limit:
+        return True, f"당일 실현손실 {realized:,.0f}원 ≥ 한도 {limit:,.0f}원({DAILY_LOSS_LIMIT_PCT:g}%)"
+    return False, ""
+
+
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
@@ -475,6 +502,11 @@ async def phase_entry() -> None:
     if not cands or slots <= 0:
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
         return
+    broken, why = await _circuit_broken()
+    if broken:
+        log_event("circuit_break", {"phase": "entry", "reason": why})
+        await notify(f"🛑 서킷브레이커 — 신규 진입 중단\n{why}")
+        return
     cands = await _apply_sector_rally(cands)
     if not cands:
         await notify("⏭️ 주도섹터 게이트: 주도섹터 소속 후보 없음 — 진입 스킵")
@@ -536,6 +568,10 @@ async def _try_pending() -> None:
     slots = MAX_POS - len(positions)
     if slots <= 0:
         save_state("pending_entries", [])
+        return
+    broken, why = await _circuit_broken()
+    if broken:
+        log_event("circuit_break", {"phase": "pending", "reason": why})
         return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     still, bought = [], []

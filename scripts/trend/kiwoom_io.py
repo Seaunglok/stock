@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -133,12 +134,23 @@ async def _account_equity() -> tuple[float, float]:
     return equity, cash
 
 
-async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
-    """시장가 주문(order_type 03). mcp = 열려있는 trading-domain MCPManager."""
+async def _place(mcp, side: str, symbol: str, qty: int, *, timeout: float = 10.0, retries: int = 1) -> Any:
+    """시장가 주문(order_type 03) — 타임아웃 + 재시도. mcp = 열려있는 trading-domain MCPManager.
+
+    호출 자체 실패(타임아웃/예외)는 {"success": False} 반환 → _order_accepted 가 거부로 판정(유령 방지).
+    """
     tool = "place_buy_order" if side == "buy" else "place_sell_order"
-    raw = await mcp.call_tool(tool, {"stock_code": symbol, "quantity": qty,
-                                     "price": None, "order_type": "03", "account_no": ACCOUNT_NO})
-    return json.loads(raw) if isinstance(raw, str) else raw
+    args = {"stock_code": symbol, "quantity": qty, "price": None,
+            "order_type": "03", "account_no": ACCOUNT_NO}
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            raw = await asyncio.wait_for(mcp.call_tool(tool, args), timeout=timeout)
+            return json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            last = e
+            logger.warning("[ORDER] %s %s 시도%d/%d 실패: %s", side, symbol, attempt + 1, retries + 1, e)
+    return {"success": False, "error": f"주문 호출 실패: {last}"}
 
 
 async def _sector_index_rows() -> list[dict] | None:

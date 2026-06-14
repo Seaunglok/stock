@@ -77,6 +77,7 @@ TREND_INVEST_PER_TRADE=500000       # fixed 모드 또는 예탁자산 조회 �
 TREND_EXIT_MA=120                   # 청산 이평선(A/B 검증 채택). MA50→MA120
 TREND_ENTRY_WAIT_FALLING=true TREND_ENTRY_CUTOFF=10:30  # 하락 보류→반등 진입, 마감시각
 TREND_HARD_STOP_PCT=0               # 하드손절 %(0=off, ATR 트레일 우월)
+TREND_DAILY_LOSS_LIMIT_PCT=0        # 일일 최대손실 서킷브레이커: 당일 실현손실>예탁자산 X% 시 신규진입 중단(0=off)
 TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_PULLBACK_PCT=3 TREND_RS_DAYS=60
 TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
 TREND_STOP_PCT=7 TREND_ATR_K=2.0 TREND_RR=3 TREND_PARTIAL_PCT=30
@@ -104,9 +105,10 @@ python -m pytest tests/test_trend_signals.py -q
 ```
 
 ## 파일
-- `src/mcp_servers/trend_mcp/signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산 + `classify_zone` JH ZONE + `fundamentals_bonus` 실적 + `leading_sectors` 주도섹터). scorer·exit_rules 재사용.
-- `scripts/backtest_trend.py` — 비용포함 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`). `backtest_dynamic`·`backtest_walkforward` 재사용.
-- `scripts/trend_follow.py` — MOCK 라이브 데몬(스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 실적·섹터 가점) + 매매일지 + 일별로그.
+- `src/mcp_servers/trend_mcp/signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산 + `classify_zone` JH ZONE + `fundamentals_bonus` 실적 + `leading_sectors` 주도섹터 + `position_size`/`exit_decision`/`is_rising` 실행결정). scorer·exit_rules 재사용.
+- `scripts/backtest_trend.py` — 비용포함 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`) + A/B(`--abtest`). `backtest_dynamic`·`backtest_walkforward` 재사용.
+- `scripts/trend/` — 데몬 레이어 패키지: `config.py`(env·상수·logger), `kiwoom_io.py`(키움 MCP I/O), `market_data.py`(pykrx 시세/유니버스).
+- `scripts/trend_follow.py` — MOCK 라이브 데몬(상태/락/매매일지/알림 + 스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 실적·섹터 가점 + 일일손실 서킷브레이커) + 일별로그.
 - `scripts/trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지, 프리장·근거 표시).
 - `tests/test_trend_signals.py` — 순수함수 회귀(54: 지표/진입/청산 + JH ZONE 6 + 실적 3 + 주도섹터 3).
 

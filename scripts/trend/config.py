@@ -1,0 +1,119 @@
+"""추세추종 데몬 공유 설정 — .env 로드 + 상수 + 로거 (scripts/trend/config.py).
+
+trend_follow.py / kiwoom_io.py / market_data.py 가 공유. import 시 .env 로드 + 로깅 설정 1회.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[2]   # scripts/trend/config.py → repo root
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+from src.mcp_servers.trend_mcp.signals import TrendConfig  # noqa: E402
+
+
+def _load_env() -> None:
+    env = _ROOT / ".env"
+    if not env.exists():
+        return
+    for line in env.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+_load_env()
+
+# 외부 라이브러리 로그 억제
+logging.Handler.handleError = lambda self, record: None  # noqa: E731
+for _n in ("pykrx", "pykrx.website", "FinanceDataReader", "requests", "urllib3", "httpx"):
+    logging.getLogger(_n).setLevel(logging.ERROR)
+logging.getLogger().setLevel(logging.WARNING)
+
+# ─── 설정 ──────────────────────────────────────────────────────────────────
+ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
+MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
+TRADING_URL = "http://localhost:8030/mcp/"
+MARKET_URL = "http://localhost:8031/mcp/"
+INFO_URL = "http://localhost:8032/mcp/"
+INVESTOR_URL = "http://localhost:8033/mcp/"
+PORTFOLIO_URL = "http://localhost:8034/mcp/"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "watchlist")   # 기본 watchlist (검증 최고)
+WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").split(",") if c.strip()]
+TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 100))
+MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
+MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
+INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
+# 포지션 사이징: pct_equity=예탁자산의 POSITION_PCT% (현금 한도 내) / fixed=INVEST_PER_TRADE 고정.
+SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
+POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "8"))
+USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
+NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
+INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
+# 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).
+PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
+# 09:30 진입 시 하락 중(현재가<시가)인 후보는 보류 → 장중 반등(시가 회복) 시 진입, 끝까지 안 돌면 그날 스킵.
+ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "true"
+# 신규 진입 허용 마감 시각(PDF: 09:30~10:30만 진입). 이후 보류분은 그날 스킵. "HH:MM".
+ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
+# 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
+HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
+# 청산 이평선(하방돌파 시 청산). A/B 검증(2026-06-12): MA120 >> MA50(기대값·누적 2~4배, 추세 끝까지 탑승).
+EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
+# 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
+FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
+# 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.
+SECTOR_BONUS = float(os.getenv("TREND_SECTOR_BONUS", "5") or 0)
+# true 면 주도섹터 소속 후보만 진입(하드 게이트). 기본 false(가점만) — 검증된 게이트 엣지 보존.
+SECTOR_GATE = os.getenv("TREND_SECTOR_GATE", "false").lower() == "true"
+SECTOR_MIN_AVG = float(os.getenv("TREND_SECTOR_MIN_AVG", "1.0"))     # 주도 판정: 섹터 평균 등락률 하한 %
+SECTOR_BREADTH = float(os.getenv("TREND_SECTOR_BREADTH", "0.6"))    # 주도 판정: 상승종목 비율 하한 (집단상승)
+SECTOR_TOP_K = int(os.getenv("TREND_SECTOR_TOP_K", "3"))
+TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
+FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
+SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
+ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
+FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
+# 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "0") or 0)
+
+CFG = TrendConfig(
+    mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),
+    stop_pct=float(os.getenv("TREND_STOP_PCT", "7")),
+    atr_k=float(os.getenv("TREND_ATR_K", "2.0")),
+    rr=float(os.getenv("TREND_RR", "3.0")),
+    partial_pct=float(os.getenv("TREND_PARTIAL_PCT", "30")),
+)
+
+DATA_DIR = _ROOT / "data" / "trend_follow"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = DATA_DIR / "state.json"
+LOCK_FILE = DATA_DIR / "daemon.lock"
+JOURNAL_FILE = DATA_DIR / "journal.jsonl"
+LOG_DIR = _ROOT / "logs" / "trend_follow"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "trend_follow.log"
+
+_fh = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=30, encoding="utf-8")
+_fh.suffix = "%Y-%m-%d"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout), _fh])
+logger = logging.getLogger("trend")
+
+SCHEDULE = [(8, 50, "screen"), (9, 30, "entry"), (15, 20, "exit")]

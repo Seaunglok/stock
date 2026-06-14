@@ -26,35 +26,15 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(_ROOT))
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-logging.Handler.handleError = lambda self, record: None  # noqa: E731
-for _n in ("pykrx", "pykrx.website", "FinanceDataReader", "requests", "urllib3", "httpx"):
-    logging.getLogger(_n).setLevel(logging.ERROR)
-logging.getLogger().setLevel(logging.WARNING)
+sys.path.insert(0, str(Path(__file__).parent))   # scripts/ → trend 패키지 import 가능
 
-
-def _load_env() -> None:
-    env = _ROOT / ".env"
-    if not env.exists():
-        return
-    for line in env.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        k, v = k.strip(), v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
-            os.environ[k] = v
-
-
-_load_env()
-
-import contextlib as _ctx, io as _io  # noqa: E402
-with _ctx.redirect_stdout(_io.StringIO()):
-    from pykrx import stock as krx  # noqa: E402
-del _ctx, _io
+from trend.config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
+from trend.config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
+from trend.kiwoom_io import (               # noqa: E402
+    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _order_accepted,
+    _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
+)
+from trend.market_data import get_kospi_closes, get_ohlcv, get_universe  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
@@ -63,78 +43,7 @@ from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     fundamentals_bonus, leading_sectors, position_size, exit_decision, is_rising,
 )
 
-# ─── 설정 ──────────────────────────────────────────────────────────────────
-ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
-MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
-TRADING_URL = "http://localhost:8030/mcp/"
-MARKET_URL  = "http://localhost:8031/mcp/"
-INFO_URL = "http://localhost:8032/mcp/"
-INVESTOR_URL = "http://localhost:8033/mcp/"
-PORTFOLIO_URL = "http://localhost:8034/mcp/"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "watchlist")   # 기본 watchlist (검증 최고)
-WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").split(",") if c.strip()]
-TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 100))
-MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
-MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
-INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
-# 포지션 사이징: pct_equity=예탁자산의 POSITION_PCT% (현금 한도 내) / fixed=INVEST_PER_TRADE 고정.
-SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
-POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "8"))
-USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
-NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
-INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
-# 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).
-PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
-# 09:30 진입 시 하락 중(현재가<시가)인 후보는 보류 → 장중 반등(시가 회복) 시 진입, 끝까지 안 돌면 그날 스킵.
-ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "true"
-# 신규 진입 허용 마감 시각(PDF: 09:30~10:30만 진입). 이후 보류분은 그날 스킵. "HH:MM".
-ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
-# 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
-HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
-# 청산 이평선(하방돌파 시 청산). A/B 검증(2026-06-12): MA120 >> MA50(기대값·누적 2~4배, 추세 끝까지 탑승).
-EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
-# 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
-FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
-# 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.
-SECTOR_BONUS = float(os.getenv("TREND_SECTOR_BONUS", "5") or 0)
-# true 면 주도섹터 소속 후보만 진입(하드 게이트). 기본 false(가점만) — 검증된 게이트 엣지 보존.
-SECTOR_GATE = os.getenv("TREND_SECTOR_GATE", "false").lower() == "true"
-SECTOR_MIN_AVG = float(os.getenv("TREND_SECTOR_MIN_AVG", "1.0"))     # 주도 판정: 섹터 평균 등락률 하한 %
-SECTOR_BREADTH = float(os.getenv("TREND_SECTOR_BREADTH", "0.6"))    # 주도 판정: 상승종목 비율 하한 (집단상승)
-SECTOR_TOP_K = int(os.getenv("TREND_SECTOR_TOP_K", "3"))
-TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
-FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
-SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
-ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
-FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
-
-CFG = TrendConfig(
-    mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),
-    stop_pct=float(os.getenv("TREND_STOP_PCT", "7")),
-    atr_k=float(os.getenv("TREND_ATR_K", "2.0")),
-    rr=float(os.getenv("TREND_RR", "3.0")),
-    partial_pct=float(os.getenv("TREND_PARTIAL_PCT", "30")),
-)
-
-DATA_DIR = _ROOT / "data" / "trend_follow"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = DATA_DIR / "state.json"
-LOCK_FILE = DATA_DIR / "daemon.lock"
-JOURNAL_FILE = DATA_DIR / "journal.jsonl"
-LOG_DIR = _ROOT / "logs" / "trend_follow"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "trend_follow.log"
-
-_fh = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=30, encoding="utf-8")
-_fh.suffix = "%Y-%m-%d"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout), _fh])
-logger = logging.getLogger("trend")
-
-SCHEDULE = [(8, 50, "screen"), (9, 30, "entry"), (15, 20, "exit")]
+# 설정·상수·CFG·paths·logger·SCHEDULE 는 trend.config 로 이동 (import * 로 노출)
 
 
 # ─── 알림/상태/락 ──────────────────────────────────────────────────────────
@@ -236,238 +145,7 @@ def journal_note(jid: str, psych: str = "", mistake: str = "", improve: str = ""
     print(f"매매일지 메모 추가: id={jid}")
 
 
-# ─── pykrx / MCP 데이터 ────────────────────────────────────────────────────
-def _today() -> str:
-    return datetime.now().strftime("%Y%m%d")
-
-
-def _days_ago(n: int) -> str:
-    return (datetime.now() - timedelta(days=n)).strftime("%Y%m%d")
-
-
-def _market_open_now() -> bool:
-    """정규장 진행 중(평일 09:00–15:30)이면 True — 오늘 일봉이 미완성이라는 뜻."""
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    mins = now.hour * 60 + now.minute
-    return 9 * 60 <= mins < 15 * 60 + 30
-
-
-def _suppress():
-    import contextlib, io
-    return contextlib.redirect_stdout(io.StringIO())
-
-
-def get_ohlcv(symbol: str, days: int = 320) -> list[dict]:
-    try:
-        with _suppress():
-            df = krx.get_market_ohlcv_by_date(_days_ago(days + 60), _today(), symbol)
-        if df.empty:
-            return []
-        out = []
-        for d, row in df.tail(days + 1).iterrows():
-            out.append({"date": d.strftime("%Y-%m-%d"), "open": float(row.get("시가", 0)),
-                        "high": float(row.get("고가", 0)), "low": float(row.get("저가", 0)),
-                        "close": float(row.get("종가", 0)), "volume": float(row.get("거래량", 0)),
-                        "value": float(row.get("거래대금", 0))})
-        # 장중이면 오늘 미완성 일봉 제거 — 거래량·종가가 미완성이라 게이트 판정 왜곡(과소평가) 방지.
-        # 추세추종은 '완성된 일봉'으로 신호를 잡고 익일 진입하는 검증 방식과 동일.
-        if out and _market_open_now() and out[-1]["date"] == datetime.now().strftime("%Y-%m-%d"):
-            out = out[:-1]
-        return out[-days:]
-    except Exception as e:
-        logger.debug("[OHLCV] %s %s", symbol, e)
-        return []
-
-
-def _clean_index_closes(pairs: list[tuple[str, float]], days: int) -> list[float]:
-    """지수 (date, close) → NaN/0 제거 + 장중 미완성 오늘봉 제거 후 마지막 days개."""
-    out = [(d, c) for d, c in pairs if c == c and c > 0]   # c==c → NaN 제거
-    if out and _market_open_now() and out[-1][0] == datetime.now().strftime("%Y-%m-%d"):
-        out = out[:-1]
-    return [c for _, c in out][-days:]
-
-
-def get_kospi_closes(days: int = 320) -> list[float]:
-    try:
-        with _suppress():
-            df = krx.get_index_ohlcv_by_date(_days_ago(days + 60), _today(), "1001")
-        pairs = [(d.strftime("%Y-%m-%d"), float(row["종가"])) for d, row in df.iterrows()]
-        res = _clean_index_closes(pairs, days)
-        if res:
-            return res
-    except Exception:
-        pass
-    try:
-        import FinanceDataReader as fdr
-        df = fdr.DataReader("^KS11", _days_ago(days + 60), _today())
-        pairs = [(d.strftime("%Y-%m-%d"), float(c)) for d, c in zip(df.index, df["Close"])]
-        return _clean_index_closes(pairs, days)
-    except Exception:
-        return []
-
-
-def _broad_codes() -> list[str]:
-    """KOSPI 시총상위 캐시(docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스."""
-    sys.path.insert(0, str(_ROOT / "scripts"))
-    from backtest_dynamic import get_broad_universe  # 백테스트와 동일 유니버스
-    return get_broad_universe()
-
-
-def get_universe() -> list[tuple[str, str]]:
-    """모드별 유니버스 [(code, name)]."""
-    if UNIVERSE_MODE == "watchlist":
-        return [(c, _name(c)) for c in WATCHLIST]
-    # largecap: 시총상위 캐시 우선(pykrx 전종목 조회가 장중 실패해도 안정) — 백테스트와 동일.
-    if UNIVERSE_MODE == "largecap":
-        try:
-            codes = _broad_codes()[:TOP_N]
-            if codes:
-                return [(c, _name(c)) for c in codes]
-        except Exception as e:
-            logger.warning("[UNIVERSE] 시총상위 캐시 실패: %s — pykrx 폴백", e)
-    # gainers(또는 largecap 캐시 실패): pykrx 전종목에서 등락률/거래대금 상위
-    for off in range(8):
-        try:
-            date = (datetime.now() - timedelta(days=off)).strftime("%Y%m%d")
-            with _suppress():
-                df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
-            if df.empty:
-                continue
-            df = df[df["거래대금"] >= MIN_VALUE_KRW]
-            if UNIVERSE_MODE == "gainers" and "등락률" in df.columns:
-                df = df.sort_values("등락률", ascending=False)
-            else:  # largecap 캐시 실패 시 거래대금 상위 근사
-                df = df.sort_values("거래대금", ascending=False)
-            codes = list(df.head(TOP_N).index)
-            return [(c, _name(c)) for c in codes]
-        except Exception:
-            continue
-    # 최종 폴백: 시총상위 캐시 → watchlist (조용한 2종목 폴백 방지)
-    try:
-        codes = _broad_codes()[:TOP_N]
-        if codes:
-            return [(c, _name(c)) for c in codes]
-    except Exception:
-        pass
-    return [(c, _name(c)) for c in WATCHLIST]
-
-
-def _name(code: str) -> str:
-    try:
-        return krx.get_market_ticker_name(code)
-    except Exception:
-        return code
-
-
-# ─── MCP 주문/시세/수급 ────────────────────────────────────────────────────
-def _order_accepted(parsed: Any) -> tuple[bool, str]:
-    if not isinstance(parsed, dict):
-        return False, "형식오류"
-    if parsed.get("success") is False:
-        return False, str(parsed.get("error", "실패"))
-    d = parsed.get("data", parsed)
-    rc = d.get("return_code") if isinstance(d, dict) else None
-    if rc in (0, "0", None):
-        return True, ""
-    return False, f"rc={rc} {str(d.get('return_msg',''))[:80]}"
-
-
-async def _kiwoom_call(server_key: str, url: str, tool_kw, args: dict) -> dict:
-    """키움 MCP 단일 호출 → data dict. tool_kw: 도구명 부분일치 키워드(str/tuple). 실패 시 {}.
-
-    헬퍼들의 'MCPManager 열기 → tool 검색 → call → json → data' 보일러플레이트 단일화.
-    """
-    kws = (tool_kw,) if isinstance(tool_kw, str) else tuple(tool_kw)
-    try:
-        async with MCPManager({server_key: url}) as mcp:
-            tool = next((t["name"] for t in (mcp.tools or [])
-                         if any(k in t["name"].lower() for k in kws)), None)
-            if not tool:
-                return {}
-            raw = await mcp.call_tool(tool, args)
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            if not isinstance(p, dict):
-                return {}
-            d = p.get("data", p)
-            return d if isinstance(d, dict) else {}
-    except Exception as e:
-        logger.debug("[KIWOOM] %s %s 실패: %s", server_key, kws, e)
-        return {}
-
-
-def _num(d: dict, key: str, abs_val: bool = False) -> float:
-    """키움 숫자필드 파싱(콤마/부호/제로패딩 처리). 없으면 0.0. abs_val=True면 절대값."""
-    v = d.get(key) if isinstance(d, dict) else None
-    if v in (None, ""):
-        return 0.0
-    try:
-        f = float(str(v).replace(",", ""))
-    except Exception:
-        return 0.0
-    return abs(f) if abs_val else f
-
-
-async def _realtime_price(symbol: str) -> float | None:
-    for key, url in [("kiwoom-market-mcp", MARKET_URL), ("trading-domain", TRADING_URL)]:
-        d = await _kiwoom_call(key, url, ("basic_info", "current_price", "quote"), {"stock_code": symbol})
-        for k in ("cur_prc", "current_price", "현재가", "stck_prpr", "price", "close"):
-            f = _num(d, k, abs_val=True)
-            if f:
-                return f
-    return None
-
-
-async def _foreign_net_5d(symbol: str) -> float | None:
-    d = await _kiwoom_call("investor-domain", INVESTOR_URL, ("foreign", "investor", "trading"), {"stock_code": symbol})
-    for k in ("foreign_net_5d", "외국인_5일_순매수"):
-        if d.get(k) not in (None, ""):
-            return _num(d, k)
-    return None
-
-
-async def _cur_and_open(symbol: str) -> tuple[float, float]:
-    """현재가·당일 시가 (장중 방향 판정용). get_stock_basic_info cur_prc/open_pric."""
-    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": symbol})
-    return _num(d, "cur_prc", abs_val=True), _num(d, "open_pric", abs_val=True)
-
-
 _is_rising = is_rising   # signals.is_rising 재노출(호출부 호환)
-
-
-async def _premarket_snapshot(symbol: str) -> dict | None:
-    """프리장(장전 동시호가, 08:00~09:00) 예상체결가·예상수량·갭%(기준가 대비).
-
-    키움 get_stock_basic_info 의 exp_cntr_pric(예상체결가)/exp_cntr_qty/base_pric 사용.
-    장전 외 시간대엔 보통 exp_cntr_pric=0 → None 반환(표시 생략).
-    """
-    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": symbol})
-    exp = _num(d, "exp_cntr_pric", abs_val=True)
-    base = _num(d, "base_pric", abs_val=True) or _num(d, "cur_prc", abs_val=True)
-    if exp <= 0 or base <= 0:
-        return None
-    return {"exp_price": exp, "exp_qty": _num(d, "exp_cntr_qty", abs_val=True),
-            "gap_pct": round((exp - base) / base * 100, 2)}
-
-
-def _kint(s: Any) -> int:
-    """키움 제로패딩/부호 문자열 → int."""
-    return int(_num({"_": s}, "_"))
-
-
-async def _broker_holdings() -> list[dict]:
-    """계좌 보유종목 [{symbol,name,qty,avg,cur}]. get_account_evaluation 파싱."""
-    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
-    out = []
-    for r in (d.get("stk_acnt_evlt_prst") or []):
-        code = str(r.get("stk_cd", "")).lstrip("A")
-        qty = _kint(r.get("rmnd_qty", 0))
-        if not code or qty <= 0:
-            continue
-        out.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty,
-                    "avg": _kint(r.get("avg_prc", 0)), "cur": _kint(r.get("cur_prc", 0))})
-    return out
 
 
 async def phase_reconcile() -> None:
@@ -515,17 +193,6 @@ async def phase_reconcile() -> None:
                                for p in adopted))
 
 
-async def _account_equity() -> tuple[float, float]:
-    """(추정예탁자산, 예수금현금) — 포지션 사이징용. 실패 시 (0,0).
-
-    반드시 get_account_evaluation 사용(get_account_balance 엔 prsm_dpst_aset_amt 없음 → 예탁자산 0 폴백 버그).
-    """
-    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
-    equity = _num(d, "prsm_dpst_aset_amt") or _num(d, "tot_est_amt")
-    cash = _num(d, "entr") or _num(d, "d2_entra")
-    return equity, cash
-
-
 async def _size_qty(price: float) -> int:
     """가격 → 매수 수량. signals.position_size(순수) + 예탁자산 조회."""
     equity, cash = (await _account_equity()) if SIZING_MODE == "pct_equity" else (0.0, 0.0)
@@ -535,15 +202,7 @@ async def _size_qty(price: float) -> int:
                          pct=POSITION_PCT, invest_fixed=INVEST_PER_TRADE)
 
 
-async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
-    tool = "place_buy_order" if side == "buy" else "place_sell_order"
-    raw = await mcp.call_tool(tool, {"stock_code": symbol, "quantity": qty,
-                                     "price": None, "order_type": "03", "account_no": ACCOUNT_NO})
-    return json.loads(raw) if isinstance(raw, str) else raw
-
-
-# ─── 실적(DART YoY) / 주도섹터 데이터 ────────────────────────────────────────
-FUND_CACHE_DIR = _ROOT / "docs_cache" / "dart_fin"
+FUND_CACHE_DIR = _ROOT / "docs_cache" / "dart_fin"   # DART 재무 YoY 30일 캐시
 
 
 def _fundamentals_yoy(symbol: str) -> dict | None:
@@ -630,50 +289,6 @@ def _sector_map() -> dict[str, str]:
     except Exception as e2:
         logger.warning("[SECTOR] Kiwoom 캐시도 실패: %s — 주도섹터 비활성", e2)
     return {}
-
-
-_SECTOR_SKIP = {"종합(KOSPI)", "대형주", "중형주", "소형주"}   # 업종 아님(시장 구분 지수)
-
-
-async def _sector_index_rows() -> list[dict] | None:
-    """키움 업종지수 당일 스냅샷 [{sector, change_pct, rising, falling, flat}] (ka20001).
-
-    KOSPI 전 업종의 지수 등락률 + 상승/하락/보합 종목수 — 집단상승(breadth) 판정 소스.
-    info-domain(:8032) 미가동/실패 시 None(판정 불가 → fail-open).
-    """
-    def _f(v: Any) -> float:
-        try:
-            return float(str(v).replace(",", "").replace("+", ""))
-        except Exception:
-            return float("nan")
-
-    try:
-        async with MCPManager({"kiwoom-info-mcp": INFO_URL}) as mcp:
-            if not mcp.tools:
-                return None
-            raw = await mcp.call_tool("get_sector_code_list", {"market_type": "0"})
-            p = json.loads(raw) if isinstance(raw, str) else raw
-            codes = (p.get("data", {}) or {}).get("list", []) if isinstance(p, dict) else []
-            rows = []
-            for it in codes:
-                name = str(it.get("name", ""))
-                if not name or name in _SECTOR_SKIP:
-                    continue
-                try:
-                    raw2 = await mcp.call_tool("get_sector_current_price",
-                                               {"sector_code": it.get("code", ""), "market_type": "0"})
-                    p2 = json.loads(raw2) if isinstance(raw2, str) else raw2
-                    d = p2.get("data", {}) if isinstance(p2, dict) else {}
-                    rows.append({"sector": name, "change_pct": _f(d.get("flu_rt")),
-                                 "rising": int(_f(d.get("rising")) or 0),
-                                 "falling": int(_f(d.get("fall")) or 0),
-                                 "flat": int(_f(d.get("stdns")) or 0)})
-                except Exception:
-                    continue
-            return rows or None
-    except Exception as e:
-        logger.debug("[SECTOR] 업종지수 조회 실패: %s", e)
-        return None
 
 
 # ─── Phase: 스크리닝 ────────────────────────────────────────────────────────

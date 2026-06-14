@@ -60,7 +60,7 @@ from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, entry_signal, atr, moving_average, classify_zone,
-    fundamentals_bonus, leading_sectors,
+    fundamentals_bonus, leading_sectors, position_size, exit_decision, is_rising,
 )
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────
@@ -433,11 +433,7 @@ async def _cur_and_open(symbol: str) -> tuple[float, float]:
     return _num(d, "cur_prc", abs_val=True), _num(d, "open_pric", abs_val=True)
 
 
-def _is_rising(cur: float, opn: float) -> bool:
-    """상승 중 = 현재가 ≥ 당일 시가. 시가/현재가 불명이면 True(차단 안 함, fail-open)."""
-    if cur <= 0 or opn <= 0:
-        return True
-    return cur >= opn
+_is_rising = is_rising   # signals.is_rising 재노출(호출부 호환)
 
 
 async def _premarket_snapshot(symbol: str) -> dict | None:
@@ -531,18 +527,12 @@ async def _account_equity() -> tuple[float, float]:
 
 
 async def _size_qty(price: float) -> int:
-    """가격 → 매수 수량. pct_equity: 예탁자산 POSITION_PCT% (현금 한도 내). fixed: INVEST_PER_TRADE."""
-    if price <= 0:
-        return 0
-    if SIZING_MODE == "pct_equity":
-        equity, cash = await _account_equity()
-        if equity > 0:
-            qty = int(equity * POSITION_PCT / 100.0 / price)
-            if cash > 0:
-                qty = min(qty, int(cash / price))     # 현금 한도
-            return max(0, qty)
+    """가격 → 매수 수량. signals.position_size(순수) + 예탁자산 조회."""
+    equity, cash = (await _account_equity()) if SIZING_MODE == "pct_equity" else (0.0, 0.0)
+    if SIZING_MODE == "pct_equity" and equity <= 0:
         logger.warning("[SIZE] 예탁자산 조회 실패 → 고정금액 폴백")
-    return max(1, int(INVEST_PER_TRADE / price))
+    return position_size(price, mode=SIZING_MODE, equity=equity, cash=cash,
+                         pct=POSITION_PCT, invest_fixed=INVEST_PER_TRADE)
 
 
 async def _place(mcp, side: str, symbol: str, qty: int) -> Any:
@@ -976,26 +966,17 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 a = float(pos.get("atr", 0) or 0)
                 peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
                 pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
-                action, reason, sell_qty = None, "", 0
-                pnl_now = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
-                # 하드 손절(PDF 절대원칙) — ATR 트레일과 무관하게 진입가 대비 -HARD_STOP_PCT% 즉시 청산
-                if HARD_STOP_PCT > 0 and pnl_now <= -HARD_STOP_PCT:
-                    sell_qty, action, reason = qty, "EXIT", f"하드 손절 ({pnl_now:.2f}% ≤ -{HARD_STOP_PCT:.0f}%)"
-                # 첫 목표 → 30% 부분익절
-                elif not pos.get("partial_done") and cur >= pos["target"]:
-                    sell_qty = max(1, int(qty * CFG.partial_pct / 100))
-                    action, reason = "PARTIAL", f"첫 목표 도달 {CFG.partial_pct:.0f}% 익절"
-                # 트레일/손절 이탈
-                elif cur <= stop:
-                    sell_qty, action, reason = qty, "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}"
-                elif do_exit_signals:
+                # 이평선/외인 청산 신호는 15:20 청산 phase(do_exit_signals)에서만 평가
+                ma_exit, foreign = None, None
+                if do_exit_signals:
                     ohlcv = get_ohlcv(sym, EXIT_MA + 40)
                     ma_exit = moving_average([b["close"] for b in ohlcv] + [cur], EXIT_MA) if ohlcv else None
                     foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
-                    if ma_exit is not None and cur < ma_exit:
-                        sell_qty, action, reason = qty, "EXIT", f"MA{EXIT_MA} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})"
-                    elif USE_FOREIGN_EXIT and foreign is not None and foreign < 0:
-                        sell_qty, action, reason = qty, "EXIT", "외국인 5일 순매도 전환"
+                action, reason, sell_qty = exit_decision(
+                    entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
+                    partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
+                    partial_pct=CFG.partial_pct, ma_exit=ma_exit, exit_ma_label=EXIT_MA,
+                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT)
                 if not action:
                     remaining.append(pos); continue
                 resp = await _place(mcp, "sell", sym, sell_qty)

@@ -3,12 +3,15 @@ from src.mcp_servers.trend_mcp.signals import (
     TrendConfig,
     classify_zone,
     entry_signal,
+    exit_decision,
     fundamentals_bonus,
     is_big_bullish_candle,
     is_consolidation,
+    is_rising,
     leading_sectors,
     ma_uptrend,
     moving_average,
+    position_size,
     relative_strength,
     trend_exit,
     volume_surge_ok,
@@ -188,3 +191,50 @@ def test_leading_sectors_min_count_and_topk():
 def test_leading_sectors_empty_and_nan():
     assert leading_sectors([]) == []
     assert leading_sectors([_sec("X", float("nan"), rising=10, falling=0)]) == []
+
+
+# ── 실행 결정(순수): 사이징 / 상승판정 / 청산분기 ───────────────────────────
+
+def test_position_size_pct_equity():
+    # 예탁 1억의 8% = 800만 / 215만원 = 3주
+    assert position_size(2_150_000, mode="pct_equity", equity=100_000_000, cash=100_000_000, pct=8) == 3
+    # 현금 한도: 현금 100만이면 0주(215만 못 삼)
+    assert position_size(2_150_000, mode="pct_equity", equity=100_000_000, cash=1_000_000, pct=8) == 0
+
+
+def test_position_size_fallback_and_fixed():
+    # equity 조회 실패(0) → 고정금액 폴백 (최소 1주)
+    assert position_size(2_150_000, mode="pct_equity", equity=0, invest_fixed=500_000) == 1
+    # fixed 모드: 50만 / 17만 = 2주
+    assert position_size(170_000, mode="fixed", invest_fixed=500_000) == 2
+    assert position_size(0, mode="fixed") == 0
+
+
+def test_is_rising():
+    assert is_rising(101, 100) is True          # 시가 위
+    assert is_rising(99, 100) is False           # 시가 아래(하락중)
+    assert is_rising(0, 100) is True             # 불명 → fail-open
+
+
+def test_exit_decision_hard_stop_priority():
+    a, r, q = exit_decision(entry=100, cur=90, qty=10, target=130, stop=85,
+                            partial_done=False, hard_stop_pct=5)
+    assert a == "EXIT" and "하드 손절" in r and q == 10
+
+
+def test_exit_decision_partial_then_trail():
+    a, r, q = exit_decision(entry=100, cur=131, qty=10, target=130, stop=95, partial_done=False, partial_pct=30)
+    assert a == "PARTIAL" and q == 3
+    a2, _, q2 = exit_decision(entry=100, cur=94, qty=10, target=130, stop=95, partial_done=True)
+    assert a2 == "EXIT" and q2 == 10            # 트레일 이탈
+
+
+def test_exit_decision_ma_and_foreign_only_when_passed():
+    # ma_exit 미평가(None) → HOLD
+    assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90, partial_done=True)[0] is None
+    # MA 이탈
+    assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90, partial_done=True,
+                         ma_exit=115)[0] == "EXIT"
+    # 외인 전환
+    assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90, partial_done=True,
+                         foreign_net=-3, use_foreign=True)[0] == "EXIT"

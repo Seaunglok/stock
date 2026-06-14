@@ -285,3 +285,52 @@ def classify_zone(price: float, ma60: float | None, ma120: float | None, *,
     if ma60 > ma120 and price <= ma60 * 1.03:   # 정배열 + 60일선 ±3% 지지
         return "GO"
     return "WATCH"
+
+
+# ─── 실행 결정(순수) — 사이징 / 청산 분기 ────────────────────────────────────
+
+def is_rising(cur: float, opn: float) -> bool:
+    """상승 중 = 현재가 ≥ 당일 시가. 시가/현재가 불명이면 True(차단 안 함, fail-open)."""
+    if cur <= 0 or opn <= 0:
+        return True
+    return cur >= opn
+
+
+def position_size(price: float, *, mode: str = "pct_equity", equity: float = 0.0,
+                  cash: float = 0.0, pct: float = 8.0, invest_fixed: float = 500000.0) -> int:
+    """매수 수량. pct_equity: 예탁자산 pct% (현금 한도 내). equity<=0 또는 fixed: 고정금액.
+
+    예탁자산 조회 실패(equity=0) 시 고정금액 폴백. price<=0 이면 0.
+    """
+    if price <= 0:
+        return 0
+    if mode == "pct_equity" and equity > 0:
+        qty = int(equity * pct / 100.0 / price)
+        if cash > 0:
+            qty = min(qty, int(cash / price))
+        return max(0, qty)
+    return max(1, int(invest_fixed / price))
+
+
+def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: float,
+                  partial_done: bool, hard_stop_pct: float = 0.0, partial_pct: float = 30.0,
+                  ma_exit: float | None = None, exit_ma_label: int = 120,
+                  foreign_net: float | None = None, use_foreign: bool = False
+                  ) -> tuple[str | None, str, int]:
+    """포지션 청산/부분익절 판정 → (action, reason, sell_qty). action ∈ {None, PARTIAL, EXIT}.
+
+    우선순위: 하드손절 → 첫목표 부분익절 → 트레일/손절 이탈 → 이평선 이탈 → 외인 전환.
+    ma_exit/foreign_net 은 do_exit_signals 시에만 호출자가 채워 넘긴다(None=미평가).
+    """
+    pnl = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
+    if hard_stop_pct > 0 and pnl <= -hard_stop_pct:
+        return "EXIT", f"하드 손절 ({pnl:.2f}% ≤ -{hard_stop_pct:.0f}%)", qty
+    if not partial_done and target > 0 and cur >= target:
+        return "PARTIAL", f"첫 목표 도달 {partial_pct:.0f}% 익절", max(1, int(qty * partial_pct / 100))
+    if stop > 0 and cur <= stop:
+        return "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}", qty
+    if ma_exit is not None and cur < ma_exit:
+        return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})", qty
+    if use_foreign and foreign_net is not None and foreign_net < 0:
+        return "EXIT", "외국인 5일 순매도 전환", qty
+    return None, "", 0

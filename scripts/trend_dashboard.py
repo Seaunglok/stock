@@ -20,7 +20,7 @@ from starlette.routing import Route
 _ROOT = Path(__file__).parent.parent
 DATA_DIR = _ROOT / "data" / "trend_follow"
 STATE_FILE = DATA_DIR / "state.json"
-JOURNAL_FILE = DATA_DIR / "journal.jsonl"
+JOURNAL_FILE = DATA_DIR / "journal.json"   # config.py 와 동일 파일명
 
 
 def _read_journal() -> list[dict]:

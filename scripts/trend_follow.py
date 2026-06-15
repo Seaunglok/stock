@@ -688,6 +688,70 @@ async def phase_exit() -> None:
         save_state("pending_entries", [])
     await phase_reconcile()   # 신규 계좌 보유분 편입 후 청산판단
     await _manage(do_exit_signals=True, when="exit")
+    await write_daily_journal()   # 마감 후 그날 매매일지 자동 작성
+
+
+async def write_daily_journal() -> None:
+    """그날 매매일지 md 자동 생성 — journal.json(진입/청산/부분/메모) + 보유 P&L + KOSPI.
+
+    docs/YYYY-MM-DD-trend-journal.md 작성. 15:20 청산 후 자동 호출 + `--phase journal` 수동.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    recs = []
+    if JOURNAL_FILE.exists():
+        for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    pass
+    todays = [r for r in recs if str(r.get("ts", "")).startswith(today)]
+    entries = [r for r in todays if r.get("type") == "entry"]
+    exits = [r for r in todays if r.get("type") == "exit"]
+    partials = [r for r in todays if r.get("type") == "partial"]
+
+    k = get_kospi_closes()
+    kline = (f"{k[-2]:,.1f} → {k[-1]:,.1f} ({(k[-1]-k[-2]) / k[-2] * 100:+.2f}%)"
+             if len(k) >= 2 else "N/A")
+
+    positions = get_state("positions", [])
+    rows, tot = [], 0.0
+    for p in positions:
+        live = await _realtime_price(p["symbol"]) or p["entry_price"]
+        pnl = (live - p["entry_price"]) / p["entry_price"] * 100 if p["entry_price"] else 0.0
+        amt = (live - p["entry_price"]) * p["qty"]
+        tot += amt
+        rows.append((p, live, pnl, amt))
+    rows.sort(key=lambda x: -x[2])
+    realized = sum(e.get("entry_price", 0) * e.get("qty", 0) * e.get("net_pct", 0) / 100.0 for e in exits)
+
+    L = [f"# 추세추종 매매일지 — {today}", "",
+         f"> 대형주 추세추종 (MOCK) · 모드 {UNIVERSE_MODE} · 자동 생성 · 대시보드 :8091", "",
+         f"## 시장\n- KOSPI {kline}", "",
+         f"## 매매 (신규 {len(entries)} · 청산 {len(exits)} · 부분익절 {len(partials)})"]
+    if entries:
+        L.append("| 종목 | 진입가 | 수량 | 금액 | 점수 |")
+        L.append("|------|--------|------|------|------|")
+        for e in entries:
+            L.append(f"| {e['name']}({e['symbol']}) | {e['entry_price']:,.0f} | {e['qty']} | "
+                     f"{e['entry_price'] * e['qty']:,.0f} | {e.get('score', '')} |")
+    for e in exits:
+        L.append(f"- 청산 {e['name']}({e['symbol']}) {e['qty']}주 @{e['exit_price']:,.0f} "
+                 f"net {e.get('net_pct', 0):+.2f}% — {e.get('reason', '')}")
+    if not entries and not exits:
+        L.append("- 신규/청산 없음 (보유 유지)")
+    L += ["", f"## 보유 {len(positions)}종 · 평가손익 **{tot:+,.0f}원** (당일 실현 {realized:+,.0f}원)",
+          "| 종목 | 수량 | 진입 | 현재 | 손익 | 평가손익 |", "|------|------|------|------|------|------|"]
+    for p, live, pnl, amt in rows:
+        L.append(f"| {p['name']}({p['symbol']}) | {p['qty']} | {p['entry_price']:,.0f} | "
+                 f"{live:,.0f} | {pnl:+.2f}% | {amt:+,.0f} |")
+    L += ["", "*자동 생성. 심리/실수/개선은 `--journal-note <id>` 또는 대시보드에서 추가.*", ""]
+
+    out = _ROOT / "docs" / f"{today}-trend-journal.md"
+    out.write_text("\n".join(L), encoding="utf-8")
+    logger.info("[JOURNAL] 매매일지 자동작성: %s", out.name)
+    log_event("journal_write", {"file": out.name, "entries": len(entries), "exits": len(exits), "eval_pnl": round(tot)})
+    await notify(f"📓 매매일지 작성 {today} — 진입 {len(entries)}·청산 {len(exits)}·보유 {len(positions)}·평가 {tot:+,.0f}원")
 
 
 # ─── 데몬 ──────────────────────────────────────────────────────────────────
@@ -770,7 +834,7 @@ def print_status() -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile"])
+    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile", "journal"])
     g.add_argument("--daemon", action="store_true")
     g.add_argument("--status", action="store_true")
     g.add_argument("--journal-note", metavar="ID")
@@ -791,4 +855,4 @@ if __name__ == "__main__":
     else:
         asyncio.run({"screen": phase_screen, "entry": phase_entry,
                      "intraday": phase_intraday, "exit": phase_exit,
-                     "reconcile": phase_reconcile}[args.phase]())
+                     "reconcile": phase_reconcile, "journal": write_daily_journal}[args.phase]())

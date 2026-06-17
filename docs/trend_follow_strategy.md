@@ -64,6 +64,25 @@
 **대시보드** — `scripts/trend_dashboard.py` (:8091, 종가매매 :8090 와 별개):
 탭 ① 보유 포지션(손익·트레일 stop) ② 거래 내역(승률·손익비 payoff·net) ③ 매매일지(근거+심리/실수/개선 편집·저장).
 
+## 운영 안정성 (watchdog) · 실거래 전환 준비
+**문제**: 데몬·MCP 서버는 별도 프로세스라 PC 절전/콘솔 종료/인터럽트로 죽을 수 있다. 보유 중 데몬이
+죽으면 손절·트레일 관리가 멈춰 실포지션이 방치된다(실거래 치명적). 두 단계로 방어한다.
+
+1. **서버 분리 기동** (`run_mcp_local.py`): 자식 MCP 서버를 Windows `CREATE_NEW_PROCESS_GROUP|DETACHED_PROCESS`
+   (그 외 OS `start_new_session`)로 띄워 런처 콘솔의 Ctrl+C/종료가 서버로 전파돼 동반 종료되는 것을 차단.
+2. **watchdog** (`scripts/trend_watchdog.py` + `.cmd`): 멱등 복구 스크립트. 필수 MCP 포트(8030–8034)가
+   죽었으면 `stop→start`(중복 세트 누적 방지)로 재기동, 데몬 락 PID가 죽었으면 분리 기동으로 재시작,
+   둘 다 살아있으면 무동작. 주말은 즉시 종료. **작업스케줄러** 등록(평일 장중 5분 주기):
+   ```bat
+   schtasks /Create /TN KiwoomTrendWatchdog /TR "...\scripts\trend_watchdog.cmd" /SC DAILY /ST 08:40 /RI 5 /DU 07:15 /F
+   ```
+   (`/RI 5 /DU 07:15` = 08:40~15:55 5분 반복. `/ET`는 `/SC DAILY`에서 종료*일*로 오인되니 `/DU` 사용.)
+   로그 `logs/trend_follow/watchdog.log`(이상 시에만 기록)·`daemon_stdout.log`.
+
+**실거래 전환 전 권장 .env**(MOCK 에서도 동작): `TREND_HARD_STOP_PCT=7`(트레일 무관 즉시 손절 백스톱),
+`TREND_DAILY_LOSS_LIMIT_PCT=2`(당일 실현손실>예탁 2% 시 신규진입 중단). 첫 실전은 사이징·종목수 축소
+(예: `TREND_POSITION_PCT=2~3`·`TREND_MAX_POS=3~5`)로 실체결 경로(return_code/슬리피지/reconcile) 검증 후 확대.
+
 ## 파라미터 (env, 기본값)
 ```bash
 TREND_UNIVERSE=watchlist            # watchlist(기본) | largecap | gainers(v2)

@@ -105,7 +105,7 @@ DATA_DIR = _ROOT / "data" / "trend_follow"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 LOCK_FILE = DATA_DIR / "daemon.lock"
-JOURNAL_FILE = DATA_DIR / "journal.jsonl"
+JOURNAL_FILE = DATA_DIR / "journal.json"
 LOG_DIR = _ROOT / "logs" / "trend_follow"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "trend_follow.log"

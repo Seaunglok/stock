@@ -69,13 +69,23 @@ def start_servers():
 
         log_path = LOG_DIR / f"mcp_{name}.log"
         log_file = open(log_path, "w", encoding="utf-8")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", module],
+        popen_kwargs = dict(
             env=env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(Path(__file__).parent),
         )
+        if sys.platform == "win32":
+            # 자식 서버를 런처 콘솔에서 분리 — Ctrl+C(KeyboardInterrupt)/콘솔 종료가
+            # 자식으로 전파돼 서버가 같이 죽는 것을 방지(런처/하니스 종료에도 서버 생존).
+            #   CREATE_NEW_PROCESS_GROUP: Ctrl+C 그룹 분리
+            #   DETACHED_PROCESS: 부모 콘솔 미상속(stdout은 로그파일로 리다이렉트됨)
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen([sys.executable, "-m", module], **popen_kwargs)
         pids[name] = proc.pid
         print(f"[START] {name} (PID={proc.pid}) → {log_path}")
 
@@ -83,7 +93,11 @@ def start_servers():
 
     import time
     print("\n3초 후 상태 확인...")
-    time.sleep(3)
+    try:
+        time.sleep(3)
+    except KeyboardInterrupt:
+        # 자식 서버는 분리 기동(detached)되어 이미 독립 — 런처만 빠져나가도 서버는 생존.
+        print("\n(대기 중단 — 서버는 백그라운드에서 계속 실행 중)")
     check_status()
 
 

@@ -22,6 +22,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Windows 콘솔/리다이렉트 기본 cp949 → 이모지(⚠️·→) print 시 UnicodeEncodeError 로
+# watchdog 자체가 죽어 자동복구가 멈추는 것을 방지. utf-8·errors=replace 로 강제.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 LOCK_FILE = ROOT / "data" / "trend_follow" / "daemon.lock"
 LOG_DIR = ROOT / "logs" / "trend_follow"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,7 +43,14 @@ ESSENTIAL_PORTS = [8030, 8031, 8032, 8033, 8034]
 
 def log(msg: str) -> None:
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
-    print(line)
+    try:
+        print(line)
+    except Exception:
+        # reconfigure 실패 환경 대비 — print 실패해도 watchdog 은 죽지 않게
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"))
+        except Exception:
+            pass
     try:
         with open(WD_LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")

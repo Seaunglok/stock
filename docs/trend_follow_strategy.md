@@ -97,6 +97,9 @@ TREND_EXIT_MA=120                   # 청산 이평선(A/B 검증 채택). MA50�
 TREND_ENTRY_WAIT_FALLING=true TREND_ENTRY_CUTOFF=10:30  # 하락 보류→반등 진입, 마감시각
 TREND_HARD_STOP_PCT=0               # 하드손절 %(0=off, ATR 트레일 우월)
 TREND_DAILY_LOSS_LIMIT_PCT=0        # 일일 최대손실 서킷브레이커: 당일 실현손실>예탁자산 X% 시 신규진입 중단(0=off)
+TREND_PYRAMID_ADDS=0                # 피라미딩 종목당 최대 추가유닛(0=off). 진입+k×R 도달 시 1유닛 추가
+TREND_PYRAMID_STEP_R=1.0           # 추가 트리거 간격(R배수)  TREND_PYRAMID_LOOKBACK=20  # equity게이트 청산표본
+TREND_PYRAMID_MIN_NET=0            # equity게이트: 최근 LOOKBACK 청산 net 평균>이 값 일 때만 불타기(검증 채택)
 TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_PULLBACK_PCT=3 TREND_RS_DAYS=60
 TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
 TREND_STOP_PCT=7 TREND_ATR_K=2.0 TREND_RR=3 TREND_PARTIAL_PCT=30

@@ -92,6 +92,12 @@ ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
 FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
 # 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "0") or 0)
+# 피라미딩(승자 불타기, 검증=backtest equity게이트): 보유 종목이 진입+ k×STEP_R×R 도달 시 1유닛 추가.
+# equity-curve 게이트(최근 LOOKBACK 청산 net 평균>MIN_NET 일 때만)로 횡보장 증폭손실 차단. 0=off(기본).
+PYRAMID_ADDS = int(os.getenv("TREND_PYRAMID_ADDS", "0") or 0)          # 종목당 최대 추가 유닛 수(0=off)
+PYRAMID_STEP_R = float(os.getenv("TREND_PYRAMID_STEP_R", "1.0"))       # 추가 트리거 간격(R배수)
+PYRAMID_LOOKBACK = int(os.getenv("TREND_PYRAMID_LOOKBACK", "20"))      # equity 게이트 청산거래 표본 수
+PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이트 임계(최근 평균 net% >)
 
 CFG = TrendConfig(
     mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),

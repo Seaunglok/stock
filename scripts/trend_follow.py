@@ -178,6 +178,7 @@ async def phase_reconcile() -> None:
                "entry_price": entry, "stop_price": stop, "target": target,
                "peak_price": max(cur, entry), "atr": a, "score": 0,
                "buy_date": datetime.now().strftime("%Y-%m-%d"), "partial_done": False, "journal_id": jid}
+        _pyramid_init(pos, entry, e_stop)   # 편입분도 평단·평단기준 1R 로 불타기 추적
         positions.append(pos)
         adopted.append(pos)
         journal_append({"type": "entry", "id": jid, "symbol": h["symbol"], "name": h["name"],
@@ -403,6 +404,40 @@ async def _circuit_broken() -> tuple[bool, str]:
     return False, ""
 
 
+def _pyramid_gate_open() -> tuple[bool, float, int]:
+    """equity-curve 레짐 게이트(검증=backtest --pyramidequity) — 최근 PYRAMID_LOOKBACK 청산거래
+    net 평균 > PYRAMID_MIN_NET 이면 (True, 평균, 표본수). 이력 부족 시 닫힘(보수).
+
+    "전략이 최근 통할 때만 승자에 불타기" — 횡보장(전략 cold) 증폭손실 차단.
+    """
+    if PYRAMID_ADDS <= 0 or not JOURNAL_FILE.exists():
+        return False, 0.0, 0
+    nets: list[float] = []
+    try:
+        for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r.get("type") == "exit" and r.get("net_pct") is not None:
+                nets.append(float(r["net_pct"]))
+    except Exception:
+        return False, 0.0, 0
+    recent = nets[-PYRAMID_LOOKBACK:]
+    if len(recent) < max(3, PYRAMID_LOOKBACK // 2):    # 이력 부족 → 게이트 닫힘
+        return False, 0.0, len(recent)
+    avg = sum(recent) / len(recent)
+    return avg > PYRAMID_MIN_NET, avg, len(recent)
+
+
+def _pyramid_init(pos: dict, entry: float, stop: float) -> None:
+    """피라미딩 활성 시 포지션에 추가매수 추적 필드 부여. R=초기 손절폭(고정). 부분익절은 끔(불타기와 상충)."""
+    if PYRAMID_ADDS <= 0:
+        return
+    pos["pyramid"] = True
+    pos["pyr_base"] = round(entry, 2)        # 추가 트리거 기준(초기 진입가, 고정)
+    pos["pyr_R"] = round(entry - stop, 2)    # 초기 1R(고정) — 트레일과 무관
+    pos["adds_done"] = 0
+    pos["partial_done"] = True               # 부분익절 off (검증: 불타기는 부분익절 없이 트레일)
+
+
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
@@ -434,6 +469,7 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
            "atr": c["atr"], "score": c["score"], "buy_date": datetime.now().strftime("%Y-%m-%d"),
            "partial_done": False, "journal_id": jid,
            "sector": c.get("sector"), "sector_lead": c.get("sector_lead", False)}
+    _pyramid_init(pos, entry, stop)
     journal_append({"type": "entry", "id": jid, "symbol": sym, "name": c["name"],
                     "mode": UNIVERSE_MODE, "qty": qty, "entry_price": entry, "stop": stop,
                     "target": target, "score": c["score"], "rationale": c.get("gates"),
@@ -600,6 +636,72 @@ async def _try_pending() -> None:
         await notify(f"✅ 추세추종 보류분 진입(반등 확인) {mode_tag}\n" + "\n".join(_entry_notify_line(p) for p in bought))
 
 
+async def _pyramid_adds(when: str) -> None:
+    """피라미딩(승자 불타기) — equity 게이트 open 시, 보유 종목이 진입+ k×STEP_R×R 도달하면 1유닛 추가.
+
+    각 추가 유닛 = 신규 진입과 동일 사이징(_size_qty, 예탁 PCT%). 평단·수량 갱신, 트레일은 공통.
+    게이트(최근 청산 평균 net>임계)·서킷브레이커·현금 한도·return_code 모두 통과해야 체결 기록.
+    """
+    if PYRAMID_ADDS <= 0:
+        return
+    positions = get_state("positions", [])
+    if not any(p.get("pyramid") and p.get("adds_done", 0) < PYRAMID_ADDS for p in positions):
+        return
+    gate, avg, n = _pyramid_gate_open()
+    if not gate:
+        return                       # 전략 cold → 불타기 보류(횡보장 증폭 차단)
+    broken, _why = await _circuit_broken()
+    if broken:
+        return
+    added = []
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                logger.warning("[PYRAMID] trading-domain 연결 실패"); return
+            for pos in positions:
+                if not (pos.get("pyramid") and pos.get("adds_done", 0) < PYRAMID_ADDS):
+                    continue
+                base, R = pos.get("pyr_base", pos["entry_price"]), pos.get("pyr_R", 0)
+                if R <= 0:
+                    continue
+                k = pos["adds_done"] + 1
+                trigger = base + k * PYRAMID_STEP_R * R
+                cur = await _realtime_price(pos["symbol"]) or 0
+                if cur < trigger:
+                    continue
+                add_qty = await _size_qty(cur)
+                if add_qty < 1:
+                    logger.info("[PYRAMID] %s 현금부족/수량0 — 추가 스킵", pos["symbol"]); continue
+                resp = await _place(mcp, "buy", pos["symbol"], add_qty)
+                ok, why = _order_accepted(resp)
+                if not ok:
+                    logger.error("[REJECT] pyramid %s — %s", pos["symbol"], why)
+                    log_event("order_reject", {"phase": "pyramid", "symbol": pos["symbol"], "why": why, "raw": resp})
+                    continue
+                d = resp.get("data", {}) if isinstance(resp, dict) else {}
+                fill = d.get("cntr_pric") or d.get("체결가")
+                add_price = float(str(fill).lstrip("+-").replace(",", "")) if fill else cur
+                oq = int(pos["qty"]); nq = oq + add_qty
+                pos["entry_price"] = round((pos["entry_price"] * oq + add_price * add_qty) / nq, 2)
+                pos["qty"] = nq
+                pos["adds_done"] = k
+                journal_append({"type": "pyramid", "id": pos["journal_id"], "symbol": pos["symbol"],
+                                "name": pos["name"], "add_no": k, "qty": add_qty, "price": add_price,
+                                "avg_entry": pos["entry_price"], "gate_avg": round(avg, 2)})
+                log_event("pyramid", {"symbol": pos["symbol"], "add_no": k, "qty": add_qty,
+                                      "price": add_price, "gate_avg": round(avg, 2)})
+                logger.info("[PYRAMID] %s %s +%d주 @%.0f (#%d차) 평단%.0f", pos["symbol"], pos["name"][:10],
+                            add_qty, add_price, k, pos["entry_price"])
+                added.append((pos, add_qty, add_price, k))
+    except Exception as e:
+        logger.error("[PYRAMID] %s", e); return
+    if added:
+        save_state("positions", positions)
+        await notify(f"🔼 피라미딩 추가매수 (전략 hot · 최근{n}거래 평균 {avg:+.2f}%)\n" +
+                     "\n".join(f"• <b>{p['name']}</b>({p['symbol']}) +{q}주 @{pr:,.0f} (#{k}차) · 평단 {p['entry_price']:,.0f}"
+                               for p, q, pr, k in added))
+
+
 # ─── 포지션 관리 공통 (트레일/목표/청산) ──────────────────────────────────────
 async def _manage(do_exit_signals: bool, when: str) -> None:
     positions = get_state("positions", [])
@@ -673,6 +775,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
 async def phase_intraday() -> None:
     log_event("phase_start", {"phase": "intraday"})
     await _try_pending()      # 보류(하락중) 후보 반등 시 진입
+    await _pyramid_adds("intraday")   # 승자 불타기(equity 게이트, opt-in·기본off)
     await _manage(do_exit_signals=False, when="intraday")
 
 

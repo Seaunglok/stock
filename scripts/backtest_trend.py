@@ -34,7 +34,7 @@ from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs, metrics              # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop, init_stop_price  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    TrendConfig, entry_signal, atr, moving_average,
+    TrendConfig, entry_signal, atr, moving_average, relative_strength,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억
@@ -50,6 +50,7 @@ def _gap_pct(full: list[dict], i: int) -> float:
 V_FIRST_PARTIAL_R: float | None = None   # 첫 30% 익절 지점(R배수). None=cfg.rr(1:3). 1.0=1:1
 V_EXIT_MA: int | None = None             # 청산 이평선. None=cfg.ma_support(50). 120 등
 V_HARD_STOP_PCT: float = 0.0             # 진입가 -X% 하드 손절(트레일 floor). 0=off
+V_RS_TOP_PCT: float | None = None        # RS 게이트: None=절대값(>KOSPI). 0.3=그날 유니버스 RS 상위 30%
 
 
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
@@ -157,8 +158,18 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             day_rows.sort(key=lambda r: -_gap_pct(r[1], r[2]))
             day_rows = day_rows[:cfg_top]
 
+        # RS 랭킹 모드: 그날 유니버스 RS 상위 N% 만 RS 게이트 통과
+        rs_pass_set = None
+        if V_RS_TOP_PCT is not None and day_rows:
+            rs_vals = [(code, relative_strength([b["close"] for b in full[:idx + 1]], kospi_upto, cfg.rs_days))
+                       for code, full, idx in day_rows]
+            rs_vals.sort(key=lambda x: -x[1])
+            keep = max(1, int(len(rs_vals) * V_RS_TOP_PCT))
+            rs_pass_set = {c for c, _ in rs_vals[:keep]}
+
         for code, full, idx in day_rows:
-            sig = entry_signal(full[:idx + 1], kospi_upto, cfg)
+            rs_pass = (code in rs_pass_set) if rs_pass_set is not None else None
+            sig = entry_signal(full[:idx + 1], kospi_upto, cfg, rs_pass=rs_pass)
             if not sig.passed:
                 continue
             if idx + 1 >= len(full) or full[idx]["close"] <= 0:
@@ -240,6 +251,29 @@ def report_abtest(mode: str, start: str, end: str, watch: list[str], costs: Cost
     print("  ※ 기준 = 현재 검증·운영 설정. 변형이 기대값·손익비·P10(꼬리손실)을 개선하는지 확인.")
 
 
+def report_rs_abtest(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """RS 게이트 A/B — 절대값(>KOSPI) vs 그날 유니버스 RS 상위 20/30/40% (유니버스 1회 로드)."""
+    global V_RS_TOP_PCT
+    variants = [("기준: RS>0 절대(>KOSPI)", None), ("RS 상위 20%", 0.20),
+                ("RS 상위 30%", 0.30), ("RS 상위 40%", 0.40), ("RS 게이트 off(상위100%)", 1.00)]
+    print("\n" + "=" * 92)
+    print(f"RS 게이트 A/B 비교 — {label} (비용 차감 후)")
+    print("=" * 92)
+    print(f"  {'변형':26} {'진입':>6} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>11}")
+    for vlabel, pct in variants:
+        V_RS_TOP_PCT = pct
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:26} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:26} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+10.1f}%")
+    V_RS_TOP_PCT = None
+    print("  ※ 기준 = 현재 운영(RS 절대값). 상위 N%가 진입 수↑ 하면서 기대값·손익비·P10 을 유지/개선하는지 확인.")
+
+
 def main():
     global cfg_top
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -253,6 +287,7 @@ def main():
     p.add_argument("--slippage-bps", type=float, default=10.0)
     p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
     p.add_argument("--abtest", action="store_true", help="검증대기 항목 A/B 비교(첫익절/청산선/하드손절)")
+    p.add_argument("--rstest", action="store_true", help="RS 게이트 A/B 비교(절대값 vs 상위 20/30/40%)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -262,6 +297,8 @@ def main():
 
     if args.abtest:
         report_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.rstest:
+        report_rs_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

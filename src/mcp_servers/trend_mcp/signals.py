@@ -155,8 +155,13 @@ def entry_signal(
     cfg: TrendConfig,
     foreign_net: float | None = None,
     inst_net: float | None = None,
+    rs_pass: bool | None = None,
 ) -> TrendSignal:
-    """모드별 진입 게이트 + 점수 + 손절/목표. passed=False 면 진입 불가."""
+    """모드별 진입 게이트 + 점수 + 손절/목표. passed=False 면 진입 불가.
+
+    rs_pass: RS 게이트 외부 오버라이드(예: cross-sectional RS 상위 N% 랭킹).
+             None 이면 기존 절대값(RS>0=종목 60일수익률>KOSPI) 사용.
+    """
     need = max(cfg.ma_trend if cfg.mode == "gainers" else cfg.ma_slow, 21) + 1
     if len(ohlcv) < need:
         return TrendSignal(False, reason=f"데이터 부족(<{need}봉)")
@@ -180,7 +185,7 @@ def entry_signal(
         ma_p = moving_average(closes, cfg.ma_pullback)
         gates["price>MA60"] = ma_f is not None and price > ma_f
         gates["price>MA120"] = ma_w is not None and price > ma_w
-        gates["RS>0"] = relative_strength(closes, kospi_closes, cfg.rs_days) > 0
+        gates["RS>0"] = rs_pass if rs_pass is not None else (relative_strength(closes, kospi_closes, cfg.rs_days) > 0)
         gates["pullback"] = ma_p is not None and price <= ma_p * (1 + cfg.pullback_pct / 100.0)
         gates["vol_up"] = volume_surge_ok(ohlcv, 1.0)
 

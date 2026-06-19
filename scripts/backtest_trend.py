@@ -51,6 +51,12 @@ V_FIRST_PARTIAL_R: float | None = None   # 첫 30% 익절 지점(R배수). None=
 V_EXIT_MA: int | None = None             # 청산 이평선. None=cfg.ma_support(50). 120 등
 V_HARD_STOP_PCT: float = 0.0             # 진입가 -X% 하드 손절(트레일 floor). 0=off
 V_RS_TOP_PCT: float | None = None        # RS 게이트: None=절대값(>KOSPI). 0.3=그날 유니버스 RS 상위 30%
+# 피라미딩(승자 불타기): 초기 진입 후 +N×R 마다 유닛 추가. 각 유닛=별도 거래로 집계.
+V_USE_UNITS: bool = False                 # True=유닛 시뮬(부분익절 off, 트레일/MA 청산). 피라미딩 비교용.
+V_PYRAMID_ADDS: int = 0                   # 추가 유닛 수(0=초기 1유닛만)
+V_PYRAMID_STEP_R: float = 1.0             # 추가 트리거 간격(R배수): 진입+ k×step×R 도달 시 추가
+V_PYRAMID_REGIME_MA: int | None = None    # 피라미딩 레짐 게이트: KOSPI>MA(N)일 때만 불타기 허용. None=항상
+V_PYRAMID_REGIME_MOM: tuple | None = None  # 모멘텀 게이트 (days, pct): KOSPI days수익률>pct% 일 때만 불타기
 
 
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
@@ -102,6 +108,48 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
     if rem > 0:   # 미청산분 → 마지막 종가 청산
         realized += rem * (closes[last_j] - entry) / entry * 100
     return realized - costs.roundtrip_pct
+
+
+def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
+                   allow_pyramid: bool = True) -> list[float]:
+    """피라미딩: 초기 유닛 + 가격 상승 시 추가 유닛. 각 유닛의 net%(공통 트레일/MA 청산) 리스트 반환.
+
+    부분익절 없음(불타기와 상충). 추가 유닛은 진입+ (k+1)×STEP_R×R 도달(장중 고가) 시 그 가격에 진입.
+    모든 유닛은 동일 청산(트레일 이탈/MA 하방돌파/보유만기 종가)에서 빠진다 — 공통 트레일 스톱.
+    allow_pyramid=False(레짐 게이트 미충족) 면 추가 유닛 없이 초기 1유닛만.
+    """
+    if i + 1 >= len(full):
+        return []
+    entry = full[i + 1]["open"]
+    if entry <= 0:
+        return []
+    a = atr(full[:i + 1], cfg.atr_period)
+    stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
+    exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support
+    closes = [b["close"] for b in full]
+    R = entry - stop
+    add_prices = ([entry + (k + 1) * V_PYRAMID_STEP_R * R for k in range(V_PYRAMID_ADDS)]
+                  if R > 0 and allow_pyramid else [])
+    units = [entry]
+    nxt = 0
+    peak = entry
+    end = min(i + 1 + cfg.max_hold, len(full))
+    last_j = i + 1
+    exit_price = None
+    for j in range(i + 1, end):
+        b = full[j]; last_j = j
+        while nxt < len(add_prices) and b["high"] >= add_prices[nxt]:
+            units.append(add_prices[nxt]); nxt += 1
+        peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
+        if b["low"] <= stop:
+            exit_price = stop; break
+        ma = moving_average(closes[:j + 1], exit_ma)
+        if ma is not None and b["close"] < ma:
+            exit_price = b["close"]; break
+    if exit_price is None:
+        exit_price = closes[last_j]
+    nets = [(exit_price - u) / u * 100 - costs.roundtrip_pct for u in units]
+    return nets, (last_j - (i + 1))   # (유닛 net% 리스트, 보유 영업일수)
 
 
 _UNIV_CACHE: dict = {}   # A/B 스윕에서 유니버스 재로드 방지
@@ -175,9 +223,22 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             if idx + 1 >= len(full) or full[idx]["close"] <= 0:
                 continue
             gap = (full[idx + 1]["open"] - full[idx]["close"]) / full[idx]["close"] * 100.0
-            net = simulate_trade(full, idx, cfg, costs)
-            if net is not None:
-                trades.append((gap, net))
+            if V_USE_UNITS:
+                allow = True
+                if V_PYRAMID_REGIME_MA:
+                    kma = moving_average(kospi_upto, V_PYRAMID_REGIME_MA)
+                    allow = kma is not None and kospi_upto[-1] > kma
+                elif V_PYRAMID_REGIME_MOM:
+                    d, pct = V_PYRAMID_REGIME_MOM
+                    allow = (len(kospi_upto) > d and kospi_upto[-d - 1] > 0
+                             and (kospi_upto[-1] - kospi_upto[-d - 1]) / kospi_upto[-d - 1] * 100 > pct)
+                nets_u, _ = simulate_units(full, idx, cfg, costs, allow_pyramid=allow)
+                for u_net in nets_u:
+                    trades.append((gap, u_net))
+            else:
+                net = simulate_trade(full, idx, cfg, costs)
+                if net is not None:
+                    trades.append((gap, net))
         if (i_day + 1) % 40 == 0:
             print(f"  [{i_day+1}/{len(dates)}] {date_fmt}: 누적 진입 {len(trades)}건")
     return trades
@@ -274,6 +335,138 @@ def report_rs_abtest(mode: str, start: str, end: str, watch: list[str], costs: C
     print("  ※ 기준 = 현재 운영(RS 절대값). 상위 N%가 진입 수↑ 하면서 기대값·손익비·P10 을 유지/개선하는지 확인.")
 
 
+def report_pyramid(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """피라미딩 A/B — 승자 불타기 유무·강도 비교. 각 유닛=별도 거래로 집계(누적=총 P&L 대용)."""
+    global V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R
+    variants = [
+        ("현행(부분익절+트레일)",   False, 0, 1.0),
+        ("기준2: 단일유닛(부분익절off)", True, 0, 1.0),
+        ("피라미딩 +1유닛 @1R",      True, 1, 1.0),
+        ("피라미딩 +2유닛 @1R",      True, 2, 1.0),
+        ("피라미딩 +2유닛 @1.5R",    True, 2, 1.5),
+        ("피라미딩 +3유닛 @1R",      True, 3, 1.0),
+    ]
+    print("\n" + "=" * 96)
+    print(f"피라미딩(승자 불타기) A/B — {label} (비용 차감 후, 각 유닛=별도 거래)")
+    print("=" * 96)
+    print(f"  {'변형':28} {'유닛수':>6} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>11}")
+    for vlabel, use_u, adds, step in variants:
+        V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R = use_u, adds, step
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:28} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:28} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+10.1f}%")
+    V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R = False, 0, 1.0
+    print("  ※ 누적(=Σ유닛 net%) = 총 P&L 대용. 피라미딩이 누적↑ 하면서 기대값·PF·P10(꼬리손실) 을 지키는지 확인.")
+    print("  ※ 추가 유닛은 승자에서만 발생 → 유닛수 증가분이 곧 강세장 추가 참여분.")
+
+
+def _equity_gated_trades(mode, start, end, watch, costs, cfg, lookback, threshold, adds, step):
+    """equity-curve 게이트 피라미딩 — 이미 청산된 최근 lookback 거래 평균 net%>threshold 일 때만 불타기.
+
+    look-ahead 방지: 진입일 i_day 시점에 **청산이 끝난** 거래만으로 레짐 판정.
+    반환: 유닛 net% 리스트(각 유닛=별도 거래).
+    """
+    global V_PYRAMID_ADDS, V_PYRAMID_STEP_R
+    V_PYRAMID_ADDS, V_PYRAMID_STEP_R = adds, step
+    key = (mode, tuple(watch), start, end, cfg_top)
+    if key not in _UNIV_CACHE:
+        run(mode, start, end, watch, costs, cfg)   # 유니버스 로드(캐시 채움)
+    dates, kospi_close, broad = _UNIV_CACHE[key]
+    need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
+
+    closed_base: list[float] = []      # 청산 완료 거래의 초기유닛 net%
+    pending: list[tuple[int, float]] = []   # (청산 영업일 idx, 초기유닛 net%)
+    nets_out: list[float] = []
+    for i_day, date_str in enumerate(dates[:-1]):
+        # 오늘 이전에 청산된 거래 → closed_base 편입 (look-ahead 방지)
+        closed_base.extend(bn for ex, bn in pending if ex <= i_day)
+        pending = [(ex, bn) for ex, bn in pending if ex > i_day]
+        if i_day < need:
+            continue
+        recent = closed_base[-lookback:]
+        regime_ok = len(recent) >= max(3, lookback // 2) and (sum(recent) / len(recent)) > threshold
+        date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+        kospi_upto = kospi_close[:i_day + 1]
+        for code, full in broad.items():
+            idx = next((k for k, b in enumerate(full) if b["date"] == date_fmt), None)
+            if idx is None or idx < need or full[idx]["value"] < MIN_VALUE_KRW:
+                continue
+            sig = entry_signal(full[:idx + 1], kospi_upto, cfg)
+            if not sig.passed or idx + 1 >= len(full) or full[idx]["close"] <= 0:
+                continue
+            unit_nets, held = simulate_units(full, idx, cfg, costs, allow_pyramid=regime_ok)
+            if not unit_nets:
+                continue
+            nets_out.extend(unit_nets)
+            pending.append((i_day + 1 + held, unit_nets[0]))   # 초기유닛으로 레짐 추적
+    return nets_out
+
+
+def report_pyramid_equity(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """equity-curve 레짐 게이트 피라미딩 — 전략이 최근 통할 때만 불타기."""
+    global V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_REGIME_MA, V_PYRAMID_REGIME_MOM
+    print("\n" + "=" * 100)
+    print(f"equity-curve 게이트 피라미딩 A/B — {label} (비용 차감 후, 각 유닛=별도 거래)")
+    print("=" * 100)
+    print(f"  {'변형':34} {'유닛수':>6} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>11}")
+
+    def show(vlabel, nets):
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:34} 진입 0건"); return
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:34} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+10.1f}%")
+
+    V_USE_UNITS, V_PYRAMID_REGIME_MA, V_PYRAMID_REGIME_MOM = False, None, None
+    show("현행(부분익절+트레일)", [n for _, n in run(mode, start, end, watch, costs, cfg)])
+    V_USE_UNITS = True; V_PYRAMID_ADDS = 2; V_PYRAMID_STEP_R = 1.0
+    show("피라미딩 +2 (게이트 없음)", [n for _, n in run(mode, start, end, watch, costs, cfg)])
+    V_USE_UNITS = False
+    for lb, th, adds in [(10, 0.0, 2), (20, 0.0, 2), (20, 0.3, 2), (20, 0.0, 3)]:
+        show(f"equity게이트 +{adds} (최근{lb}거래 평균>{th})",
+             _equity_gated_trades(mode, start, end, watch, costs, cfg, lb, th, adds, 1.0))
+    V_PYRAMID_ADDS, V_PYRAMID_STEP_R = 0, 1.0
+    print("  ※ '전략이 최근 통할 때만' 불타기 → 횡보장(2025) 억제·추세장(2026) 포착 되는지 두 구간 모두 확인.")
+
+
+def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """레짐 게이트 피라미딩 — 시장이 추세(KOSPI>MA)일 때만 불타기. 횡보장 증폭손실 회피 검증."""
+    global V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R, V_PYRAMID_REGIME_MA, V_PYRAMID_REGIME_MOM
+    V_PYRAMID_STEP_R = 1.0
+    # (label, use_units, adds, regime_ma, regime_mom)
+    variants = [
+        ("현행(부분익절+트레일)",          False, 0, None, None),
+        ("피라미딩 +2 (게이트 없음)",       True,  2, None, None),
+        ("피라미딩 +2 (KOSPI 60d>5%)",     True,  2, None, (60, 5.0)),
+        ("피라미딩 +2 (KOSPI 60d>8%)",     True,  2, None, (60, 8.0)),
+        ("피라미딩 +2 (KOSPI 60d>10%)",    True,  2, None, (60, 10.0)),
+        ("피라미딩 +3 (KOSPI 60d>8%)",     True,  3, None, (60, 8.0)),
+    ]
+    print("\n" + "=" * 96)
+    print(f"레짐 게이트 피라미딩 A/B — {label} (비용 차감 후, 각 유닛=별도 거래)")
+    print("=" * 96)
+    print(f"  {'변형':30} {'유닛수':>6} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>11}")
+    for vlabel, use_u, adds, rma, rmom in variants:
+        V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_REGIME_MA, V_PYRAMID_REGIME_MOM = use_u, adds, rma, rmom
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:30} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:30} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+10.1f}%")
+    V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_REGIME_MA, V_PYRAMID_REGIME_MOM = False, 0, None, None
+    print("  ※ 레짐 게이트가 횡보장 추가유닛을 억제해 증폭손실을 줄이면서 추세장 상승을 살리는지 확인.")
+
+
 def main():
     global cfg_top
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -288,6 +481,9 @@ def main():
     p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
     p.add_argument("--abtest", action="store_true", help="검증대기 항목 A/B 비교(첫익절/청산선/하드손절)")
     p.add_argument("--rstest", action="store_true", help="RS 게이트 A/B 비교(절대값 vs 상위 20/30/40%)")
+    p.add_argument("--pyramidtest", action="store_true", help="피라미딩(승자 불타기) A/B 비교")
+    p.add_argument("--pyramidregime", action="store_true", help="레짐 게이트 피라미딩 A/B(KOSPI>MA 일 때만)")
+    p.add_argument("--pyramidequity", action="store_true", help="equity-curve 게이트 피라미딩 A/B(전략 최근 성적>0일 때만)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -299,6 +495,12 @@ def main():
         report_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.rstest:
         report_rs_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.pyramidtest:
+        report_pyramid(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.pyramidregime:
+        report_pyramid_regime(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.pyramidequity:
+        report_pyramid_equity(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

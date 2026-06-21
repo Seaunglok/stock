@@ -45,7 +45,10 @@ logging.getLogger().setLevel(logging.WARNING)
 
 # ─── 설정 ──────────────────────────────────────────────────────────────────
 ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
-MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
+# 라벨은 MCP 서버의 KIWOOM_PRODUCTION_MODE 와 단일 소스. MCP 서버가 paper 면 MOCK, production 이면 REAL.
+# 과거에 별도 MOCK_MODE env 를 받았으나 주문경로(MCP)와 라벨(데몬) 불일치 footgun 으로 제거(2026-06-19).
+PRODUCTION_MODE = os.getenv("KIWOOM_PRODUCTION_MODE", "false").lower() == "true"
+MOCK_MODE = not PRODUCTION_MODE
 TRADING_URL = "http://localhost:8030/mcp/"
 MARKET_URL = "http://localhost:8031/mcp/"
 INFO_URL = "http://localhost:8032/mcp/"
@@ -53,6 +56,8 @@ INVESTOR_URL = "http://localhost:8033/mcp/"
 PORTFOLIO_URL = "http://localhost:8034/mcp/"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Critical 알림 별도 채팅(미설정 시 기본 채팅 사용). 매도거부/누적실패/긴급 등에만 전송.
+TELEGRAM_CRITICAL_CHAT_ID = os.getenv("TELEGRAM_CRITICAL_CHAT_ID", "") or TELEGRAM_CHAT_ID
 
 UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "watchlist")   # 기본 watchlist (검증 최고)
 WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").split(",") if c.strip()]
@@ -85,10 +90,13 @@ SECTOR_GATE = os.getenv("TREND_SECTOR_GATE", "false").lower() == "true"
 SECTOR_MIN_AVG = float(os.getenv("TREND_SECTOR_MIN_AVG", "1.0"))     # 주도 판정: 섹터 평균 등락률 하한 %
 SECTOR_BREADTH = float(os.getenv("TREND_SECTOR_BREADTH", "0.6"))    # 주도 판정: 상승종목 비율 하한 (집단상승)
 SECTOR_TOP_K = int(os.getenv("TREND_SECTOR_TOP_K", "3"))
-TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "18.0"))
+# 거래비용 (편도 bps). 거래세는 정부 정책 가변 → 보수 20bps(코스피 0.20%·코스닥 0.20%, 2026 기준).
+# 키움 비대면 위탁수수료 0.015% 편도, 대형주 시장가 슬리피지 0.10% 편도 (실전 첫주 후 보정).
+# 환경변수 prefix CLOSING_BET_* 공용(과거 잔존, 변경하면 closing-bet 도 영향). 실전에선 .env 로 override.
+TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "20.0"))
 FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
 SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
-ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0
+ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0  # 매도세 + 2×수수료 + 2×슬리피지
 FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
 # 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "0") or 0)
@@ -98,6 +106,9 @@ PYRAMID_ADDS = int(os.getenv("TREND_PYRAMID_ADDS", "0") or 0)          # 종목�
 PYRAMID_STEP_R = float(os.getenv("TREND_PYRAMID_STEP_R", "1.0"))       # 추가 트리거 간격(R배수)
 PYRAMID_LOOKBACK = int(os.getenv("TREND_PYRAMID_LOOKBACK", "20"))      # equity 게이트 청산거래 표본 수
 PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이트 임계(최근 평균 net% >)
+# Reconcile(어댑트) 모드: all=모든 broker 보유분 편입(기본·기존 동작), watchlist=WATCHLIST 종목만, off=어댑트 안 함.
+# 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되는 위험 차단용.
+ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "all").lower()
 
 CFG = TrendConfig(
     mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),

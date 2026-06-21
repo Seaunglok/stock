@@ -386,17 +386,11 @@ def validate_all_required_for_trading() -> dict[str, Any]:
         "KIWOOM_PRODUCTION_MODE", False
     )  # 환경변수로 제어
 
-    # 환경변수로 실거래 모드를 시도해도 무시하고 경고
-    if get_boolean_env_var("KIWOOM_PRODUCTION_MODE", False):
+    # KIWOOM_PRODUCTION_MODE=true → 실거래 API(api.kiwoom.com) 사용. 경고 후 진행.
+    if production_mode:
         logger.warning(
-            "production_mode_disabled",
-            message="️ 실거래 모드는 보안상 완전히 비활성화되었습니다. 모의투자 모드만 사용 가능합니다.",
-        )
-
-    if not get_boolean_env_var("KIWOOM_MOCK_MODE", True):
-        logger.warning(
-            "mock_mode_forced",
-            message="️ 모의투자 모드가 강제로 활성화되었습니다. 실거래는 지원하지 않습니다.",
+            "production_mode_enabled",
+            message="⚠️ PRODUCTION MODE — 실거래 API 사용. 주문은 실제 체결됩니다.",
         )
 
     return {

@@ -54,17 +54,26 @@ def _html_safe(msg: str) -> str:
                .replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>"))
 
 
-async def notify(msg: str) -> None:
-    logger.info("[NOTIFY] %s", msg[:200].replace("\n", " "))
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+async def notify(msg: str, critical: bool = False) -> None:
+    """텔레그램 알림. critical=True 면 TELEGRAM_CRITICAL_CHAT_ID 로 전송(미설정 시 기본 채팅).
+
+    Critical 용도: 매도거부, 누적실패, 긴급정지 등 즉시대응 필요 알림.
+    """
+    tag = "[CRITICAL] " if critical else "[NOTIFY] "
+    logger.info("%s%s", tag, msg[:200].replace("\n", " "))
+    if not TELEGRAM_TOKEN:
+        return
+    chat = TELEGRAM_CRITICAL_CHAT_ID if critical else TELEGRAM_CHAT_ID
+    if not chat:
         return
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                             json={"chat_id": TELEGRAM_CHAT_ID, "text": _html_safe(msg), "parse_mode": "HTML"})
+                             json={"chat_id": chat, "text": _html_safe(msg), "parse_mode": "HTML"})
             if r.status_code != 200:
-                logger.warning("[TELEGRAM] 전송 실패 %s: %s", r.status_code, r.text[:200])
+                logger.warning("[TELEGRAM%s] 전송 실패 %s: %s",
+                               " CRIT" if critical else "", r.status_code, r.text[:200])
     except Exception as e:
         logger.warning("[TELEGRAM] %s", e)
 
@@ -153,14 +162,26 @@ async def phase_reconcile() -> None:
 
     트레일 stop 은 '현재가' 기준으로 새로 잡아 편입 즉시 손절을 방지한다(편입 시점부터 추적).
     손익(entry_price)은 실제 평단 기준. 이후 _manage 가 MA50이탈/트레일/외인전환 시 처분.
+
+    ADOPT_MODE 제어 (실전 안전): all=전체 편입(기본·MOCK용), watchlist=WATCHLIST 만, off=편입 안 함.
+    실전에선 HTS 수동매수/장기보유분이 trend 청산룰로 강제처분되지 않도록 off/watchlist 권장.
     """
-    log_event("phase_start", {"phase": "reconcile"})
+    log_event("phase_start", {"phase": "reconcile", "adopt_mode": ADOPT_MODE})
+    if ADOPT_MODE == "off":
+        logger.info("[RECONCILE] ADOPT_MODE=off — broker 보유분 편입 생략")
+        return
     holdings = await _broker_holdings()
     if not holdings:
         return
+    if ADOPT_MODE == "watchlist":
+        before = len(holdings)
+        holdings = [h for h in holdings if h["symbol"] in WATCHLIST]
+        logger.info("[RECONCILE] ADOPT_MODE=watchlist — %d→%d종 (WATCHLIST: %s)",
+                    before, len(holdings), ",".join(WATCHLIST))
     positions = get_state("positions", [])
     held = {p["symbol"] for p in positions}
     adopted = []
+    skipped = []
     for h in holdings:
         if h["symbol"] in held:
             continue
@@ -438,6 +459,47 @@ def _pyramid_init(pos: dict, entry: float, stop: float) -> None:
     pos["partial_done"] = True               # 부분익절 off (검증: 불타기는 부분익절 없이 트레일)
 
 
+async def _verify_buy_fills(bought: list[dict], positions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """매수 phase 직후 broker 잔고와 대조 — 부분/미체결 감지 시 state qty 보정.
+
+    물타기 금지(1종목 1진입) 전제하에, 신규 매수 종목의 broker 보유수량 = pos.qty 여야 정상.
+    broker < state: 부분체결 → state qty 축소(보유분만 추적). broker = 0: 미체결 → state 제거.
+    호출 직후 호가/체결 지연을 고려해 짧게 대기. paper 모드는 즉시체결로 보통 정상.
+    """
+    if not bought:
+        return bought, positions
+    await asyncio.sleep(2.0)   # 체결 동기화 짧은 대기
+    try:
+        held = await _broker_holdings()
+    except Exception as e:
+        logger.warning("[VERIFY] broker 조회 실패 — fill 검증 스킵: %s", e)
+        return bought, positions
+    held_map = {h["symbol"]: h["qty"] for h in held}
+    fixed_bought, removed, partial = [], [], []
+    for p in bought:
+        actual = held_map.get(p["symbol"], 0)
+        if actual <= 0:
+            removed.append(p)
+            log_event("fill_missing", {"symbol": p["symbol"], "requested_qty": p["qty"]})
+            logger.error("[VERIFY] %s %s 미체결(broker 보유 0) — state 제거", p["symbol"], p["name"])
+            continue
+        if actual < p["qty"]:
+            partial.append((p, p["qty"], actual))
+            log_event("fill_partial", {"symbol": p["symbol"], "requested_qty": p["qty"], "filled_qty": actual})
+            logger.warning("[VERIFY] %s %s 부분체결 %d/%d → state 조정", p["symbol"], p["name"], actual, p["qty"])
+            p["qty"] = actual
+        fixed_bought.append(p)
+    if removed:
+        rm_syms = {p["symbol"] for p in removed}
+        positions = [pp for pp in positions if pp["symbol"] not in rm_syms]
+        await notify("⚠️ 미체결 감지 — 진입 취소\n" +
+                     "\n".join(f"• {p['name']}({p['symbol']}) 요청{p['qty']}주 → broker 0" for p in removed))
+    if partial:
+        await notify("⚠️ 부분체결 감지 — state 축소\n" +
+                     "\n".join(f"• {p['name']}({p['symbol']}) {req}→{act}주" for p, req, act in partial))
+    return fixed_bought, positions
+
+
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
@@ -568,6 +630,7 @@ async def phase_entry() -> None:
                     positions.append(pos); bought.append(pos)
     except Exception as e:
         logger.error("[ENTRY] %s", e); await notify(f"❌ 진입 오류: {e}"); return
+    bought, positions = await _verify_buy_fills(bought, positions)
     save_state("positions", positions)
     save_state("pending_entries", pending)
     if bought or pending:
@@ -629,6 +692,7 @@ async def _try_pending() -> None:
                     still.append(c)
     except Exception as e:
         logger.error("[PENDING] %s", e); return
+    bought, positions = await _verify_buy_fills(bought, positions)
     if bought:
         save_state("positions", positions)
     save_state("pending_entries", still)
@@ -709,6 +773,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
         return
     remaining = []
     closed = []
+    sell_failures: list[dict] = []   # phase 내 매도 거부 누적 (8005/거부/예외) — 임계 초과 시 critical alert
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
@@ -732,11 +797,24 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                     foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT)
                 if not action:
                     remaining.append(pos); continue
+                # 매도 시도(클라이언트 단의 8005 자동복구 1회 포함). 실패 시 1회 추가 재시도.
                 resp = await _place(mcp, "sell", sym, sell_qty)
                 ok, why = _order_accepted(resp)
                 if not ok:
-                    logger.error("[REJECT] %s %s — %s", when, sym, why)
-                    log_event("order_reject", {"phase": when, "symbol": sym, "why": why, "raw": resp})
+                    logger.warning("[RETRY] %s %s 매도 첫 시도 실패 (%s) — 2초 후 재시도", when, sym, why)
+                    await asyncio.sleep(2.0)
+                    resp = await _place(mcp, "sell", sym, sell_qty)
+                    ok, why = _order_accepted(resp)
+                if not ok:
+                    logger.error("[REJECT] %s %s 매도 거부 (재시도 후에도 실패) — %s", when, sym, why)
+                    log_event("order_reject", {"phase": when, "symbol": sym, "qty": sell_qty,
+                                               "reason": reason, "why": why, "raw": resp})
+                    # 매도 거부는 시장 노출 직결 → critical alert (개별 알림)
+                    await notify(f"🚨 <b>매도 거부</b> [{when}] {pos['name']}({sym}) {sell_qty}주 "
+                                 f"@{cur:,.0f} 사유:{reason}\n원인:{why}\n→ HTS 수동매도 검토",
+                                 critical=True)
+                    sell_failures.append({"symbol": sym, "name": pos["name"], "qty": sell_qty,
+                                          "reason": reason, "why": why})
                     remaining.append(pos); continue
                 pnl_pct = round((cur - entry) / entry * 100, 2)
                 if action == "PARTIAL":
@@ -762,6 +840,12 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     except Exception as e:
         logger.error("[%s] %s", when, e); return
     save_state("positions", remaining)
+    # 매도 거부 누적이 임계치 초과(시도 절반 이상 또는 3건+) → 시스템적 문제 가능성 → critical alert
+    attempts = len(closed) + len(sell_failures)
+    if sell_failures and (len(sell_failures) >= 3 or len(sell_failures) >= attempts / 2):
+        await notify(f"🚨🚨 <b>[{when}] 매도 거부 누적 {len(sell_failures)}/{attempts}건</b> — 시스템 점검 필요\n"
+                     "8005 토큰/계좌권한/거래시간/잔고 확인. 필요 시 `python scripts/trend_panic.py --flatten`",
+                     critical=True)
     if closed:
         def _exit_line(x: dict) -> str:
             p, n = x["pos"], x["net"]
@@ -848,13 +932,65 @@ async def write_daily_journal() -> None:
     for p, live, pnl, amt in rows:
         L.append(f"| {p['name']}({p['symbol']}) | {p['qty']} | {p['entry_price']:,.0f} | "
                  f"{live:,.0f} | {pnl:+.2f}% | {amt:+,.0f} |")
+
+    # 안전 이벤트 카운터 (events.jsonl 스캔) — 운영 모니터링용
+    events_file = DATA_DIR / today / "events.jsonl"
+    counts = {"hard_stop": 0, "circuit_break": 0, "sell_reject": 0,
+              "adopted": 0, "fill_partial": 0, "fill_missing": 0, "pyramid": 0}
+    if events_file.exists():
+        for ln in events_file.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                ev = json.loads(ln)
+            except Exception:
+                continue
+            name = ev.get("event", "")
+            payload = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
+            if name == "exit" and "하드" in str(payload.get("reason", "")):
+                counts["hard_stop"] += 1
+            elif name == "circuit_break":
+                counts["circuit_break"] += 1
+            elif name == "order_reject" and payload.get("phase") in ("exit", "intraday", "force_close"):
+                counts["sell_reject"] += 1
+            elif name == "reconcile_adopt":
+                counts["adopted"] += 1
+            elif name == "fill_partial":
+                counts["fill_partial"] += 1
+            elif name == "fill_missing":
+                counts["fill_missing"] += 1
+            elif name == "pyramid_add":
+                counts["pyramid"] += 1
+    if any(v > 0 for v in counts.values()):
+        L += ["", "## ⚙️ 안전 이벤트 (당일)"]
+        if counts["hard_stop"]:    L.append(f"- 🔴 하드손절 발동 **{counts['hard_stop']}건**")
+        if counts["circuit_break"]: L.append(f"- 🛑 서킷브레이커 발동 **{counts['circuit_break']}건**")
+        if counts["sell_reject"]:  L.append(f"- 🚨 매도 거부 **{counts['sell_reject']}건** (재시도 후 실패)")
+        if counts["fill_missing"]: L.append(f"- ⚠️ 미체결 감지 **{counts['fill_missing']}건**")
+        if counts["fill_partial"]: L.append(f"- ⚠️ 부분체결 감지 **{counts['fill_partial']}건**")
+        if counts["adopted"]:      L.append(f"- 📥 계좌보유분 편입 **{counts['adopted']}종**")
+        if counts["pyramid"]:      L.append(f"- 📈 피라미딩 추가매수 **{counts['pyramid']}건**")
+
     L += ["", "*자동 생성. 심리/실수/개선은 `--journal-note <id>` 또는 대시보드에서 추가.*", ""]
 
     out = _ROOT / "docs" / f"{today}-trend-journal.md"
     out.write_text("\n".join(L), encoding="utf-8")
     logger.info("[JOURNAL] 매매일지 자동작성: %s", out.name)
     log_event("journal_write", {"file": out.name, "entries": len(entries), "exits": len(exits), "eval_pnl": round(tot)})
-    await notify(f"📓 매매일지 작성 {today} — 진입 {len(entries)}·청산 {len(exits)}·보유 {len(positions)}·평가 {tot:+,.0f}원")
+    # 마감 요약 알림 — 모드 + 진입/청산/보유 + 실현/평가 + 안전이벤트 카운트
+    safety_line = ""
+    if any(v > 0 for v in counts.values()):
+        bits = []
+        if counts["hard_stop"]:     bits.append(f"하드손절 {counts['hard_stop']}")
+        if counts["circuit_break"]: bits.append(f"서킷 {counts['circuit_break']}")
+        if counts["sell_reject"]:   bits.append(f"매도거부 {counts['sell_reject']}")
+        if counts["fill_missing"]:  bits.append(f"미체결 {counts['fill_missing']}")
+        if counts["fill_partial"]:  bits.append(f"부분체결 {counts['fill_partial']}")
+        safety_line = "\n⚠️ " + " · ".join(bits)
+    mode_tag = "💰 REAL" if PRODUCTION_MODE else "🧪 MOCK"
+    await notify(f"📓 <b>마감 {today}</b> ({mode_tag})\n"
+                 f"진입 {len(entries)} · 청산 {len(exits)} · 보유 {len(positions)}\n"
+                 f"실현 {realized:+,.0f}원 · 평가 {tot:+,.0f}원" + safety_line)
 
 
 # ─── 데몬 ──────────────────────────────────────────────────────────────────
@@ -881,8 +1017,34 @@ def _next_run(h: int, m: int) -> datetime:
 
 async def scheduler_daemon() -> None:
     logger.info("=" * 56)
-    logger.info("[DAEMON] 추세추종 시작 | 모드=%s | MOCK=%s | 08:50 스크린/09:30 진입/장중 트레일/15:20 청산",
-                UNIVERSE_MODE, MOCK_MODE)
+    if PRODUCTION_MODE:
+        logger.warning("[DAEMON] ⚠️ PRODUCTION MODE — 실거래 API 사용. 주문은 실제 체결됩니다.")
+        logger.warning("[DAEMON] 계좌=%s · 사이징=%s %s · 최대슬롯=%d · HardStop=%s%% · 일일손실서킷=%s%%",
+                       (ACCOUNT_NO[:4] + "****") if ACCOUNT_NO else "없음",
+                       SIZING_MODE, POSITION_PCT, MAX_POS, HARD_STOP_PCT, DAILY_LOSS_LIMIT_PCT)
+        # 실전 안전 기본값 가드: 첫주 권장 ≤3% 균등·≤5슬롯·하드손절 ON·일일손실서킷 ON
+        warns: list[str] = []
+        if SIZING_MODE == "pct_equity" and POSITION_PCT > 3:
+            warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
+        if MAX_POS > 5:
+            warns.append(f"MAX_POS={MAX_POS} > 권장 5 (실전 첫주 슬롯 과다)")
+        if HARD_STOP_PCT <= 0:
+            warns.append("HARD_STOP_PCT=0 — 하드손절 비활성 (실전엔 7% 권장)")
+        if DAILY_LOSS_LIMIT_PCT <= 0:
+            warns.append("DAILY_LOSS_LIMIT_PCT=0 — 일일손실 서킷 비활성 (실전엔 2% 권장)")
+        if PYRAMID_ADDS > 0:
+            warns.append(f"PYRAMID_ADDS={PYRAMID_ADDS} — 피라미딩 ON (실전 첫달 보류 권장)")
+        if ADOPT_MODE == "all":
+            warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
+        for w in warns:
+            logger.warning("[DAEMON][LIVE-GUARD] ⚠️ %s", w)
+        if warns:
+            await notify("⚠️ 실전 가드 경고 " + str(len(warns)) + "건: " + "; ".join(warns),
+                         critical=True)
+    else:
+        logger.info("[DAEMON] 🧪 MOCK MODE — 모의투자 API. KIWOOM_PRODUCTION_MODE=true 로 실전 전환.")
+    logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/09:30 진입/장중 트레일/15:20 청산",
+                UNIVERSE_MODE)
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
     await notify(f"🚀 추세추종 데몬 시작 ({'🧪 MOCK' if MOCK_MODE else '💰 REAL'}) 모드:{UNIVERSE_MODE}")

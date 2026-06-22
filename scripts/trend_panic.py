@@ -93,8 +93,8 @@ def _backup_state() -> None:
 async def _flatten_all() -> None:
     """trend 데몬이 추적하던 모든 보유분을 시장가 즉시 청산. broker_holdings 기준(state 신뢰X)."""
     from src.claude_agents.base.mcp_client import MCPManager
-    from trend.config import ACCOUNT_NO, PORTFOLIO_URL, TRADING_URL
-    from trend.kiwoom_io import _broker_holdings, _order_accepted, _place
+    from trend_config import ACCOUNT_NO, PORTFOLIO_URL, TRADING_URL
+    from trend_kiwoom_io import _broker_holdings, _order_accepted, _place
 
     held = await _broker_holdings()
     if not held:

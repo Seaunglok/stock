@@ -1,4 +1,4 @@
-"""키움 MCP I/O 레이어 — 시세/수급/계좌/주문/업종지수 (scripts/trend/kiwoom_io.py).
+"""키움 MCP I/O 레이어 — 시세/수급/계좌/주문/업종지수 (scripts/trend_kiwoom_io.py).
 
 모든 함수가 _kiwoom_call(공용 호출) + _num(숫자파싱)을 재사용. 실패 시 graceful 기본값.
 """
@@ -10,7 +10,7 @@ from typing import Any
 
 from src.claude_agents.base.mcp_client import MCPManager
 
-from trend.config import (
+from trend_config import (
     ACCOUNT_NO, INFO_URL, INVESTOR_URL, MARKET_URL, PORTFOLIO_URL, TRADING_URL, logger,
 )
 
@@ -197,7 +197,7 @@ async def _sector_index_rows() -> list[dict] | None:
 # ─── universe wrapper ──────────────────────────────────────────────────────
 # scripts/trend/market_data.py 가 삭제되면서 데몬용 get_universe (config 자동 주입) 흡수.
 def get_universe() -> list[tuple[str, str]]:
-    """데몬용: trend.config 의 환경설정값을 trend_mcp.market_data.get_universe 에 주입."""
+    """데몬용: trend_config 의 환경설정값을 trend_mcp.market_data.get_universe 에 주입."""
     from src.mcp_servers.trend_mcp.market_data import get_universe as _gu
-    from trend.config import MIN_VALUE_KRW, TOP_N, UNIVERSE_MODE, WATCHLIST
+    from trend_config import MIN_VALUE_KRW, TOP_N, UNIVERSE_MODE, WATCHLIST
     return _gu(UNIVERSE_MODE, TOP_N, WATCHLIST, MIN_VALUE_KRW)

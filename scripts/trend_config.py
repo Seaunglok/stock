@@ -1,6 +1,6 @@
-"""추세추종 데몬 공유 설정 — .env 로드 + 상수 + 로거 (scripts/trend/config.py).
+"""추세추종 데몬 공유 설정 — .env 로드 + 상수 + 로거 (scripts/trend_config.py).
 
-trend_follow.py / kiwoom_io.py / market_data.py 가 공유. import 시 .env 로드 + 로깅 설정 1회.
+trend_follow.py / trend_kiwoom_io.py 가 공유. import 시 .env 로드 + 로깅 설정 1회.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[2]   # scripts/trend/config.py → repo root
+_ROOT = Path(__file__).resolve().parents[1]   # scripts/trend_config.py → repo root
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 try:

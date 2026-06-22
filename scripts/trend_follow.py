@@ -28,9 +28,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))   # scripts/ → trend 패키지 import 가능
 
-from trend.config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
-from trend.config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
-from trend.kiwoom_io import (               # noqa: E402
+from trend_config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
+from trend_config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
+from trend_kiwoom_io import (               # noqa: E402
     _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _order_accepted,
     _place, _premarket_snapshot, _realtime_price, _sector_index_rows, get_universe,
 )
@@ -43,7 +43,7 @@ from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     fundamentals_bonus, leading_sectors, position_size, exit_decision, is_rising,
 )
 
-# 설정·상수·CFG·paths·logger·SCHEDULE 는 trend.config 로 이동 (import * 로 노출)
+# 설정·상수·CFG·paths·logger·SCHEDULE 는 trend_config 로 이동 (import * 로 노출)
 
 
 # ─── 알림/상태/락 ──────────────────────────────────────────────────────────

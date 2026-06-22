@@ -339,3 +339,60 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
     if use_foreign and foreign_net is not None and foreign_net < 0:
         return "EXIT", "외국인 5일 순매도 전환", qty
     return None, "", 0
+
+
+# ─── 진단 ──────────────────────────────────────────────────────────────────
+def analyze_gate_funnel(
+    universe: list[tuple[str, str]],
+    kospi_closes: list[float],
+    cfg: TrendConfig,
+    held: set[str] | None = None,
+    ohlcv_loader=None,
+) -> dict:
+    """진입 게이트 퍼널 분석 — 유니버스 종목별로 entry_signal 실행해 게이트별 통과율 집계.
+
+    어떤 게이트가 후보를 떨구는지 진단(튜닝 보조). 데몬과 무관한 순수 분석 함수.
+
+    Args:
+        universe: [(code, name)] 평가 대상 종목 리스트.
+        kospi_closes: KOSPI 종가 시계열 (RS 계산용).
+        cfg: TrendConfig.
+        held: 평가 제외 종목 (보유 중). None=빈 set.
+        ohlcv_loader: callable(code) -> list[dict] OHLCV. 호출자가 데이터 소스 주입.
+
+    Returns:
+        {
+          "total": 평가 종목 수,
+          "pass_counts": {gate_name: 통과 수},
+          "all_pass": 전 게이트 통과(후보) 수,
+          "near_miss": [(code, name, missing_gate, score)] — 1개만 부족한 종목,
+        }
+    """
+    if held is None:
+        held = set()
+    if ohlcv_loader is None:
+        raise ValueError("ohlcv_loader 콜백 필수(데이터 소스 주입)")
+    pass_counts: dict[str, int] = {}
+    total = 0
+    all_pass = 0
+    near_miss: list[tuple[str, str, str, float]] = []
+    for code, name in universe:
+        if code in held:
+            continue
+        ohlcv = ohlcv_loader(code)
+        if not ohlcv:
+            continue
+        sig = entry_signal(ohlcv, kospi_closes, cfg, None, None)
+        if not sig.gates:
+            continue
+        total += 1
+        for k, v in sig.gates.items():
+            if v:
+                pass_counts[k] = pass_counts.get(k, 0) + 1
+        fails = [k for k, v in sig.gates.items() if not v]
+        if not fails:
+            all_pass += 1
+        elif len(fails) == 1:
+            near_miss.append((code, name[:10], fails[0], round(sig.score, 1)))
+    return {"total": total, "pass_counts": pass_counts,
+            "all_pass": all_pass, "near_miss": near_miss}

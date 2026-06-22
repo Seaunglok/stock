@@ -32,9 +32,9 @@ from trend.config import *                  # noqa: F401,F403  env·상수·logg
 from trend.config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
 from trend.kiwoom_io import (               # noqa: E402
     _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _order_accepted,
-    _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
+    _place, _premarket_snapshot, _realtime_price, _sector_index_rows, get_universe,
 )
-from trend.market_data import get_kospi_closes, get_ohlcv, get_universe  # noqa: E402
+from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
@@ -431,7 +431,11 @@ def _pyramid_gate_open() -> tuple[bool, float, int]:
 
     "전략이 최근 통할 때만 승자에 불타기" — 횡보장(전략 cold) 증폭손실 차단.
     """
-    if PYRAMID_ADDS <= 0 or not JOURNAL_FILE.exists():
+    if PYRAMID_ADDS <= 0:
+        return False, 0.0, 0
+    if PYRAMID_BYPASS_GATE:                      # MOCK 파일럿용 강제 OPEN — 횡보장 증폭위험 인지 전제
+        return True, 0.0, 0
+    if not JOURNAL_FILE.exists():
         return False, 0.0, 0
     nets: list[float] = []
     try:
@@ -730,8 +734,16 @@ async def _pyramid_adds(when: str) -> None:
                     continue
                 k = pos["adds_done"] + 1
                 trigger = base + k * PYRAMID_STEP_R * R
-                cur = await _realtime_price(pos["symbol"]) or 0
+                # 장중 방향 가드(2026-06-22 추가): 당일 하락 중인 종목엔 추가 보류 →
+                # ENTRY_WAIT_FALLING 정신을 불타기에도 적용(승자 + 오늘도 상승 중 = 진짜 모멘텀)
+                cur, opn = await _cur_and_open(pos["symbol"])
+                if cur <= 0:
+                    continue
                 if cur < trigger:
+                    continue
+                if opn > 0 and not _is_rising(cur, opn):
+                    logger.info("[PYRAMID] %s 하락중(현재%.0f<시가%.0f) — 추가 보류(다음 cycle 재평가)",
+                                pos["symbol"], cur, opn)
                     continue
                 add_qty = await _size_qty(cur)
                 if add_qty < 1:
@@ -1034,6 +1046,8 @@ async def scheduler_daemon() -> None:
             warns.append("DAILY_LOSS_LIMIT_PCT=0 — 일일손실 서킷 비활성 (실전엔 2% 권장)")
         if PYRAMID_ADDS > 0:
             warns.append(f"PYRAMID_ADDS={PYRAMID_ADDS} — 피라미딩 ON (실전 첫달 보류 권장)")
+        if PYRAMID_BYPASS_GATE:
+            warns.append("PYRAMID_BYPASS_GATE=true — equity-curve 안전게이트 비활성 (횡보장 증폭위험)")
         if ADOPT_MODE == "all":
             warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
         for w in warns:

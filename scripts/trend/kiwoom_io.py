@@ -192,3 +192,12 @@ async def _sector_index_rows() -> list[dict] | None:
     except Exception as e:
         logger.debug("[SECTOR] 업종지수 조회 실패: %s", e)
         return None
+
+
+# ─── universe wrapper ──────────────────────────────────────────────────────
+# scripts/trend/market_data.py 가 삭제되면서 데몬용 get_universe (config 자동 주입) 흡수.
+def get_universe() -> list[tuple[str, str]]:
+    """데몬용: trend.config 의 환경설정값을 trend_mcp.market_data.get_universe 에 주입."""
+    from src.mcp_servers.trend_mcp.market_data import get_universe as _gu
+    from trend.config import MIN_VALUE_KRW, TOP_N, UNIVERSE_MODE, WATCHLIST
+    return _gu(UNIVERSE_MODE, TOP_N, WATCHLIST, MIN_VALUE_KRW)

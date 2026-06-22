@@ -1,15 +1,23 @@
-"""시세/유니버스 데이터 레이어 — pykrx OHLCV·KOSPI지수·시총상위 유니버스 (scripts/trend/market_data.py)."""
+"""시세/유니버스 데이터 레이어 — pykrx OHLCV·KOSPI지수·시총상위 유니버스.
+
+trend 도메인 순수 데이터 함수. 외부 의존 (config·logger·env) 없음 — 호출자가 모드/한계값을 파라미터로 주입.
+trend daemon(scripts/trend_follow.py) 과 backtest(scripts/backtest_trend.py) 모두 이 모듈을 공유한다.
+"""
 from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 with contextlib.redirect_stdout(io.StringIO()):
     from pykrx import stock as krx
 
-from trend.config import _ROOT, MIN_VALUE_KRW, TOP_N, UNIVERSE_MODE, WATCHLIST, logger
+logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).resolve().parents[3]   # src/mcp_servers/trend_mcp/market_data.py → repo root
 
 
 def _today() -> str:
@@ -90,20 +98,26 @@ def _name(code: str) -> str:
 
 
 def _broad_codes() -> list[str]:
-    """KOSPI 시총상위 캐시(docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스."""
-    sys.path.insert(0, str(_ROOT / "scripts"))
+    """KOSPI 시총상위 캐시(docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스.
+
+    scripts/backtest_dynamic.get_broad_universe 를 lazy import (sys.path 추가는 함수 내부 한정).
+    """
+    scripts_dir = str(_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
     from backtest_dynamic import get_broad_universe  # 백테스트와 동일 유니버스
     return get_broad_universe()
 
 
-def get_universe() -> list[tuple[str, str]]:
-    """모드별 유니버스 [(code, name)]."""
-    if UNIVERSE_MODE == "watchlist":
-        return [(c, _name(c)) for c in WATCHLIST]
+def get_universe(mode: str, top_n: int, watchlist: list[str],
+                 min_value: float) -> list[tuple[str, str]]:
+    """모드별 유니버스 [(code, name)]. 모든 설정값은 호출자가 주입 (config 의존 0)."""
+    if mode == "watchlist":
+        return [(c, _name(c)) for c in watchlist]
     # largecap: 시총상위 캐시 우선(pykrx 전종목 조회가 장중 실패해도 안정) — 백테스트와 동일.
-    if UNIVERSE_MODE == "largecap":
+    if mode == "largecap":
         try:
-            codes = _broad_codes()[:TOP_N]
+            codes = _broad_codes()[:top_n]
             if codes:
                 return [(c, _name(c)) for c in codes]
         except Exception as e:
@@ -116,20 +130,20 @@ def get_universe() -> list[tuple[str, str]]:
                 df = krx.get_market_ohlcv_by_ticker(date, market="KOSPI")
             if df.empty:
                 continue
-            df = df[df["거래대금"] >= MIN_VALUE_KRW]
-            if UNIVERSE_MODE == "gainers" and "등락률" in df.columns:
+            df = df[df["거래대금"] >= min_value]
+            if mode == "gainers" and "등락률" in df.columns:
                 df = df.sort_values("등락률", ascending=False)
             else:  # largecap 캐시 실패 시 거래대금 상위 근사
                 df = df.sort_values("거래대금", ascending=False)
-            codes = list(df.head(TOP_N).index)
+            codes = list(df.head(top_n).index)
             return [(c, _name(c)) for c in codes]
         except Exception:
             continue
     # 최종 폴백: 시총상위 캐시 → watchlist (조용한 2종목 폴백 방지)
     try:
-        codes = _broad_codes()[:TOP_N]
+        codes = _broad_codes()[:top_n]
         if codes:
             return [(c, _name(c)) for c in codes]
     except Exception:
         pass
-    return [(c, _name(c)) for c in WATCHLIST]
+    return [(c, _name(c)) for c in watchlist]

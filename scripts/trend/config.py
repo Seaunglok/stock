@@ -106,6 +106,9 @@ PYRAMID_ADDS = int(os.getenv("TREND_PYRAMID_ADDS", "0") or 0)          # 종목�
 PYRAMID_STEP_R = float(os.getenv("TREND_PYRAMID_STEP_R", "1.0"))       # 추가 트리거 간격(R배수)
 PYRAMID_LOOKBACK = int(os.getenv("TREND_PYRAMID_LOOKBACK", "20"))      # equity 게이트 청산거래 표본 수
 PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이트 임계(최근 평균 net% >)
+# Equity-curve 게이트 우회(MOCK 파일럿/테스트용). true 시 청산이력 무관 즉시 OPEN — 횡보장 증폭손실 위험.
+# 실전 전환 시 반드시 false 복귀. PRODUCTION 모드 + 이 값 true 면 LIVE-GUARD 경고 발화.
+PYRAMID_BYPASS_GATE = os.getenv("TREND_PYRAMID_BYPASS_GATE", "false").lower() == "true"
 # Reconcile(어댑트) 모드: all=모든 broker 보유분 편입(기본·기존 동작), watchlist=WATCHLIST 종목만, off=어댑트 안 함.
 # 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되는 위험 차단용.
 ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "all").lower()

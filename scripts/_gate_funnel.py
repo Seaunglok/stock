@@ -3,7 +3,8 @@ import sys, json
 from collections import Counter
 sys.path.insert(0, ".")
 from trend.config import CFG, UNIVERSE_MODE  # noqa: E402
-from trend.market_data import get_kospi_closes, get_ohlcv, get_universe  # noqa: E402
+from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  # noqa: E402
+from trend.kiwoom_io import get_universe  # noqa: E402  (데몬용 config 주입 wrapper)
 from src.mcp_servers.trend_mcp.signals import entry_signal  # noqa: E402
 
 kospi = get_kospi_closes()

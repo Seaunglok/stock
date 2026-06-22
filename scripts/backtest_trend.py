@@ -57,6 +57,7 @@ V_PYRAMID_ADDS: int = 0                   # 추가 유닛 수(0=초기 1유닛�
 V_PYRAMID_STEP_R: float = 1.0             # 추가 트리거 간격(R배수): 진입+ k×step×R 도달 시 추가
 V_PYRAMID_REGIME_MA: int | None = None    # 피라미딩 레짐 게이트: KOSPI>MA(N)일 때만 불타기 허용. None=항상
 V_PYRAMID_REGIME_MOM: tuple | None = None  # 모멘텀 게이트 (days, pct): KOSPI days수익률>pct% 일 때만 불타기
+V_PYRAMID_RISING_DAY: bool = False        # True=추가 유닛은 해당 영업일이 양봉(close>open)일 때만 (라이브 _is_rising 의 backtest 대응)
 
 
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
@@ -138,8 +139,11 @@ def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
     exit_price = None
     for j in range(i + 1, end):
         b = full[j]; last_j = j
-        while nxt < len(add_prices) and b["high"] >= add_prices[nxt]:
-            units.append(add_prices[nxt]); nxt += 1
+        # rising-day 가드: True 면 양봉(close>open)일 때만 추가 — 라이브 _is_rising(cur,opn) 의 backtest 대응
+        can_add = (b["close"] > b["open"]) if V_PYRAMID_RISING_DAY else True
+        if can_add:
+            while nxt < len(add_prices) and b["high"] >= add_prices[nxt]:
+                units.append(add_prices[nxt]); nxt += 1
         peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
         if b["low"] <= stop:
             exit_price = stop; break
@@ -467,6 +471,39 @@ def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], cos
     print("  ※ 레짐 게이트가 횡보장 추가유닛을 억제해 증폭손실을 줄이면서 추세장 상승을 살리는지 확인.")
 
 
+def report_pyramid_rising(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """피라미딩 rising-day 게이트 A/B — 추가 유닛을 양봉(close>open) 일에만 허용(라이브 _is_rising 의 backtest 대응).
+
+    배경: 2026-06-22 라이브 운영에서 BYPASS_GATE=true 로 retrofit 한 후 9종 일제 추가발동.
+    하락 중 종목도 추가매수 → 평단 상승 후 손실 가중. rising-day 가드가 같은 평균기대값을
+    유지하면서 P10(꼬리손실)을 개선하는지 검증.
+    """
+    global V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R, V_PYRAMID_RISING_DAY
+    variants = [
+        ("기준: 단일유닛(부분익절off)",     True, 0, 1.0, False),
+        ("피라미딩 +2유닛 @1R (rising off)", True, 2, 1.0, False),
+        ("피라미딩 +2유닛 @1R + RISING",    True, 2, 1.0, True),
+        ("피라미딩 +1유닛 @1R + RISING",    True, 1, 1.0, True),
+        ("피라미딩 +2유닛 @1.5R + RISING",  True, 2, 1.5, True),
+    ]
+    print("\n" + "=" * 96)
+    print(f"피라미딩 rising-day 게이트 A/B — {label} (비용 차감 후)")
+    print("=" * 96)
+    print(f"  {'변형':32} {'유닛':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>11}")
+    for vlabel, use_u, adds, step, rising in variants:
+        V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R, V_PYRAMID_RISING_DAY = use_u, adds, step, rising
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:32} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:32} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+10.1f}%")
+    V_USE_UNITS, V_PYRAMID_ADDS, V_PYRAMID_STEP_R, V_PYRAMID_RISING_DAY = False, 0, 1.0, False
+    print("  ※ rising-day 가 같은 기대값에서 P10·누적을 개선하면 채택. 표본 감소 폭 확인.")
+
+
 def main():
     global cfg_top
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -484,6 +521,7 @@ def main():
     p.add_argument("--pyramidtest", action="store_true", help="피라미딩(승자 불타기) A/B 비교")
     p.add_argument("--pyramidregime", action="store_true", help="레짐 게이트 피라미딩 A/B(KOSPI>MA 일 때만)")
     p.add_argument("--pyramidequity", action="store_true", help="equity-curve 게이트 피라미딩 A/B(전략 최근 성적>0일 때만)")
+    p.add_argument("--pyramidrising", action="store_true", help="피라미딩 rising-day 게이트 A/B(양봉일에만 추가)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -501,6 +539,8 @@ def main():
         report_pyramid_regime(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.pyramidequity:
         report_pyramid_equity(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.pyramidrising:
+        report_pyramid_rising(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

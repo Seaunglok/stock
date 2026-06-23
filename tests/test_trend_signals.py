@@ -10,6 +10,7 @@ from src.mcp_servers.trend_mcp.signals import (
     is_rising,
     leading_sectors,
     ma_uptrend,
+    market_breadth,
     moving_average,
     position_size,
     relative_strength,
@@ -191,6 +192,31 @@ def test_leading_sectors_min_count_and_topk():
 def test_leading_sectors_empty_and_nan():
     assert leading_sectors([]) == []
     assert leading_sectors([_sec("X", float("nan"), rising=10, falling=0)]) == []
+
+
+def test_market_breadth_strong():
+    # 상승 600 / 하락 200 / 보합 100 = 600/900 ≈ 0.667 → 양호
+    rows = [_sec("A", 1.5, rising=200, falling=80, flat=20),
+            _sec("B", 2.0, rising=200, falling=70, flat=30),
+            _sec("C", 1.0, rising=200, falling=50, flat=50)]
+    b = market_breadth(rows)
+    assert b is not None and 0.66 < b < 0.68
+
+
+def test_market_breadth_weak():
+    # 상승 150 / 하락 600 / 보합 50 = 150/800 ≈ 0.1875 → 약세
+    rows = [_sec("A", -2.5, rising=50, falling=200, flat=20),
+            _sec("B", -3.0, rising=50, falling=200, flat=20),
+            _sec("C", -1.0, rising=50, falling=200, flat=10)]
+    b = market_breadth(rows)
+    assert b is not None and 0.18 < b < 0.20
+
+
+def test_market_breadth_insufficient_sample():
+    # 표본 < 50 → None (fail-open)
+    rows = [_sec("A", 1.0, rising=10, falling=5, flat=0)]   # 15 종목만
+    assert market_breadth(rows) is None
+    assert market_breadth([]) is None
 
 
 # ── 실행 결정(순수): 사이징 / 상승판정 / 청산분기 ───────────────────────────

@@ -58,6 +58,8 @@ V_PYRAMID_STEP_R: float = 1.0             # 추가 트리거 간격(R배수): �
 V_PYRAMID_REGIME_MA: int | None = None    # 피라미딩 레짐 게이트: KOSPI>MA(N)일 때만 불타기 허용. None=항상
 V_PYRAMID_REGIME_MOM: tuple | None = None  # 모멘텀 게이트 (days, pct): KOSPI days수익률>pct% 일 때만 불타기
 V_PYRAMID_RISING_DAY: bool = False        # True=추가 유닛은 해당 영업일이 양봉(close>open)일 때만 (라이브 _is_rising 의 backtest 대응)
+V_BREAKEVEN_TRIGGER_PCT: float | None = None  # 진입가 +X% 도달 시 stop 을 BE(entry)로 끌어올림. None=off
+V_BREADTH_MIN_PCT: float | None = None    # 시장 breadth 게이트: 일별 universe 상승비율 < 이 값 일 때 신규진입 차단. None=off
 
 
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
@@ -94,6 +96,9 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
             partial = True
         # 트레일 갱신(종가)
         peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
+        # Break-even: 장중 고가가 entry +X% 도달했으면 stop 을 entry 로 끌어올림(floor) — 손실 진입 방지
+        if V_BREAKEVEN_TRIGGER_PCT and b["high"] >= entry * (1 + V_BREAKEVEN_TRIGGER_PCT / 100.0):
+            stop = max(stop, entry)
         # 손절/트레일 이탈(장중 저가) — 하드손절은 트레일 floor 로 적용
         eff_stop = max(stop, hard_floor) if hard_floor is not None else stop
         if b["low"] <= eff_stop:
@@ -145,6 +150,9 @@ def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
             while nxt < len(add_prices) and b["high"] >= add_prices[nxt]:
                 units.append(add_prices[nxt]); nxt += 1
         peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
+        # Break-even floor (단일유닛 모드와 동일 — 초기 진입가 기준)
+        if V_BREAKEVEN_TRIGGER_PCT and b["high"] >= entry * (1 + V_BREAKEVEN_TRIGGER_PCT / 100.0):
+            stop = max(stop, entry)
         if b["low"] <= stop:
             exit_price = stop; break
         ma = moving_average(closes[:j + 1], exit_ma)
@@ -209,6 +217,16 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
         if mode == "gainers":   # 당일 등락률 상위 N 로 좁힘
             day_rows.sort(key=lambda r: -_gap_pct(r[1], r[2]))
             day_rows = day_rows[:cfg_top]
+
+        # 시장 breadth 게이트(라이브 _sector_index_rows 의 backtest 대응) —
+        # 그날 universe 의 close>open(양봉) 비율로 근사. < V_BREADTH_MIN_PCT 면 신규진입 전부 차단.
+        if V_BREADTH_MIN_PCT is not None and day_rows:
+            rising = sum(1 for _, full, idx in day_rows if full[idx]["close"] > full[idx]["open"])
+            breadth = rising / len(day_rows) if day_rows else 0.0
+            if breadth < V_BREADTH_MIN_PCT:
+                if (i_day + 1) % 40 == 0:
+                    print(f"  [{i_day+1}/{len(dates)}] {date_fmt}: breadth {breadth:.2f} < {V_BREADTH_MIN_PCT} → 진입 차단")
+                continue
 
         # RS 랭킹 모드: 그날 유니버스 RS 상위 N% 만 RS 게이트 통과
         rs_pass_set = None
@@ -471,6 +489,70 @@ def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], cos
     print("  ※ 레짐 게이트가 횡보장 추가유닛을 억제해 증폭손실을 줄이면서 추세장 상승을 살리는지 확인.")
 
 
+def report_breadth(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """시장 breadth 게이트 A/B — 일별 universe 양봉비율 < X 일 때 신규진입 차단.
+
+    동기: 06-23 같은 KOSPI 광범위 약세장 9종 동시 hard stop 사고 사전 차단.
+    """
+    global V_BREADTH_MIN_PCT
+    variants = [
+        ("기준: breadth off", None),
+        ("breadth ≥ 0.30",   0.30),
+        ("breadth ≥ 0.40",   0.40),
+        ("breadth ≥ 0.50",   0.50),
+        ("breadth ≥ 0.60",   0.60),
+    ]
+    print("\n" + "=" * 96)
+    print(f"시장 breadth 게이트 A/B — {label} (비용 차감 후)")
+    print("=" * 96)
+    print(f"  {'변형':24} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
+    for vlabel, pct in variants:
+        V_BREADTH_MIN_PCT = pct
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:24} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:24} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+9.1f}%")
+    V_BREADTH_MIN_PCT = None
+    print("  ※ 약세장 진입 차단이 P10/누적을 개선하는지 확인. 진입 수 감소 폭 트레이드오프.")
+
+
+def report_breakeven(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """Break-even 트리거 A/B — 진입 +X% 도달 시 stop 을 entry 로 끌어올림(손실 진입 방지).
+
+    동기: 수익 났을 때 일부라도 보호하고 싶은 직관. 1:3 목표·트레일·MA청산 그대로,
+    단지 stop floor 만 X% 도달 후 BE 로 강제. 승률↑·평균↓ 기대(BE 청산 0% 거래 늘어남).
+    """
+    global V_BREAKEVEN_TRIGGER_PCT
+    variants = [
+        ("기준: BE off",       None),
+        ("BE @ +5% 도달",      5.0),
+        ("BE @ +7% 도달",      7.0),
+        ("BE @ +10% 도달",    10.0),
+        ("BE @ +15% 도달",    15.0),
+        ("BE @ +20% 도달",    20.0),
+    ]
+    print("\n" + "=" * 96)
+    print(f"Break-even 트리거 A/B — {label} (비용 차감 후)")
+    print("=" * 96)
+    print(f"  {'변형':24} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'P90':>8} {'누적':>10}")
+    for vlabel, pct in variants:
+        V_BREAKEVEN_TRIGGER_PCT = pct
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:24} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:24} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['p90']:>+7.2f}% {m['total']:>+9.1f}%")
+    V_BREAKEVEN_TRIGGER_PCT = None
+    print("  ※ BE 가 P10(꼬리손실)을 개선하면서 기대값/누적이 유지/개선되면 채택. 0% 거래 증가(트리거 후 즉시 BE)는 정상.")
+
+
 def report_pyramid_rising(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """피라미딩 rising-day 게이트 A/B — 추가 유닛을 양봉(close>open) 일에만 허용(라이브 _is_rising 의 backtest 대응).
 
@@ -522,6 +604,8 @@ def main():
     p.add_argument("--pyramidregime", action="store_true", help="레짐 게이트 피라미딩 A/B(KOSPI>MA 일 때만)")
     p.add_argument("--pyramidequity", action="store_true", help="equity-curve 게이트 피라미딩 A/B(전략 최근 성적>0일 때만)")
     p.add_argument("--pyramidrising", action="store_true", help="피라미딩 rising-day 게이트 A/B(양봉일에만 추가)")
+    p.add_argument("--breakeven", action="store_true", help="Break-even 트리거 A/B(+X% 도달 시 stop을 entry로 끌어올림)")
+    p.add_argument("--breadthtest", action="store_true", help="시장 breadth 게이트 A/B(universe 양봉비율 < X 시 신규진입 차단)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -541,6 +625,10 @@ def main():
         report_pyramid_equity(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.pyramidrising:
         report_pyramid_rising(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.breakeven:
+        report_breakeven(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.breadthtest:
+        report_breadth(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

@@ -40,7 +40,7 @@ from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, entry_signal, atr, moving_average, classify_zone,
-    fundamentals_bonus, leading_sectors, position_size, exit_decision, is_rising,
+    fundamentals_bonus, leading_sectors, market_breadth, position_size, exit_decision, is_rising,
 )
 
 # 설정·상수·CFG·paths·logger·SCHEDULE 는 trend_config 로 이동 (import * 로 노출)
@@ -609,6 +609,17 @@ async def phase_entry() -> None:
         log_event("circuit_break", {"phase": "entry", "reason": why})
         await notify(f"🛑 서킷브레이커 — 신규 진입 중단\n{why}")
         return
+    # 시장 breadth 게이트(2026-06-24 추가): KOSPI universe 양봉비율 < BREADTH_MIN_PCT 시 신규진입 차단.
+    # 06-23 사고(9종 동시 hard stop) 같은 광범위 약세장 자동 감지. 백테스트 P10 -9.33→-7.07%(0.5) 검증.
+    if BREADTH_MIN_PCT > 0:
+        rows = await _sector_index_rows()
+        if rows:
+            breadth = market_breadth(rows)
+            if breadth is not None and breadth < BREADTH_MIN_PCT:
+                log_event("breadth_block", {"breadth": round(breadth, 3), "threshold": BREADTH_MIN_PCT})
+                await notify(f"🚫 시장 breadth 게이트 — 신규 진입 차단\n"
+                             f"universe 양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%} (약세장 자동 감지)")
+                return
     cands = await _apply_sector_rally(cands)
     if not cands:
         await notify("⏭️ 주도섹터 게이트: 주도섹터 소속 후보 없음 — 진입 스킵")
@@ -1050,6 +1061,8 @@ async def scheduler_daemon() -> None:
             warns.append("PYRAMID_BYPASS_GATE=true — equity-curve 안전게이트 비활성 (횡보장 증폭위험)")
         if ADOPT_MODE == "all":
             warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
+        if BREADTH_MIN_PCT <= 0:
+            warns.append("BREADTH_MIN_PCT=0 — 시장 breadth 게이트 비활성 (06-23 같은 광범위 약세장 무방어). 0.4 권장")
         for w in warns:
             logger.warning("[DAEMON][LIVE-GUARD] ⚠️ %s", w)
         if warns:

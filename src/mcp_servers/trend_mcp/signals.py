@@ -239,6 +239,26 @@ def leading_sectors(sector_rows: list[dict], *,
     return out[:top_k]
 
 
+def market_breadth(sector_rows: list[dict]) -> float | None:
+    """KOSPI 시장 breadth — 전체 업종 구성종목의 상승 비율 (0.0 ~ 1.0).
+
+    sector_rows: 키움 ka20001 업종지수 스냅샷 [{sector, change_pct, rising, falling, flat}].
+    rising/falling/flat 합산 → 상승비율. 약세장 자동 감지용 (예: < 0.4 면 신규진입 차단 게이트).
+    데이터 없음/표본 부족 시 None 반환 (fail-open — 호출자가 게이트 미적용 결정).
+    """
+    if not sector_rows:
+        return None
+    total_rising = total_falling = total_flat = 0
+    for r in sector_rows:
+        total_rising += int(r.get("rising", 0))
+        total_falling += int(r.get("falling", 0))
+        total_flat += int(r.get("flat", 0))
+    total = total_rising + total_falling + total_flat
+    if total < 50:        # universe 너무 작으면 신뢰 X (KOSPI 전체는 보통 800+)
+        return None
+    return total_rising / total
+
+
 # ─── 청산 신호 ──────────────────────────────────────────────────────────────
 
 def trend_exit(

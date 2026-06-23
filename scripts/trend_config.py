@@ -109,6 +109,9 @@ PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이�
 # Equity-curve 게이트 우회(MOCK 파일럿/테스트용). true 시 청산이력 무관 즉시 OPEN — 횡보장 증폭손실 위험.
 # 실전 전환 시 반드시 false 복귀. PRODUCTION 모드 + 이 값 true 면 LIVE-GUARD 경고 발화.
 PYRAMID_BYPASS_GATE = os.getenv("TREND_PYRAMID_BYPASS_GATE", "false").lower() == "true"
+# 시장 breadth 게이트(2026-06-24): KOSPI 업종지수 universe 양봉비율 < 이 값 일 때 신규진입 차단.
+# 06-23 사고(9종 동시 hard stop) 재발 방지. 백테스트(largecap): 0.4=P10-7.99%·PF1.52, 0.5=P10-7.07%·PF1.65. 0=off.
+BREADTH_MIN_PCT = float(os.getenv("TREND_BREADTH_MIN_PCT", "0") or 0)
 # Reconcile(어댑트) 모드: all=모든 broker 보유분 편입(기본·기존 동작), watchlist=WATCHLIST 종목만, off=어댑트 안 함.
 # 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되는 위험 차단용.
 ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "all").lower()

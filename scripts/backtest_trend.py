@@ -489,6 +489,31 @@ def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], cos
     print("  ※ 레짐 게이트가 횡보장 추가유닛을 억제해 증폭손실을 줄이면서 추세장 상승을 살리는지 확인.")
 
 
+def report_hardstop(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """하드손절 임계값 A/B — off / 5% / 7% / 10% / 15% 비교.
+
+    동기: 라이브에서 7% 청산 후 일부 종목 회복 관찰. 임계값 완화/유지/제거 정량 검증.
+    """
+    global V_HARD_STOP_PCT
+    variants = [("off (ATR 트레일만)", 0.0), ("-5%", 5.0), ("-7%", 7.0), ("-10%", 10.0), ("-15%", 15.0)]
+    print("\n" + "=" * 92)
+    print(f"하드손절 A/B — {label} (비용 차감 후)")
+    print("=" * 92)
+    print(f"  {'변형':24} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'P90':>8} {'누적':>10}")
+    for vlabel, hard in variants:
+        V_HARD_STOP_PCT = hard
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:24} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:24} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['p90']:>+7.2f}% {m['total']:>+9.1f}%")
+    V_HARD_STOP_PCT = 0.0
+    print("  ※ 강한 hard stop 일수록 P10(꼬리손실) 작아지지만 진입수·기대값·누적 감소 트레이드오프.")
+
+
 def report_breadth(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """시장 breadth 게이트 A/B — 일별 universe 양봉비율 < X 일 때 신규진입 차단.
 
@@ -606,6 +631,7 @@ def main():
     p.add_argument("--pyramidrising", action="store_true", help="피라미딩 rising-day 게이트 A/B(양봉일에만 추가)")
     p.add_argument("--breakeven", action="store_true", help="Break-even 트리거 A/B(+X% 도달 시 stop을 entry로 끌어올림)")
     p.add_argument("--breadthtest", action="store_true", help="시장 breadth 게이트 A/B(universe 양봉비율 < X 시 신규진입 차단)")
+    p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -629,6 +655,8 @@ def main():
         report_breakeven(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.breadthtest:
         report_breadth(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.hardstoptest:
+        report_hardstop(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

@@ -16,8 +16,9 @@ wheels/
 .ruff_cache/
 .mypy_cache/
 
-# Environment variables
+# Environment variables (실거래 키 포함 — 모든 .env 변형/백업 추적 금지)
 .env
+.env.*
 logs/
 data/
 

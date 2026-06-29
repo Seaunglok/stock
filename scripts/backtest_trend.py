@@ -545,6 +545,35 @@ def report_breadth(mode: str, start: str, end: str, watch: list[str], costs: Cos
     print("  ※ 약세장 진입 차단이 P10/누적을 개선하는지 확인. 진입 수 감소 폭 트레이드오프.")
 
 
+def report_pullback(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """눌림목 게이트 폭 A/B — pullback_pct 스윕 (largecap 게이트: 현재가 ≤ MA20×(1+X%)).
+
+    동기: 양극화/멜트업 장에서 주도주가 MA20 위로 멀어져(extended) pullback 게이트 탈락 → 후보 0.
+    폭을 넓히면 진입 수↑ 하지만 추격매수 위험 — 기대값·손익비·P10(꼬리손실)이 유지/개선되는지 검증.
+    off(무제한) 면 pullback 게이트 사실상 제거(price>MA60·MA120·RS·vol_up 만으로 진입).
+    """
+    orig = cfg.pullback_pct
+    variants = [("기준: 3% (현행)", 3.0), ("5%", 5.0), ("8%", 8.0),
+                ("12%", 12.0), ("20%", 20.0), ("off (무제한)", 1e9)]
+    print("\n" + "=" * 96)
+    print(f"눌림목(pullback) 게이트 폭 A/B — {label} (비용 차감 후)")
+    print("=" * 96)
+    print(f"  {'변형':18} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'P90':>8} {'누적':>10}")
+    for vlabel, pct in variants:
+        cfg.pullback_pct = pct
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:18} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:18} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['p90']:>+7.2f}% {m['total']:>+9.1f}%")
+    cfg.pullback_pct = orig
+    print("  ※ 기준 3% = 검증·운영 설정. 폭↑ 가 진입 수를 늘리면서 기대값·손익비·P10 을 지키는지 확인.")
+    print("  ※ 폭↑ → 추격매수(MA20 멀리서 진입) 늘어남 → P10 악화/기대값 저하 시 현행 3% 유지가 정답.")
+
+
 def report_breakeven(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """Break-even 트리거 A/B — 진입 +X% 도달 시 stop 을 entry 로 끌어올림(손실 진입 방지).
 
@@ -631,6 +660,7 @@ def main():
     p.add_argument("--pyramidrising", action="store_true", help="피라미딩 rising-day 게이트 A/B(양봉일에만 추가)")
     p.add_argument("--breakeven", action="store_true", help="Break-even 트리거 A/B(+X% 도달 시 stop을 entry로 끌어올림)")
     p.add_argument("--breadthtest", action="store_true", help="시장 breadth 게이트 A/B(universe 양봉비율 < X 시 신규진입 차단)")
+    p.add_argument("--pullbacktest", action="store_true", help="눌림목 게이트 폭 A/B(pullback_pct 3/5/8/12/20/off)")
     p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
     args = p.parse_args()
 
@@ -655,6 +685,8 @@ def main():
         report_breakeven(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.breadthtest:
         report_breadth(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.pullbacktest:
+        report_pullback(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.hardstoptest:
         report_hardstop(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:

@@ -122,6 +122,9 @@ CFG = TrendConfig(
     atr_k=float(os.getenv("TREND_ATR_K", "2.0")),
     rr=float(os.getenv("TREND_RR", "3.0")),
     partial_pct=float(os.getenv("TREND_PARTIAL_PCT", "30")),
+    # 눌림목 게이트 폭(현재가 ≤ MA20×(1+X%)). 기본 3 → A/B 검증(2026-06-26)으로 12 채택.
+    # 양극화/멜트업 장에서 3%는 과도하게 좁아 후보 0 빈발 → 12%가 largecap +2.61%/watchlist +8.90% 기대값 정점.
+    pullback_pct=float(os.getenv("TREND_PULLBACK_PCT", "3")),
 )
 
 DATA_DIR = _ROOT / "data" / "trend_follow"

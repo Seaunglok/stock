@@ -16,7 +16,14 @@ Beginner notes:
 
 import asyncio
 import logging
+import os
 from datetime import datetime
+
+
+def _default_stex() -> str:
+    """국내거래소구분 기본값 — production(api.kiwoom.com)은 'KRX' 요구(kt00004),
+    paper(mockapi)는 '01' 통과. KIWOOM_PRODUCTION_MODE 기준 자동 선택."""
+    return "KRX" if os.getenv("KIWOOM_PRODUCTION_MODE", "false").lower() == "true" else "01"
 
 # from pydantic import BaseModel, Field  # 더 이상 사용하지 않음
 from src.mcp_servers.base.base_mcp_server import StandardResponse
@@ -187,14 +194,14 @@ class PortfolioDomainServer(KiwoomDomainServer):
         @self.mcp.tool()
         async def get_account_evaluation(
             query_type: str = "01",
-            stock_exchange: str = "01"
+            stock_exchange: str | None = None
         ) -> StandardResponse:
             """
             계좌평가현황 조회
 
             Args:
                 query_type: 조회구분
-                stock_exchange: 거래소구분 (01:전체)
+                stock_exchange: 거래소구분 (None=모드별 자동: production 'KRX' / paper '01')
 
             API: kt00004 (계좌평가현황요청)
             총평가금액, 총손익, 수익률 등 계좌 전체 평가
@@ -203,7 +210,7 @@ class PortfolioDomainServer(KiwoomDomainServer):
 
             params = {
                 "qry_tp": query_type,
-                "dmst_stex_tp": stock_exchange,
+                "dmst_stex_tp": stock_exchange or _default_stex(),
             }
 
             return await self.call_api_with_response(

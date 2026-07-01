@@ -91,10 +91,15 @@ def get_kospi_closes(days: int = 320) -> list[float]:
 
 
 def _name(code: str) -> str:
+    # pykrx KRX 로그인 간헐 실패 시 예외 대신 빈 DataFrame 반환 → 문자열 아니면 code 폴백
+    # (DataFrame 이 name 에 섞이면 후보 저장 JSON 직렬화 크래시. 2026-07-01 screen 오류 원인).
     try:
-        return krx.get_market_ticker_name(code)
+        n = krx.get_market_ticker_name(code)
+        if isinstance(n, str) and n.strip():
+            return n
     except Exception:
-        return code
+        pass
+    return code
 
 
 def _broad_codes() -> list[str]:

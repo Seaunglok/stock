@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+
+# 네트워크 stall 방어(2026-07-02 08:50 screen hang → entry 누락 재발방지):
+# pykrx/DART 등 동기 네트워크 호출이 무한 hang 되면 async 데몬 전체가 얼어붙는다.
+# 소켓 read 30s 초과 시 예외 → 기존 try/except 가 graceful skip(종목 스킵/폴백). async httpx(MCP)는 자체 타임아웃 사용해 영향 없음.
+socket.setdefaulttimeout(30)
 
 _ROOT = Path(__file__).resolve().parents[1]   # scripts/trend_config.py → repo root
 if str(_ROOT) not in sys.path:
@@ -131,6 +137,7 @@ DATA_DIR = _ROOT / "data" / "trend_follow"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 LOCK_FILE = DATA_DIR / "daemon.lock"
+HEARTBEAT_FILE = DATA_DIR / "daemon.heartbeat"   # 데몬 진행 heartbeat — watchdog hang 감지용
 JOURNAL_FILE = DATA_DIR / "journal.json"
 LOG_DIR = _ROOT / "logs" / "trend_follow"
 LOG_DIR.mkdir(parents=True, exist_ok=True)

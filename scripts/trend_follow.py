@@ -1038,6 +1038,22 @@ def _next_run(h: int, m: int) -> datetime:
     return t
 
 
+def _write_heartbeat() -> None:
+    """데몬 진행 heartbeat 기록 — watchdog 가 정체(hung) 감지에 사용."""
+    try:
+        HEARTBEAT_FILE.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def _heartbeat_loop() -> None:
+    """60초마다 heartbeat 기록. 동기 네트워크 호출이 이벤트루프를 막으면(hang) 이 태스크도
+    굶어 heartbeat 가 정체 → watchdog 이 stale 감지 후 재기동."""
+    while True:
+        _write_heartbeat()
+        await asyncio.sleep(60)
+
+
 async def scheduler_daemon() -> None:
     logger.info("=" * 56)
     if PRODUCTION_MODE:
@@ -1074,6 +1090,8 @@ async def scheduler_daemon() -> None:
                 UNIVERSE_MODE)
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
+    _write_heartbeat()
+    asyncio.create_task(_heartbeat_loop())   # hang 감지용 heartbeat (watchdog 이 stale 시 재기동)
     await notify(f"🚀 추세추종 데몬 시작 ({'🧪 MOCK' if MOCK_MODE else '💰 REAL'}) 모드:{UNIVERSE_MODE}")
     try:
         await phase_reconcile()   # 기동 시 계좌 보유분 편입(추세 청산규칙 관리)

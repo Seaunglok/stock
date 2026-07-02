@@ -31,6 +31,8 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 LOCK_FILE = ROOT / "data" / "trend_follow" / "daemon.lock"
+HEARTBEAT_FILE = ROOT / "data" / "trend_follow" / "daemon.heartbeat"
+HEARTBEAT_STALE_SEC = 600   # heartbeat 10분 이상 정체 → hung 판정(정상 screen 은 <2~3분, 60초마다 갱신)
 LOG_DIR = ROOT / "logs" / "trend_follow"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 WD_LOG = LOG_DIR / "watchdog.log"
@@ -90,6 +92,32 @@ def daemon_alive() -> bool:
     return bool(pid) and _pid_alive(pid)
 
 
+def heartbeat_stale() -> bool:
+    """heartbeat 가 HEARTBEAT_STALE_SEC 이상 정체면 True(hung 의심).
+
+    파일 없음/파싱 실패는 False(오탐 방지 — heartbeat 미도입 구버전/기동 직후 대비)."""
+    try:
+        from datetime import datetime
+        ts = datetime.fromisoformat(HEARTBEAT_FILE.read_text().strip())
+        return (datetime.now() - ts).total_seconds() > HEARTBEAT_STALE_SEC
+    except Exception:
+        return False
+
+
+def kill_daemon() -> None:
+    """lock PID(hung 데몬) 강제 종료 — 재기동 전 정리(신규 데몬 acquire_lock 위해)."""
+    try:
+        pid = int(LOCK_FILE.read_text().strip() or "0")
+    except Exception:
+        return
+    if pid:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=15)
+            log(f"[DAEMON] hung 데몬 PID={pid} 강제 종료")
+        except Exception as e:
+            log(f"[DAEMON] kill 예외: {e}")
+
+
 def _detached_kwargs() -> dict:
     """자식이 watchdog 종료/콘솔 신호와 무관하게 독립 생존하도록 분리 기동."""
     kw: dict = {"cwd": str(ROOT)}
@@ -142,6 +170,12 @@ def main() -> None:
             log(f"[MCP] ⚠️ 재기동 후에도 down={down2}")
 
     if not daemon_alive():
+        start_daemon()
+    elif heartbeat_stale():
+        # PID 는 살아있으나 heartbeat 정체 → 이벤트루프 hang(2026-07-02 screen hang 사례) → 강제 재기동
+        log(f"[DAEMON] ⚠️ heartbeat 정체(>{HEARTBEAT_STALE_SEC}s) — hung 판정 → 재기동")
+        kill_daemon()
+        time.sleep(2)
         start_daemon()
     # 정상일 땐 로그를 남기지 않음(파일 비대화 방지). 이상 시에만 위에서 기록.
 

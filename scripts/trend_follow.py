@@ -611,14 +611,18 @@ async def phase_entry() -> None:
         return
     # 시장 breadth 게이트(2026-06-24 추가): KOSPI universe 양봉비율 < BREADTH_MIN_PCT 시 신규진입 차단.
     # 06-23 사고(9종 동시 hard stop) 같은 광범위 약세장 자동 감지. 백테스트 P10 -9.33→-7.07%(0.5) 검증.
+    # 2026-07-03: 09:30 단발 차단이 '약한 출발→회복' 장을 통째로 놓치던 문제 → 후보를 버리지 않고 보류로 유지,
+    #   _try_pending 이 장중 breadth 재확인해 회복(≥임계)+후보 반등 시 진입(14:00 컷오프). 약세 유지 시 계속 보류(방어 유지).
     if BREADTH_MIN_PCT > 0:
         rows = await _sector_index_rows()
         if rows:
             breadth = market_breadth(rows)
             if breadth is not None and breadth < BREADTH_MIN_PCT:
-                log_event("breadth_block", {"breadth": round(breadth, 3), "threshold": BREADTH_MIN_PCT})
-                await notify(f"🚫 시장 breadth 게이트 — 신규 진입 차단\n"
-                             f"universe 양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%} (약세장 자동 감지)")
+                log_event("breadth_block", {"breadth": round(breadth, 3), "threshold": BREADTH_MIN_PCT, "held": len(cands)})
+                save_state("pending_entries", cands)   # 버리지 않고 보류 → 장중 회복 시 재시도
+                _mark_done("entry")
+                await notify(f"🚫 시장 breadth 게이트 — 09:30 신규 진입 보류 (양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%})\n"
+                             f"회복(≥{BREADTH_MIN_PCT:.0%}) + 후보 반등 시 진입 재시도 (~{ENTRY_CUTOFF})")
                 return
     cands = await _apply_sector_rally(cands)
     if not cands:
@@ -687,6 +691,16 @@ async def _try_pending() -> None:
     if broken:
         log_event("circuit_break", {"phase": "pending", "reason": why})
         return
+    # 시장 breadth 재확인 — 약세장이면 진입 보류 유지(회복 대기). 09:30 차단분·하락보류분 공통.
+    # 회복해야 진입 → '약한 출발→회복' 장 포착하면서 약세 지속 시엔 06-23식 방어 유지.
+    if BREADTH_MIN_PCT > 0:
+        rows = await _sector_index_rows()
+        if rows:
+            breadth = market_breadth(rows)
+            if breadth is not None and breadth < BREADTH_MIN_PCT:
+                logger.info("[PENDING] 시장 breadth %.1f%% < %.0f%% — 진입 보류 유지(회복 대기)",
+                            breadth * 100, BREADTH_MIN_PCT * 100)
+                return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     still, bought = [], []
     try:

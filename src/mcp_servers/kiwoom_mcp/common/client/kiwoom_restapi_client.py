@@ -238,6 +238,12 @@ class KiwoomRESTAPIClient:
             response.raise_for_status()
 
             token_info = response.json()
+            # 키움 REST 는 인증 실패 시에도 HTTP 200 + {return_code, return_msg} 반환(예: 8050 지정단말기
+            # 인증 실패). token 키만 찾으면 KeyError('token') 로 원인이 가려짐 → return_msg 를 명확히 표출.
+            if "token" not in token_info:
+                rc = token_info.get("return_code")
+                msg = token_info.get("return_msg") or token_info
+                raise KiwoomAPIError(f"Token acquisition failed (rc={rc}): {msg}", "AUTH_ERROR")
             self._access_token = token_info["token"]
 
             expires_dt_str = token_info.get("expires_dt", "")

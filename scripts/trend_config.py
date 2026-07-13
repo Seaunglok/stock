@@ -71,9 +71,14 @@ TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 1
 MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
 MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
-# 포지션 사이징: pct_equity=예탁자산의 POSITION_PCT% (현금 한도 내) / fixed=INVEST_PER_TRADE 고정.
+# 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
+#   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.
 SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
 POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "8"))
+# risk 모드: 종목당 감수 리스크(예탁 대비 %). 1.0=보수(MDD~7%)·1.5=현 15% notional 노출 근사(MDD~11%).
+RISK_PCT = float(os.getenv("TREND_RISK_PCT", "1.5"))
+# risk 모드 notional 상한(예탁 대비 %) — 손절폭 극소 종목이 과대편입되는 것 방지.
+MAX_NOTIONAL_PCT = float(os.getenv("TREND_MAX_NOTIONAL_PCT", "25"))
 USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
 NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
@@ -87,6 +92,9 @@ ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
 HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
 # 청산 이평선(하방돌파 시 청산). A/B 검증(2026-06-12): MA120 >> MA50(기대값·누적 2~4배, 추세 끝까지 탑승).
 EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
+# 최대 보유 영업일(시간청산, 0=off). 백테스트가 cfg.max_hold=60 강제 마감으로 기대값을 산출했으므로
+# 라이브도 동일 조건 유지 — MA120 위 횡보 종목의 무기한 자본 점유 방지. 15:20 exit phase 에서만 평가.
+MAX_HOLD_DAYS = int(os.getenv("TREND_MAX_HOLD", "60") or 0)
 # 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
 FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
 # 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.

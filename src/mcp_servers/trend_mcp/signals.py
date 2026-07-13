@@ -322,14 +322,28 @@ def is_rising(cur: float, opn: float) -> bool:
 
 
 def position_size(price: float, *, mode: str = "pct_equity", equity: float = 0.0,
-                  cash: float = 0.0, pct: float = 8.0, invest_fixed: float = 500000.0) -> int:
-    """매수 수량. pct_equity: 예탁자산 pct% (현금 한도 내). equity<=0 또는 fixed: 고정금액.
+                  cash: float = 0.0, pct: float = 8.0, invest_fixed: float = 500000.0,
+                  stop: float = 0.0, risk_pct: float = 1.5, max_notional_pct: float = 25.0) -> int:
+    """매수 수량.
 
-    예탁자산 조회 실패(equity=0) 시 고정금액 폴백. price<=0 이면 0.
+    - risk: 예탁자산 risk_pct% ÷ 손절폭(price−stop) = 종목당 감수 리스크 균등(터틀식). notional 은
+      max_notional_pct% 로 상한(손절폭 극소 종목 과대편입 방지). 손절폭↑ 종목은 적게, ↓ 종목은 많이 사서
+      거래별 실질 리스크를 맞춘다 → equity 곡선 MDD/변동성 대폭 축소(백테스트 검증: MAR 0.87→2.34).
+    - pct_equity: 예탁자산 pct% notional (현금 한도 내).
+    - fixed / 데이터 부족: 고정금액(invest_fixed).
+
+    예탁자산 조회 실패(equity=0) 또는 risk 모드인데 손절폭 무효(stop<=0 or price<=stop) 시 안전 폴백:
+    pct_equity(equity>0) → notional, 그 외 → 고정금액. price<=0 이면 0.
     """
     if price <= 0:
         return 0
-    if mode == "pct_equity" and equity > 0:
+    if mode == "risk" and equity > 0 and stop > 0 and price > stop:
+        qty = int(equity * risk_pct / 100.0 / (price - stop))
+        qty = min(qty, int(equity * max_notional_pct / 100.0 / price))   # notional 상한
+        if cash > 0:
+            qty = min(qty, int(cash / price))
+        return max(0, qty)
+    if mode in ("pct_equity", "risk") and equity > 0:   # risk 폴백 = notional
         qty = int(equity * pct / 100.0 / price)
         if cash > 0:
             qty = min(qty, int(cash / price))
@@ -340,24 +354,32 @@ def position_size(price: float, *, mode: str = "pct_equity", equity: float = 0.0
 def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: float,
                   partial_done: bool, hard_stop_pct: float = 0.0, partial_pct: float = 30.0,
                   ma_exit: float | None = None, exit_ma_label: int = 120,
-                  foreign_net: float | None = None, use_foreign: bool = False
+                  foreign_net: float | None = None, use_foreign: bool = False,
+                  aged_out: bool = False
                   ) -> tuple[str | None, str, int]:
     """포지션 청산/부분익절 판정 → (action, reason, sell_qty). action ∈ {None, PARTIAL, EXIT}.
 
-    우선순위: 하드손절 → 첫목표 부분익절 → 트레일/손절 이탈 → 이평선 이탈 → 외인 전환.
-    ma_exit/foreign_net 은 do_exit_signals 시에만 호출자가 채워 넘긴다(None=미평가).
+    우선순위: 하드손절 → 첫목표 부분익절 → 트레일/손절 이탈 → 이평선 이탈 → 외인 전환 → 보유만기.
+    ma_exit/foreign_net/aged_out 은 do_exit_signals 시에만 호출자가 채워 넘긴다(None/False=미평가).
+    부분익절 수량이 1주 미만(qty 소량)이면 쪼갤 수 없으므로 익절 없이 트레일 지속(우측꼬리 유지) —
+    qty 전량이 나가면 qty=0 좀비 포지션이 되기 때문.
+    aged_out: 백테스트 max_hold(60영업일 강제 마감)와 동일 의미의 시간청산.
     """
     pnl = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
     if hard_stop_pct > 0 and pnl <= -hard_stop_pct:
         return "EXIT", f"하드 손절 ({pnl:.2f}% ≤ -{hard_stop_pct:.0f}%)", qty
     if not partial_done and target > 0 and cur >= target:
-        return "PARTIAL", f"첫 목표 도달 {partial_pct:.0f}% 익절", max(1, int(qty * partial_pct / 100))
+        part_qty = max(1, int(qty * partial_pct / 100))
+        if part_qty < qty:   # qty=1 등 쪼갤 수 없으면 익절 없이 트레일 지속
+            return "PARTIAL", f"첫 목표 도달 {partial_pct:.0f}% 익절", part_qty
     if stop > 0 and cur <= stop:
         return "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}", qty
     if ma_exit is not None and cur < ma_exit:
         return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})", qty
     if use_foreign and foreign_net is not None and foreign_net < 0:
         return "EXIT", "외국인 5일 순매도 전환", qty
+    if aged_out:
+        return "EXIT", f"보유기간 만료 ({pnl:+.2f}%) — 시간청산", qty
     return None, "", 0
 
 

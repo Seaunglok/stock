@@ -81,11 +81,23 @@ async def _realtime_price(symbol: str) -> float | None:
 
 
 async def _foreign_net_5d(symbol: str) -> float | None:
-    d = await _kiwoom_call("investor-domain", INVESTOR_URL, ("foreign", "investor", "trading"), {"stock_code": symbol})
-    for k in ("foreign_net_5d", "외국인_5일_순매수"):
-        if d.get(k) not in (None, ""):
-            return _num(d, k)
-    return None
+    """외국인 최근 5영업일 순매수(보유변동수량) 합산 — ka10008 주식외국인종목별매매동향.
+
+    2026-07-13 재구현: 과거엔 존재하지 않는 foreign_net_5d 키를 찾아 항상 None(외인 청산룰 dead code).
+    응답 stk_frgnr[] 일별 리스트(최신순)의 chg_qty(전일대비 외인 보유수량 변동 = 일별 순매수)를
+    최근 5행 합산. 음수 = 5일 누적 순매도 → exit_decision 외인전환 청산 트리거.
+    리스트/필드 부재 시 None(fail-open — 룰 미적용). ※ 이 룰은 백테스트 미검증(발동 시 journal 로 추적).
+    """
+    d = await _kiwoom_call("investor-domain", INVESTOR_URL, "foreign_trading_trend", {"stock_code": symbol})
+    rows = d.get("stk_frgnr")
+    if not isinstance(rows, list) or not rows:
+        logger.debug("[FOREIGN] %s stk_frgnr 리스트 없음 — 외인 청산룰 미적용", symbol)
+        return None
+    recent = [r for r in rows[:5] if isinstance(r, dict) and r.get("chg_qty") not in (None, "")]
+    if not recent:
+        logger.debug("[FOREIGN] %s chg_qty 필드 없음 — 외인 청산룰 미적용", symbol)
+        return None
+    return sum(_num(r, "chg_qty") for r in recent)
 
 
 async def _cur_and_open(symbol: str) -> tuple[float, float]:
@@ -154,9 +166,11 @@ async def _place(mcp, side: str, symbol: str, qty: int, *, timeout: float = 10.0
 
 
 async def _sector_index_rows() -> list[dict] | None:
-    """키움 업종지수 당일 스냅샷 [{sector, change_pct, rising, falling, flat}] (ka20001).
+    """키움 전업종지수 당일 스냅샷 [{sector, change_pct, rising, falling, flat}] (ka20003, 단일 호출).
 
     KOSPI 전 업종의 지수 등락률 + 상승/하락/보합 종목수 — 집단상승(breadth) 판정 소스.
+    2026-07-09: 업종별 개별조회(ka20001) 다회(~27) 호출 → 전업종지수(ka20003) 1회로 대체(entry ~3분→수초).
+    skip 집합은 기존과 동일(_SECTOR_SKIP: 종합/대형/중형/소형주) → breadth 값 불변(ka20001·ka20003 종목수 일치 검증).
     info-domain(:8032) 미가동/실패 시 None(판정 불가 → fail-open).
     """
     def _f(v: Any) -> float:
@@ -165,32 +179,33 @@ async def _sector_index_rows() -> list[dict] | None:
         except Exception:
             return float("nan")
 
+    def _i(v: Any) -> int:
+        f = _f(v)
+        return int(f) if f == f else 0   # nan → 0
+
     try:
         async with MCPManager({"kiwoom-info-mcp": INFO_URL}) as mcp:
             if not mcp.tools:
                 return None
-            raw = await mcp.call_tool("get_sector_code_list", {"market_type": "0"})
+            raw = await mcp.call_tool("get_all_sector_index", {"sector_code": "001"})
             p = json.loads(raw) if isinstance(raw, str) else raw
-            codes = (p.get("data", {}) or {}).get("list", []) if isinstance(p, dict) else []
+            arr = (p.get("data", {}) or {}).get("all_inds_idex", []) if isinstance(p, dict) else []
             rows = []
-            for it in codes:
-                name = str(it.get("name", ""))
+            for it in arr:
+                name = str(it.get("stk_nm", ""))
                 if not name or name in _SECTOR_SKIP:
                     continue
-                try:
-                    raw2 = await mcp.call_tool("get_sector_current_price",
-                                               {"sector_code": it.get("code", ""), "market_type": "0"})
-                    p2 = json.loads(raw2) if isinstance(raw2, str) else raw2
-                    d = p2.get("data", {}) if isinstance(p2, dict) else {}
-                    rows.append({"sector": name, "change_pct": _f(d.get("flu_rt")),
-                                 "rising": int(_f(d.get("rising")) or 0),
-                                 "falling": int(_f(d.get("fall")) or 0),
-                                 "flat": int(_f(d.get("stdns")) or 0)})
-                except Exception:
-                    continue
+                rows.append({"sector": name, "change_pct": _f(it.get("flu_rt")),
+                             "rising": _i(it.get("rising")),
+                             "falling": _i(it.get("fall")),
+                             "flat": _i(it.get("stdns"))})
+            # 필드 소실 감지: rising/fall/stdns 가 전부 0/부재면 market_breadth 가 None 을 돌려
+            # breadth 게이트(06-23 방어)가 조용히 꺼진다 — 무음 해제 대신 경고 남김.
+            if rows and all(r["rising"] + r["falling"] + r["flat"] == 0 for r in rows):
+                logger.warning("[SECTOR] ka20003 rising/fall/stdns 전부 0 — breadth 게이트 판정 불가(fail-open)")
             return rows or None
     except Exception as e:
-        logger.debug("[SECTOR] 업종지수 조회 실패: %s", e)
+        logger.debug("[SECTOR] 전업종지수 조회 실패: %s", e)
         return None
 
 

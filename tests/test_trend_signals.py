@@ -236,6 +236,30 @@ def test_position_size_fallback_and_fixed():
     assert position_size(0, mode="fixed") == 0
 
 
+def test_position_size_risk_mode():
+    # 예탁 1억, 리스크 1.5% = 150만. 손절폭 = 100,000-93,000 = 7,000 → 150만/7,000 = 214주
+    # notional 상한(25%=2,500만/10만=250주)·현금 한도 내 → 214주
+    assert position_size(100_000, mode="risk", equity=100_000_000, cash=100_000_000,
+                         stop=93_000, risk_pct=1.5, max_notional_pct=25) == 214
+    # 손절폭이 좁으면(1,000) 수량 폭증하지만 notional 상한(250주)에 걸림
+    assert position_size(100_000, mode="risk", equity=100_000_000, cash=100_000_000,
+                         stop=99_000, risk_pct=1.5, max_notional_pct=25) == 250
+    # 현금 한도: 현금 1,000만이면 100주까지만
+    assert position_size(100_000, mode="risk", equity=100_000_000, cash=10_000_000,
+                         stop=93_000, risk_pct=1.5) == 100
+
+
+def test_position_size_risk_fallback_to_notional():
+    # risk 모드인데 손절폭 무효(stop=0) → notional 폴백 (pct 사용)
+    assert position_size(100_000, mode="risk", equity=100_000_000, cash=100_000_000,
+                         stop=0, pct=15) == 150
+    # stop >= price (역전) → 폴백
+    assert position_size(100_000, mode="risk", equity=100_000_000, cash=100_000_000,
+                         stop=101_000, pct=15) == 150
+    # equity 조회 실패(0) → 고정금액 폴백
+    assert position_size(170_000, mode="risk", equity=0, stop=150_000, invest_fixed=500_000) == 2
+
+
 def test_is_rising():
     assert is_rising(101, 100) is True          # 시가 위
     assert is_rising(99, 100) is False           # 시가 아래(하락중)
@@ -264,3 +288,31 @@ def test_exit_decision_ma_and_foreign_only_when_passed():
     # 외인 전환
     assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90, partial_done=True,
                          foreign_net=-3, use_foreign=True)[0] == "EXIT"
+
+
+def test_exit_decision_partial_qty1_skipped():
+    # qty=1 은 쪼갤 수 없음 — 부분익절 없이 트레일 지속 (전량 매도 → qty=0 좀비 방지)
+    a, _, q = exit_decision(entry=100, cur=131, qty=1, target=130, stop=95,
+                            partial_done=False, partial_pct=30)
+    assert a is None and q == 0
+    # qty=2~3 은 기존처럼 1주 부분익절 (잔여 ≥1 보장)
+    a2, _, q2 = exit_decision(entry=100, cur=131, qty=2, target=130, stop=95,
+                              partial_done=False, partial_pct=30)
+    assert a2 == "PARTIAL" and q2 == 1
+    a3, _, q3 = exit_decision(entry=100, cur=131, qty=3, target=130, stop=95,
+                              partial_done=False, partial_pct=30)
+    assert a3 == "PARTIAL" and q3 == 1
+
+
+def test_exit_decision_aged_out():
+    # 보유만기(시간청산) — 백테스트 max_hold 대응. 우선순위 최하위(트레일/MA 이후).
+    a, r, q = exit_decision(entry=100, cur=110, qty=5, target=130, stop=90,
+                            partial_done=True, aged_out=True)
+    assert a == "EXIT" and "시간청산" in r and q == 5
+    # 트레일 이탈이 시간청산보다 우선 (reason 으로 구분)
+    a2, r2, _ = exit_decision(entry=100, cur=89, qty=5, target=130, stop=90,
+                              partial_done=True, aged_out=True)
+    assert a2 == "EXIT" and "트레일" in r2
+    # 미만기(기본 False) → HOLD 유지
+    assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90,
+                         partial_done=True)[0] is None

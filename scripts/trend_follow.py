@@ -195,10 +195,13 @@ async def phase_reconcile() -> None:
         e_stop = init_stop_price(entry, a, CFG.atr_k, -CFG.stop_pct)
         target = round(entry + CFG.rr * (entry - e_stop), 2)                    # 1:3 (평단 기준)
         jid = uuid.uuid4().hex[:8]
+        # 이미 목표가(평단 기준 3R) 위에서 편입되는 장기보유 승자는 partial_done=True —
+        # 편입 직후 30% 즉시 매도 방지(편입 취지는 트레일 관리, 신규 진입이 아님).
         pos = {"symbol": h["symbol"], "name": h["name"], "mode": "adopted", "qty": h["qty"],
                "entry_price": entry, "stop_price": stop, "target": target,
                "peak_price": max(cur, entry), "atr": a, "score": 0,
-               "buy_date": datetime.now().strftime("%Y-%m-%d"), "partial_done": False, "journal_id": jid}
+               "buy_date": datetime.now().strftime("%Y-%m-%d"),
+               "partial_done": bool(cur >= target), "journal_id": jid}
         _pyramid_init(pos, entry, e_stop)   # 편입분도 평단·평단기준 1R 로 불타기 추적
         positions.append(pos)
         adopted.append(pos)
@@ -215,13 +218,17 @@ async def phase_reconcile() -> None:
                                for p in adopted))
 
 
-async def _size_qty(price: float) -> int:
-    """가격 → 매수 수량. signals.position_size(순수) + 예탁자산 조회."""
-    equity, cash = (await _account_equity()) if SIZING_MODE == "pct_equity" else (0.0, 0.0)
-    if SIZING_MODE == "pct_equity" and equity <= 0:
+async def _size_qty(price: float, stop: float = 0.0) -> int:
+    """가격(+손절가) → 매수 수량. signals.position_size(순수) + 예탁자산 조회.
+
+    risk 모드는 손절폭(price−stop)으로 수량을 정하므로 stop 을 넘겨야 한다(없으면 notional 폴백).
+    """
+    equity, cash = (await _account_equity()) if SIZING_MODE in ("pct_equity", "risk") else (0.0, 0.0)
+    if SIZING_MODE in ("pct_equity", "risk") and equity <= 0:
         logger.warning("[SIZE] 예탁자산 조회 실패 → 고정금액 폴백")
     return position_size(price, mode=SIZING_MODE, equity=equity, cash=cash,
-                         pct=POSITION_PCT, invest_fixed=INVEST_PER_TRADE)
+                         pct=POSITION_PCT, invest_fixed=INVEST_PER_TRADE,
+                         stop=stop, risk_pct=RISK_PCT, max_notional_pct=MAX_NOTIONAL_PCT)
 
 
 FUND_CACHE_DIR = _ROOT / "docs_cache" / "dart_fin"   # DART 재무 YoY 30일 캐시
@@ -365,6 +372,8 @@ async def phase_screen() -> list[dict]:
                 c["score"] = round(c["score"] + pts, 1)
         cands.sort(key=lambda x: -x["score"])
     save_state("candidates", cands)
+    # 날짜 스탬프 — screen 실패 시 phase_entry 가 전일 후보를 매수하는 사고 방지(당일분만 유효)
+    save_state("candidates_date", datetime.now().strftime("%Y-%m-%d"))
     log_event("screen_done", {"universe": len(universe), "candidates": len(cands),
                               "symbols": [c["symbol"] for c in cands]})
 
@@ -396,6 +405,23 @@ def _mark_done(label: str) -> None:
     today = datetime.now().strftime("%Y-%m-%d")
     done = {today: list(set((get_state("done", {}).get(today) or []) + [label]))}
     save_state("done", done)
+
+
+def _save_pending(items: list[dict]) -> None:
+    """보류 후보 저장 + 날짜 스탬프 — 데몬 재기동 시 전일 보류분을 익일 오전에 매수하는 사고 방지."""
+    save_state("pending_entries", items)
+    save_state("pending_date", datetime.now().strftime("%Y-%m-%d"))
+
+
+def _busdays_since(buy_date: str | None) -> int:
+    """buy_date 이후 경과 영업일 수(주말 제외 근사 — 공휴일 미반영). 시간청산(MAX_HOLD_DAYS) 판정용."""
+    try:
+        d0 = datetime.strptime(str(buy_date), "%Y-%m-%d").date()
+    except Exception:
+        return 0
+    d1 = datetime.now().date()
+    return sum(1 for i in range(1, (d1 - d0).days + 1)
+               if (d0 + timedelta(days=i)).weekday() < 5)
 
 
 async def _circuit_broken() -> tuple[bool, str]:
@@ -512,7 +538,9 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
         return None
     price = await _realtime_price(sym) or c["price"]
-    qty = await _size_qty(price)
+    # risk 사이징용 손절가는 사이징 시점 가격 기준으로 추정(체결 후 entry 기준 재계산은 아래에서).
+    size_stop = init_stop_price(price, float(c["atr"]), CFG.atr_k, -CFG.stop_pct)
+    qty = await _size_qty(price, size_stop)
     if qty < 1:
         logger.warning("[ENTRY] %s 현금 부족/수량 0 — 스킵 (price %.0f)", sym, price)
         return None
@@ -599,6 +627,14 @@ async def phase_entry() -> None:
         logger.warning("[ENTRY] 오늘 이미 실행 — 중복 방지")
         return
     cands = get_state("candidates", [])
+    # stale 가드: 08:50 screen 이 실패(hang/예외)하면 state 엔 전일 후보가 남는다 — 신호는 당일 한정 유효.
+    cdate = get_state("candidates_date", "")
+    if cands and cdate != datetime.now().strftime("%Y-%m-%d"):
+        log_event("entry_skip", {"reason": f"stale candidates({cdate or '?'})",
+                                 "symbols": [c["symbol"] for c in cands]})
+        await notify(f"⏭️ 진입 차단 — 후보가 오늘 스크리닝분이 아님(screen={cdate or '?'}). "
+                     "08:50 screen 실패 여부 확인 필요", critical=True)
+        return
     positions = get_state("positions", [])
     slots = MAX_POS - len(positions)
     if not cands or slots <= 0:
@@ -619,7 +655,7 @@ async def phase_entry() -> None:
             breadth = market_breadth(rows)
             if breadth is not None and breadth < BREADTH_MIN_PCT:
                 log_event("breadth_block", {"breadth": round(breadth, 3), "threshold": BREADTH_MIN_PCT, "held": len(cands)})
-                save_state("pending_entries", cands)   # 버리지 않고 보류 → 장중 회복 시 재시도
+                _save_pending(cands)   # 버리지 않고 보류 → 장중 회복 시 재시도
                 _mark_done("entry")
                 await notify(f"🚫 시장 breadth 게이트 — 09:30 신규 진입 보류 (양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%})\n"
                              f"회복(≥{BREADTH_MIN_PCT:.0%}) + 후보 반등 시 진입 재시도 (~{ENTRY_CUTOFF})")
@@ -647,11 +683,12 @@ async def phase_entry() -> None:
                 pos = await _buy_one(mcp, c, mode_tag)
                 if pos:
                     positions.append(pos); bought.append(pos)
+                    save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 포지션 방지
     except Exception as e:
         logger.error("[ENTRY] %s", e); await notify(f"❌ 진입 오류: {e}"); return
     bought, positions = await _verify_buy_fills(bought, positions)
     save_state("positions", positions)
-    save_state("pending_entries", pending)
+    _save_pending(pending)
     if bought or pending:
         _mark_done("entry")
     if bought:
@@ -676,16 +713,24 @@ async def _try_pending() -> None:
     pending = get_state("pending_entries", [])
     if not pending:
         return
+    # stale 가드: 전일 보류분(데몬 crash 로 exit phase 미도달)은 익일 매수 금지 — 신호는 당일 한정.
+    pdate = get_state("pending_date", "")
+    if pdate != datetime.now().strftime("%Y-%m-%d"):
+        log_event("entry_skip", {"symbols": [c["symbol"] for c in pending],
+                                 "reason": f"전일 보류분 stale({pdate or '?'})"})
+        logger.warning("[PENDING] 전일 보류분(%s) %d종 폐기 — 당일 스크리닝분만 진입", pdate or "?", len(pending))
+        _save_pending([])
+        return
     if _past_entry_cutoff():
         log_event("entry_skip", {"symbols": [c["symbol"] for c in pending], "reason": f"진입마감({ENTRY_CUTOFF}) 경과"})
         await notify(f"⏭️ 보류 후보 진입마감({ENTRY_CUTOFF}) 경과 → 스킵: " +
                      ", ".join(f"{c['name']}({c['symbol']})" for c in pending))
-        save_state("pending_entries", [])
+        _save_pending([])
         return
     positions = get_state("positions", [])
     slots = MAX_POS - len(positions)
     if slots <= 0:
-        save_state("pending_entries", [])
+        _save_pending([])
         return
     broken, why = await _circuit_broken()
     if broken:
@@ -715,6 +760,7 @@ async def _try_pending() -> None:
                     pos = await _buy_one(mcp, c, mode_tag)
                     if pos:
                         positions.append(pos); bought.append(pos)
+                        save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 방지
                     else:
                         still.append(c)
                 else:
@@ -722,9 +768,8 @@ async def _try_pending() -> None:
     except Exception as e:
         logger.error("[PENDING] %s", e); return
     bought, positions = await _verify_buy_fills(bought, positions)
-    if bought:
-        save_state("positions", positions)
-    save_state("pending_entries", still)
+    save_state("positions", positions)
+    _save_pending(still)
     if bought:
         await notify(f"✅ 추세추종 보류분 진입(반등 확인) {mode_tag}\n" + "\n".join(_entry_notify_line(p) for p in bought))
 
@@ -770,7 +815,7 @@ async def _pyramid_adds(when: str) -> None:
                     logger.info("[PYRAMID] %s 하락중(현재%.0f<시가%.0f) — 추가 보류(다음 cycle 재평가)",
                                 pos["symbol"], cur, opn)
                     continue
-                add_qty = await _size_qty(cur)
+                add_qty = await _size_qty(cur, pos.get("stop_price", 0))   # risk 사이징: 현 트레일 stop 기준
                 if add_qty < 1:
                     logger.info("[PYRAMID] %s 현금부족/수량0 — 추가 스킵", pos["symbol"]); continue
                 resp = await _place(mcp, "buy", pos["symbol"], add_qty)
@@ -794,10 +839,10 @@ async def _pyramid_adds(when: str) -> None:
                 logger.info("[PYRAMID] %s %s +%d주 @%.0f (#%d차) 평단%.0f", pos["symbol"], pos["name"][:10],
                             add_qty, add_price, k, pos["entry_price"])
                 added.append((pos, add_qty, add_price, k))
+                save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 평단/수량 유실 방지
     except Exception as e:
         logger.error("[PYRAMID] %s", e); return
     if added:
-        save_state("positions", positions)
         await notify(f"🔼 피라미딩 추가매수 (전략 hot · 최근{n}거래 평균 {avg:+.2f}%)\n" +
                      "\n".join(f"• <b>{p['name']}</b>({p['symbol']}) +{q}주 @{pr:,.0f} (#{k}차) · 평단 {p['entry_price']:,.0f}"
                                for p, q, pr, k in added))
@@ -811,27 +856,35 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     remaining = []
     closed = []
     sell_failures: list[dict] = []   # phase 내 매도 거부 누적 (8005/거부/예외) — 임계 초과 시 critical alert
+    price_fails: list[str] = []      # 시세조회 실패 종목 — exit phase 면 알림(무경고 HOLD 방지)
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
                 logger.warning("[%s] trading-domain 연결 실패", when); return
-            for pos in positions:
+            for idx, pos in enumerate(positions):
                 sym, entry, qty = pos["symbol"], pos["entry_price"], int(pos["qty"])
-                cur = await _realtime_price(sym) or entry
+                cur = await _realtime_price(sym)
+                if not cur:
+                    # entry 폴백은 pnl 0 으로 위장돼 트레일/손절이 침묵 — 최소한 경고는 남긴다
+                    price_fails.append(f"{pos['name']}({sym})")
+                    logger.warning("[%s] %s 시세조회 실패 — entry 폴백(청산판정 보류)", when, sym)
+                    cur = entry
                 a = float(pos.get("atr", 0) or 0)
                 peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
                 pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
-                # 이평선/외인 청산 신호는 15:20 청산 phase(do_exit_signals)에서만 평가
-                ma_exit, foreign = None, None
+                # 이평선/외인/보유만기 청산 신호는 15:20 청산 phase(do_exit_signals)에서만 평가
+                ma_exit, foreign, aged = None, None, False
                 if do_exit_signals:
                     ohlcv = get_ohlcv(sym, EXIT_MA + 40)
                     ma_exit = moving_average([b["close"] for b in ohlcv] + [cur], EXIT_MA) if ohlcv else None
                     foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
+                    # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지
+                    aged = MAX_HOLD_DAYS > 0 and _busdays_since(pos.get("buy_date")) >= MAX_HOLD_DAYS
                 action, reason, sell_qty = exit_decision(
                     entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
                     partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
                     partial_pct=CFG.partial_pct, ma_exit=ma_exit, exit_ma_label=EXIT_MA,
-                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT)
+                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT, aged_out=aged)
                 if not action:
                     remaining.append(pos); continue
                 # 매도 시도(클라이언트 단의 8005 자동복구 1회 포함). 실패 시 1회 추가 재시도.
@@ -857,12 +910,14 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 if action == "PARTIAL":
                     pos["partial_done"] = True; pos["qty"] = qty - sell_qty
                     remaining.append(pos)
+                    save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
                     journal_append({"type": "partial", "id": pos["journal_id"], "symbol": sym, "qty": sell_qty,
                                     "price": cur, "pnl_pct": pnl_pct, "reason": reason})
                     log_event("partial", {"symbol": sym, "qty": sell_qty, "price": cur, "pnl_pct": pnl_pct})
                     await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{cur:,.0f} "
                                  f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
                 else:
+                    save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
                     hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
                     net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
                     rr_real = round((cur - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
@@ -877,6 +932,9 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     except Exception as e:
         logger.error("[%s] %s", when, e); return
     save_state("positions", remaining)
+    # 청산 phase 에서 시세조회 실패 = 청산 기회를 침묵 속에 놓칠 수 있음 → 알림
+    if price_fails and when == "exit":
+        await notify("⚠️ 청산 phase 시세조회 실패 — 청산판정 보류(다음 cycle 재시도): " + ", ".join(price_fails))
     # 매도 거부 누적이 임계치 초과(시도 절반 이상 또는 3건+) → 시스템적 문제 가능성 → critical alert
     attempts = len(closed) + len(sell_failures)
     if sell_failures and (len(sell_failures) >= 3 or len(sell_failures) >= attempts / 2):
@@ -909,7 +967,7 @@ async def phase_exit() -> None:
         log_event("entry_skip", {"symbols": [c["symbol"] for c in pend], "reason": "장중 미반등"})
         await notify("⏭️ 보류 후보 진입 스킵 (장중 시가 회복 실패): " +
                      ", ".join(f"{c['name']}({c['symbol']})" for c in pend))
-        save_state("pending_entries", [])
+        _save_pending([])
     await phase_reconcile()   # 신규 계좌 보유분 편입 후 청산판단
     await _manage(do_exit_signals=True, when="exit")
     await write_daily_journal()   # 마감 후 그날 매매일지 자동 작성
@@ -1072,13 +1130,16 @@ async def scheduler_daemon() -> None:
     logger.info("=" * 56)
     if PRODUCTION_MODE:
         logger.warning("[DAEMON] ⚠️ PRODUCTION MODE — 실거래 API 사용. 주문은 실제 체결됩니다.")
-        logger.warning("[DAEMON] 계좌=%s · 사이징=%s %s · 최대슬롯=%d · HardStop=%s%% · 일일손실서킷=%s%%",
+        _size_desc = f"risk {RISK_PCT}%÷손절폭(상한{MAX_NOTIONAL_PCT:g}%)" if SIZING_MODE == "risk" else f"{SIZING_MODE} {POSITION_PCT}%"
+        logger.warning("[DAEMON] 계좌=%s · 사이징=%s · 최대슬롯=%d · HardStop=%s%% · 일일손실서킷=%s%%",
                        (ACCOUNT_NO[:4] + "****") if ACCOUNT_NO else "없음",
-                       SIZING_MODE, POSITION_PCT, MAX_POS, HARD_STOP_PCT, DAILY_LOSS_LIMIT_PCT)
+                       _size_desc, MAX_POS, HARD_STOP_PCT, DAILY_LOSS_LIMIT_PCT)
         # 실전 안전 기본값 가드: 첫주 권장 ≤3% 균등·≤5슬롯·하드손절 ON·일일손실서킷 ON
         warns: list[str] = []
         if SIZING_MODE == "pct_equity" and POSITION_PCT > 3:
             warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
+        if SIZING_MODE == "risk" and RISK_PCT > 2:
+            warns.append(f"RISK_PCT={RISK_PCT}% > 권장 ≤1.5% (거래별 리스크 과대 — MDD 급증)")
         if MAX_POS > 5:
             warns.append(f"MAX_POS={MAX_POS} > 권장 5 (실전 첫주 슬롯 과다)")
         if HARD_STOP_PCT <= 0:

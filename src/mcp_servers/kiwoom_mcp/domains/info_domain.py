@@ -375,6 +375,30 @@ class InfoDomainServer(KiwoomDomainServer):
                 params=params,
             )
 
+        @self.mcp.tool()
+        async def get_all_sector_index(
+            sector_code: str = "001",
+        ) -> StandardResponse:
+            """
+            전업종지수 조회 (한 번에 전 업종)
+
+            API: ka20003 (전업종지수요청)
+            응답 all_inds_idex 배열에 전 업종의 지수 등락률(flu_rt) + 상승/하락/보합
+            종목수(rising/fall/stdns)를 일괄 반환. 업종별 개별조회(ka20001) 다회 호출 대체.
+
+            Args:
+                sector_code: 업종코드 (기본 001=종합, 전업종 반환)
+            """
+            query = f"전업종지수: {sector_code}"
+
+            params = {"inds_cd": sector_code}
+
+            return await self.call_api_with_response(
+                api_id=KiwoomAPIID.ALL_SECTOR_INDEX,
+                query=query,
+                params=params,
+            )
+
         # === 3. 테마 정보 도구들 ===
 
         @self.mcp.tool()

@@ -63,31 +63,56 @@ def get_ohlcv(symbol: str, days: int = 320) -> list[dict]:
         return []
 
 
-def _clean_index_closes(pairs: list[tuple[str, float]], days: int) -> list[float]:
-    """지수 (date, close) → NaN/0 제거 + 장중 미완성 오늘봉 제거 후 마지막 days개."""
+def _clean_index_pairs(pairs: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    """지수 (date, close) → NaN/0 제거 + 장중 미완성 오늘봉 제거 (날짜 유지)."""
     out = [(d, c) for d, c in pairs if c == c and c > 0]   # c==c → NaN 제거
     if out and _market_open_now() and out[-1][0] == datetime.now().strftime("%Y-%m-%d"):
         out = out[:-1]
-    return [c for _, c in out][-days:]
+    return out
+
+
+def _expected_last_close_date() -> str:
+    """가장 최근 '완성된' 영업일 (장중 오늘·주말 제외) — KOSPI staleness 판정 기준."""
+    d = datetime.now()
+    if _market_open_now() or d.hour < 16:   # 장중/장전 → 오늘봉 미완성 → 직전 영업일 기대
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:                  # 주말 → 직전 금요일
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
 
 
 def get_kospi_closes(days: int = 320) -> list[float]:
-    try:
-        with _suppress():
-            df = krx.get_index_ohlcv_by_date(_days_ago(days + 60), _today(), "1001")
-        pairs = [(d.strftime("%Y-%m-%d"), float(row["종가"])) for d, row in df.iterrows()]
-        res = _clean_index_closes(pairs, days)
-        if res:
-            return res
-    except Exception:
-        pass
-    try:
+    """KOSPI 종가 시계열 (RS 게이트용).
+
+    소스 우선순위: FDR ^KS11 (현행 유일 동작). pykrx 지수 API(ka `get_index_ohlcv_by_date`)는
+    2026-07 KRX 지수 엔드포인트 인증화로 빈 DataFrame/티커명 KeyError 를 내 사실상 사망 → 2순위 폴백으로만 둔다.
+    데이터 미확보/지연 시 경고 로그 — RS 게이트는 KOSPI 없으면 RS=0(fail-open) 처리되므로 조용히 무력화되는 것 방지.
+    """
+    pairs: list[tuple[str, float]] = []
+    try:                                     # 1순위: FDR ^KS11
         import FinanceDataReader as fdr
-        df = fdr.DataReader("^KS11", _days_ago(days + 60), _today())
+        with _suppress():
+            df = fdr.DataReader("^KS11", _days_ago(days + 60), _today())
         pairs = [(d.strftime("%Y-%m-%d"), float(c)) for d, c in zip(df.index, df["Close"])]
-        return _clean_index_closes(pairs, days)
-    except Exception:
+    except Exception as e:
+        logger.debug("[KOSPI] FDR 실패: %s", e)
+    if not [c for _, c in pairs if c == c and c > 0]:
+        try:                                 # 2순위: pykrx 지수 (KRX 복구 대비, name_display=False 로 티커명 버그 우회)
+            with _suppress():
+                df = krx.get_index_ohlcv_by_date(_days_ago(days + 60), _today(), "1001", name_display=False)
+            pairs = [(d.strftime("%Y-%m-%d"), float(row["종가"])) for d, row in df.iterrows()]
+        except Exception as e:
+            logger.debug("[KOSPI] pykrx 지수 폴백 실패: %s", e)
+
+    clean = _clean_index_pairs(pairs)
+    if not clean:
+        logger.warning("[KOSPI] 지수 데이터 확보 실패 (FDR·pykrx 모두) — RS 게이트가 RS=0 으로 무력화됨")
         return []
+    exp = _expected_last_close_date()
+    if clean[-1][0] < exp:                    # 최신 봉이 기대 영업일보다 뒤처짐 → RS 신뢰도 저하
+        logger.warning("[KOSPI] 데이터 %s 까지 (기대 %s) — 소스 갱신 지연으로 RS 게이트 신뢰도 저하",
+                       clean[-1][0], exp)
+    return [c for _, c in clean][-days:]
 
 
 def _name(code: str) -> str:

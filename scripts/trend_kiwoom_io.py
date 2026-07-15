@@ -81,23 +81,25 @@ async def _realtime_price(symbol: str) -> float | None:
 
 
 async def _foreign_net_5d(symbol: str) -> float | None:
-    """외국인 최근 5영업일 순매수(보유변동수량) 합산 — ka10008 주식외국인종목별매매동향.
+    """외국인 최근 5영업일 순매수 합산 — ka10008, **완성일 기준 + 규모 임계값**(signals.foreign_net_signal).
 
-    2026-07-13 재구현: 과거엔 존재하지 않는 foreign_net_5d 키를 찾아 항상 None(외인 청산룰 dead code).
-    응답 stk_frgnr[] 일별 리스트(최신순)의 chg_qty(전일대비 외인 보유수량 변동 = 일별 순매수)를
-    최근 5행 합산. 음수 = 5일 누적 순매도 → exit_decision 외인전환 청산 트리거.
-    리스트/필드 부재 시 None(fail-open — 룰 미적용). ※ 이 룰은 백테스트 미검증(발동 시 journal 로 추적).
+    2026-07-13 재구현(구 dead code) → 2026-07-15 보강: 삼성생명 오발동(당일 잠정치 부호반전 +
+    유통주식 0.001% 노이즈 발동) 재발 방지 — 당일 잠정 행 제외, |5일합| < FOREIGN_MIN_RATIO×20일
+    평균거래량 이면 None(노이즈, 룰 미적용). ※ 백테스트 검증은 backtest_trend --foreignexit.
     """
+    from datetime import datetime as _dt
+    from src.mcp_servers.trend_mcp.signals import foreign_net_signal
+    from trend_config import FOREIGN_MIN_RATIO
     d = await _kiwoom_call("investor-domain", INVESTOR_URL, "foreign_trading_trend", {"stock_code": symbol})
     rows = d.get("stk_frgnr")
     if not isinstance(rows, list) or not rows:
         logger.debug("[FOREIGN] %s stk_frgnr 리스트 없음 — 외인 청산룰 미적용", symbol)
         return None
-    recent = [r for r in rows[:5] if isinstance(r, dict) and r.get("chg_qty") not in (None, "")]
-    if not recent:
-        logger.debug("[FOREIGN] %s chg_qty 필드 없음 — 외인 청산룰 미적용", symbol)
-        return None
-    return sum(_num(r, "chg_qty") for r in recent)
+    net = foreign_net_signal(rows, _dt.now().strftime("%Y%m%d"), FOREIGN_MIN_RATIO)
+    if net is None:
+        logger.info("[FOREIGN] %s 신호 없음(완성일<5 or |5일합|<임계 %.2f×avg20vol) — 룰 미적용",
+                    symbol, FOREIGN_MIN_RATIO)
+    return net
 
 
 async def _cur_and_open(symbol: str) -> tuple[float, float]:

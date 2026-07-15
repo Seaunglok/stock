@@ -4,6 +4,7 @@ from src.mcp_servers.trend_mcp.signals import (
     classify_zone,
     entry_signal,
     exit_decision,
+    foreign_net_signal,
     fundamentals_bonus,
     is_big_bullish_candle,
     is_consolidation,
@@ -316,3 +317,46 @@ def test_exit_decision_aged_out():
     # 미만기(기본 False) → HOLD 유지
     assert exit_decision(entry=100, cur=110, qty=5, target=130, stop=90,
                          partial_done=True)[0] is None
+
+
+# ─── foreign_net_signal (외인 수급 신호 — 완성일 기준 + 규모 임계값) ─────────
+
+def _frow(dt, chg, vol=500_000):
+    return {"dt": dt, "chg_qty": chg, "trde_qty": vol}
+
+
+def test_foreign_signal_excludes_today_provisional():
+    # 2026-07-15 삼성생명 오발동 재현: 당일 잠정치 포함 시 음수, 완성일 기준으론 판정 달라야 함.
+    rows = [_frow("20260715", "-40000"),   # 당일 잠정(제외돼야 함)
+            _frow("20260714", "-50,387"), _frow("20260713", "+104,276"),
+            _frow("20260710", "-59,576"), _frow("20260709", "+3,315"),
+            _frow("20260708", "+52,748")]
+    # 완성일 5일합 = +50,376 (당일 잠정 -40,000 미포함), 임계 off 로 값 자체 확인
+    assert foreign_net_signal(rows, "20260715", min_ratio=0) == 50376.0
+
+
+def test_foreign_signal_noise_filtered_by_ratio():
+    # 5일합 -2,372주 vs 평균거래량 500,000 → 0.5% 는 노이즈 → None (룰 미적용)
+    rows = [_frow("20260714", "-50,387"), _frow("20260713", "+104,276"),
+            _frow("20260710", "-59,576"), _frow("20260709", "+3,315"),
+            _frow("20260708", "+0"),
+            _frow("20260707", "0"), _frow("20260706", "0")]
+    assert foreign_net_signal(rows, "20260715", min_ratio=0.2) is None
+    # 임계 off(0) 면 부호 그대로 통과
+    assert foreign_net_signal(rows, "20260715", min_ratio=0) == -2372.0
+
+
+def test_foreign_signal_strong_selling_passes():
+    # 강한 순매도(-650만주 vs avg vol 1,500만 = 43%) → 임계 0.2 통과, 음수 반환
+    rows = [_frow("2026071%d" % d, "-1,300,000", 15_000_000) for d in range(0, 5)]  # 07-10~14 (완성일만)
+    net = foreign_net_signal(rows, "20260715", min_ratio=0.2)
+    assert net == -6_500_000
+
+
+def test_foreign_signal_insufficient_or_bad_data():
+    # 완성일 5개 미만 → None
+    rows = [_frow("20260714", "-100")] * 3
+    assert foreign_net_signal(rows, "20260715", min_ratio=0) is None
+    # 빈/깨진 입력 → None
+    assert foreign_net_signal([], "20260715") is None
+    assert foreign_net_signal([{"dt": "20260714", "chg_qty": "??"}] * 6, "20260715") is None

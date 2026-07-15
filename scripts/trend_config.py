@@ -80,6 +80,9 @@ RISK_PCT = float(os.getenv("TREND_RISK_PCT", "1.5"))
 # risk 모드 notional 상한(예탁 대비 %) — 손절폭 극소 종목이 과대편입되는 것 방지.
 MAX_NOTIONAL_PCT = float(os.getenv("TREND_MAX_NOTIONAL_PCT", "25"))
 USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
+# 외인 청산 신호 규모 임계값: |5일 순매수합| ≥ 이 값 × 20일 평균거래량 이어야 유효 신호(0=부호만).
+# 2026-07-15 삼성생명 노이즈 오발동(0.001% 규모) 재발 방지. 백테스트: backtest_trend --foreignexit.
+FOREIGN_MIN_RATIO = float(os.getenv("TREND_FOREIGN_MIN_RATIO", "0.2") or 0)
 NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
 # 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).

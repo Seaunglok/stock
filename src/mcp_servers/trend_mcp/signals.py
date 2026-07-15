@@ -259,6 +259,49 @@ def market_breadth(sector_rows: list[dict]) -> float | None:
     return total_rising / total
 
 
+# ─── 외인 수급 신호 (ka10008 rows → 5일 순매수 판정) ─────────────────────────
+
+def foreign_net_signal(rows: list[dict], today: str, min_ratio: float = 0.2,
+                       days: int = 5, vol_days: int = 20) -> float | None:
+    """외국인 최근 N영업일 순매수(보유변동 chg_qty) 합산 — **완성일 기준 + 규모 임계값**.
+
+    2026-07-15 삼성생명 오발동 교훈: ① 당일 잠정치가 마감 후 부호 반전(잠정 -→확정 +36,598),
+    ② 5일합 -2,372주(유통주식 0.001%) 노이즈에 부호만 보고 청산. → 두 결함 모두 여기서 차단:
+    - rows 중 dt == today(잠정치)는 제외, 완성일 최근 days개만 합산 (시스템의 '완성봉' 원칙과 정합).
+    - |합산| < min_ratio × 20일 평균거래량 이면 노이즈로 보고 None(신호 없음, fail-open).
+      min_ratio=0 이면 임계값 off(부호만 판정 — 구 동작).
+
+    Args:
+        rows: ka10008 stk_frgnr 리스트(최신순). [{dt, chg_qty, trde_qty, ...}]
+        today: 오늘 날짜 "YYYYMMDD" (잠정치 제외 기준).
+    Returns:
+        완성일 days일 순매수 합(음수=순매도) 또는 None(데이터 부족/노이즈 — 룰 미적용).
+    """
+    def _f(v: Any) -> float | None:
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return None
+
+    done = []
+    for r in rows or []:
+        if not isinstance(r, dict) or str(r.get("dt", "")) == today:
+            continue
+        q = _f(r.get("chg_qty"))
+        if q is None:
+            continue
+        done.append((q, _f(r.get("trde_qty")) or 0.0))
+    if len(done) < days:
+        return None                       # 완성일 데이터 부족 → 판정 불가
+    net = sum(q for q, _ in done[:days])
+    if min_ratio > 0:
+        vols = [v for _, v in done[:vol_days] if v > 0]
+        avg_vol = sum(vols) / len(vols) if vols else 0.0
+        if avg_vol > 0 and abs(net) < min_ratio * avg_vol:
+            return None                   # 노이즈(평균거래량 대비 미미) → 신호 아님
+    return net
+
+
 # ─── 청산 신호 ──────────────────────────────────────────────────────────────
 
 def trend_exit(

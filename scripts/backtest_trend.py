@@ -60,12 +60,47 @@ V_PYRAMID_REGIME_MOM: tuple | None = None  # 모멘텀 게이트 (days, pct): KO
 V_PYRAMID_RISING_DAY: bool = False        # True=추가 유닛은 해당 영업일이 양봉(close>open)일 때만 (라이브 _is_rising 의 backtest 대응)
 V_BREAKEVEN_TRIGGER_PCT: float | None = None  # 진입가 +X% 도달 시 stop 을 BE(entry)로 끌어올림. None=off
 V_BREADTH_MIN_PCT: float | None = None    # 시장 breadth 게이트: 일별 universe 상승비율 < 이 값 일 때 신규진입 차단. None=off
+# 외인 청산룰(ka10008 완성일 5일합 < 0 이면 종가 청산): None=off / 0=부호만 / >0 = |합|≥ratio×20일평균거래량 일 때만 유효
+V_FOREIGN_MIN_RATIO: float | None = None
+V_FOREIGN_MAP: dict = {}                  # code → (sorted_dates["YYYY-MM-DD"], {date: chg_qty}) — ka10008 이력
 
 
-def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> float | None:
+def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -> bool:
+    """외인 수급 청산 판정(완성일 5일합) — 라이브 foreign_net_signal 과 동일 규약.
+
+    당일(bar) 잠정치 제외 = bar 날짜 **이전** 완성일 5개 합산. V_FOREIGN_MIN_RATIO>0 이면
+    |합| ≥ ratio×20일 평균거래량 일 때만 유효 신호. 데이터<5일 이면 미적용(fail-open).
+    """
+    if V_FOREIGN_MIN_RATIO is None or not code or code not in V_FOREIGN_MAP:
+        return False
+    dates, fmap = V_FOREIGN_MAP[code]
+    lo, hi = 0, len(dates)
+    while lo < hi:                       # bisect_left(dates, bar date)
+        mid = (lo + hi) // 2
+        if dates[mid] < bar["date"]:
+            lo = mid + 1
+        else:
+            hi = mid
+    recent = dates[max(0, lo - 5):lo]    # bar 이전 완성일 최근 5개
+    if len(recent) < 5:
+        return False
+    net = sum(fmap[d] for d in recent)
+    if net >= 0:
+        return False
+    if V_FOREIGN_MIN_RATIO > 0:
+        vols = [b["volume"] for b in full[max(0, j - 19):j + 1] if b["volume"] > 0]
+        avg_vol = sum(vols) / len(vols) if vols else 0.0
+        if avg_vol > 0 and abs(net) < V_FOREIGN_MIN_RATIO * avg_vol:
+            return False                 # 노이즈 — 신호 아님
+    return True
+
+
+def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
+                   code: str | None = None) -> float | None:
     """신호 봉 i 다음날 시가 진입 → 트레일/목표/MA 청산. net 수익률(%) 반환.
 
-    변형 노브: V_FIRST_PARTIAL_R(첫익절 지점), V_EXIT_MA(청산선), V_HARD_STOP_PCT(하드손절).
+    변형 노브: V_FIRST_PARTIAL_R(첫익절 지점), V_EXIT_MA(청산선), V_HARD_STOP_PCT(하드손절),
+    V_FOREIGN_MIN_RATIO(외인 수급 청산 — code 필요).
     """
     if i + 1 >= len(full):
         return None
@@ -108,6 +143,11 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs) -> 
         # 청산 이평선 하방 돌파(종가)
         ma = moving_average(closes[:j + 1], exit_ma)
         if ma is not None and b["close"] < ma:
+            realized += rem * (b["close"] - entry) / entry * 100
+            rem = 0.0
+            break
+        # 외인 수급 청산(완성일 5일 순매도, 종가) — 라이브 exit_decision 우선순위와 동일(MA 다음)
+        if _foreign_exit_today(code, b, full, j):
             realized += rem * (b["close"] - entry) / entry * 100
             rem = 0.0
             break
@@ -258,7 +298,7 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
                 for u_net in nets_u:
                     trades.append((gap, u_net))
             else:
-                net = simulate_trade(full, idx, cfg, costs)
+                net = simulate_trade(full, idx, cfg, costs, code=code)
                 if net is not None:
                     trades.append((gap, net))
         if (i_day + 1) % 40 == 0:
@@ -489,6 +529,106 @@ def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], cos
     print("  ※ 레짐 게이트가 횡보장 추가유닛을 억제해 증폭손실을 줄이면서 추세장 상승을 살리는지 확인.")
 
 
+FOREIGN_CACHE = Path(__file__).parent.parent / "docs_cache" / "foreign_ka10008"
+
+
+def _load_foreign_map(codes: list[str]) -> dict:
+    """ka10008 외국인 일별 보유변동 이력 로드(코드별 1콜, 일자 캐시) → V_FOREIGN_MAP 형식.
+
+    키움 MCP investor-domain(:8033) 필요. 응답 최대 ~50 완성일 — 백테스트 창은 이 커버리지로 제한됨.
+    """
+    import asyncio
+    import json as _json
+    from datetime import datetime as _dt
+    from src.claude_agents.base.mcp_client import MCPManager
+    today = _dt.now().strftime("%Y%m%d")
+    FOREIGN_CACHE.mkdir(parents=True, exist_ok=True)
+
+    async def _fetch_all() -> dict:
+        out = {}
+        async with MCPManager({"investor-domain": "http://localhost:8033/mcp/"}) as mcp:
+            if not mcp.tools:
+                print("  [FOREIGN] investor-domain 연결 실패 — 외인 데이터 없음")
+                return out
+            for n, code in enumerate(codes, 1):
+                cache = FOREIGN_CACHE / f"{code}_{today}.json"
+                if cache.exists():
+                    rows = _json.loads(cache.read_text(encoding="utf-8"))
+                else:
+                    try:
+                        raw = await mcp.call_tool("get_foreign_trading_trend", {"stock_code": code})
+                        p = _json.loads(raw) if isinstance(raw, str) else raw
+                        rows = (p.get("data", {}) or {}).get("stk_frgnr", []) or []
+                        cache.write_text(_json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+                        await asyncio.sleep(0.25)   # 키움 rate limit 여유
+                    except Exception as e:
+                        print(f"  [FOREIGN] {code} 실패: {e}")
+                        rows = []
+                fmap = {}
+                for r in rows:
+                    dt = str(r.get("dt", ""))
+                    if len(dt) != 8 or dt == today:      # 당일 잠정치 제외(완성일만)
+                        continue
+                    try:
+                        fmap[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = float(str(r.get("chg_qty", "0")).replace(",", ""))
+                    except Exception:
+                        continue
+                if fmap:
+                    out[code] = (sorted(fmap), fmap)
+                if n % 25 == 0:
+                    print(f"  [FOREIGN] {n}/{len(codes)} 로드")
+        return out
+
+    return asyncio.run(_fetch_all())
+
+
+def report_foreignexit(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """외인 청산룰 A/B — off vs 부호만 vs 규모 임계값(0.2/0.5). 라이브 설정(MA120·하드10%) 미러.
+
+    동기: 2026-07-15 삼성생명 오발동(노이즈 부호 + 당일 잠정치). ka10008 이력이 ~50완성일이라
+    백테스트 창을 그 커버리지(약 2026-05 이후)로 제한 — 표본 적음(지시적 검증), 07-13 폭락 포함.
+    """
+    global V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP, V_EXIT_MA, V_HARD_STOP_PCT
+    V_EXIT_MA, V_HARD_STOP_PCT = 120, 10.0        # 라이브 미러(.env EXIT_MA=120·HARD_STOP=10)
+    key = (mode, tuple(watch), start, end, cfg_top)
+    if key not in _UNIV_CACHE:
+        run(mode, start, end, watch, costs, cfg)   # 유니버스 로드(캐시 채움)
+    codes = list(_UNIV_CACHE[key][2].keys())
+    V_FOREIGN_MAP = _load_foreign_map(codes)
+    cover = [d for ds, _ in V_FOREIGN_MAP.values() for d in ds[:1]]
+    print(f"  외인 데이터: {len(V_FOREIGN_MAP)}종목, 최고령 완성일 {min(cover) if cover else 'N/A'}"
+          f" — 진입창 {start}~{end} 는 이 커버리지 내여야 유효")
+    variants = [("기준: 외인룰 off", None), ("부호만(구 룰, 잠정치만 제거)", 0.0),
+                ("임계 0.2×avg20vol (라이브 채택안)", 0.2), ("임계 0.5×avg20vol", 0.5)]
+    print("\n" + "=" * 96)
+    print(f"외인 청산룰 A/B — {label} (비용 차감 후, MA120·하드10% 고정, 창={start}~{end})")
+    print("=" * 96)
+    print(f"  {'변형':30} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
+    base_nets: list[float] = []
+    for vlabel, ratio in variants:
+        V_FOREIGN_MIN_RATIO = ratio
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        if ratio is None:
+            base_nets = nets
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:30} 진입 0건"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        diff = ""
+        # 진입 게이트는 동일 → 거래 리스트 1:1 정렬. 외인룰이 결과를 바꾼 거래만 추출해 marginal 효과 표시.
+        if ratio is not None and len(base_nets) == len(nets):
+            deltas = [b - a for a, b in zip(base_nets, nets) if abs(b - a) > 1e-9]
+            better = sum(1 for d in deltas if d > 0)
+            diff = f"  변경 {len(deltas)}건(개선 {better}) Δ누적 {sum(deltas):+.1f}%p"
+        print(f"  {vlabel:30} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+9.1f}%{diff}")
+    V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP = None, {}
+    V_EXIT_MA, V_HARD_STOP_PCT = None, 0.0
+    print("  ※ 표본 작음(외인 이력 ~50완성일) — 방향성 판단용. 외인룰이 기대값·P10 을 개선 못 하면 off 권장.")
+    print("  ※ 부호만 vs 임계: 임계가 노이즈 청산(본전 털림)을 줄여 기준에 근접할수록 룰의 실질 기여는 작다는 뜻.")
+
+
 def report_hardstop(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """하드손절 임계값 A/B — off / 5% / 7% / 10% / 15% 비교.
 
@@ -662,6 +802,7 @@ def main():
     p.add_argument("--breadthtest", action="store_true", help="시장 breadth 게이트 A/B(universe 양봉비율 < X 시 신규진입 차단)")
     p.add_argument("--pullbacktest", action="store_true", help="눌림목 게이트 폭 A/B(pullback_pct 3/5/8/12/20/off)")
     p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
+    p.add_argument("--foreignexit", action="store_true", help="외인 청산룰 A/B(off/부호만/임계 0.2·0.5) — investor-domain 필요")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -689,6 +830,8 @@ def main():
         report_pullback(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.hardstoptest:
         report_hardstop(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.foreignexit:
+        report_foreignexit(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

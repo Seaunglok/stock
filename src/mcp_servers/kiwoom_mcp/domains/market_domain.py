@@ -416,6 +416,62 @@ class MarketDomainServer(KiwoomDomainServer):
             )
 
         @self.mcp.tool()
+        async def get_sector_daily_chart(
+            sector_code: str = "001",
+            base_date: str | None = None,
+            limit: int = 150,
+        ) -> StandardResponse:
+            """
+            업종(지수) 일봉 차트 조회 — KOSPI 종합지수 일별 시계열
+
+            Args:
+                sector_code: 업종코드 (001=KOSPI 종합, 101=KOSDAQ 종합)
+                base_date: 기준일자 (YYYYMMDD, 기본=오늘). 이 날짜 기준 과거 일봉 반환.
+                limit: 반환 일봉 수 상한(최신순, 기본 150). 원본 응답이 ~85KB라 MCP 결과 잘림
+                       (30KB)으로 JSON 이 깨지는 것을 방지 — 서버에서 미리 자른다.
+
+            Returns:
+                StandardResponse: 업종 일봉 (inds_dt_pole_qry 배열: dt/cur_prc/open_pric/high_pric/low_pric).
+                                  cur_prc 등 지수값은 **×100 스케일**(674795 = 6747.95).
+
+            API: ka20006 (업종일봉조회요청)
+            용도: 추세추종 RS 게이트용 KOSPI 시계열 — FDR ^KS11 이 1영업일 지연되는 문제 대체
+                  (2026-07-22: FDR 은 당일 미포함, ka20006 은 당일 포함).
+            """
+            if base_date and (len(base_date) != 8 or not base_date.isdigit()):
+                return await self.create_error_response(
+                    func_name="get_sector_daily_chart",
+                    error="기준일자는 YYYYMMDD 형식이어야 합니다"
+                )
+
+            query = f"업종 일봉 차트: {sector_code}"
+
+            params = {
+                "inds_cd": sector_code,
+                "base_dt": base_date or datetime.now().strftime("%Y%m%d"),
+            }
+
+            resp = await self.call_api_with_response(
+                api_id=KiwoomAPIID.SECTOR_DAILY_CHART, query=query, params=params
+            )
+            # 응답 축소 — 원본은 600봉×전체필드 ≈ 86KB 라 MCP 결과 잘림(30KB)으로 JSON 이 깨진다.
+            # 최신 limit개 × 필수필드(dt/cur_prc/open_pric/high_pric/low_pric)만 남긴다.
+            # ※ create_standard_response 는 dict 를 반환하므로 속성(resp.data)이 아닌 키로 접근.
+            try:
+                data = resp.get("data") if isinstance(resp, dict) else None
+                arr = data.get("inds_dt_pole_qry") if isinstance(data, dict) else None
+                if isinstance(arr, list):
+                    keep = arr[:limit] if limit > 0 else arr
+                    data["inds_dt_pole_qry"] = [
+                        {k: r.get(k) for k in ("dt", "cur_prc", "open_pric", "high_pric", "low_pric")
+                         if r.get(k) is not None}
+                        for r in keep if isinstance(r, dict)
+                    ]
+            except Exception:  # 구조가 다르면 원본 그대로 반환
+                pass
+            return resp
+
+        @self.mcp.tool()
         async def get_minute_chart(
             stock_code: str,
             interval: int,

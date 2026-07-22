@@ -31,8 +31,9 @@ sys.path.insert(0, str(Path(__file__).parent))   # scripts/ → trend 패키지 
 from trend_config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
 from trend_config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
 from trend_kiwoom_io import (               # noqa: E402
-    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _order_accepted,
-    _place, _premarket_snapshot, _realtime_price, _sector_index_rows, get_universe,
+    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _kospi_closes_kiwoom,
+    _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
+    get_universe,
 )
 from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  # noqa: E402
 
@@ -155,6 +156,19 @@ def journal_note(jid: str, psych: str = "", mistake: str = "", improve: str = ""
 
 
 _is_rising = is_rising   # signals.is_rising 재노출(호출부 호환)
+
+
+async def _kospi_closes() -> list[float]:
+    """RS 게이트용 KOSPI 종가 — 키움 ka20006 우선, 실패 시 FDR(순수도메인 market_data) 폴백.
+
+    FDR 은 전일 종가를 다음날 장중에 채워 08:50 screen 시점 1영업일 지연 → 개별종목과
+    날짜가 어긋나 RS 가 하루 묵은 지수로 판정되던 문제(2026-07-22 수정). 키움은 당일 봉 포함.
+    """
+    k = await _kospi_closes_kiwoom()
+    if k:
+        return k
+    logger.warning("[KOSPI] 키움 ka20006 실패 — FDR 폴백(1영업일 지연 가능)")
+    return get_kospi_closes()
 
 
 async def phase_reconcile() -> None:
@@ -324,7 +338,7 @@ def _sector_map() -> dict[str, str]:
 async def phase_screen() -> list[dict]:
     logger.info("=" * 56); logger.info("[SCREEN] %s  모드=%s", datetime.now().strftime("%H:%M:%S"), UNIVERSE_MODE)
     log_event("phase_start", {"phase": "screen", "mode": UNIVERSE_MODE})
-    kospi = get_kospi_closes()
+    kospi = await _kospi_closes()
     universe = get_universe()
     held = {p["symbol"] for p in get_state("positions", [])}
     cands: list[dict] = []
@@ -992,7 +1006,7 @@ async def write_daily_journal() -> None:
     exits = [r for r in todays if r.get("type") == "exit"]
     partials = [r for r in todays if r.get("type") == "partial"]
 
-    k = get_kospi_closes()
+    k = await _kospi_closes()
     kline = (f"{k[-2]:,.1f} → {k[-1]:,.1f} ({(k[-1]-k[-2]) / k[-2] * 100:+.2f}%)"
              if len(k) >= 2 else "N/A")
 

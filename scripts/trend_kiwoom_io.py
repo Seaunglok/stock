@@ -211,6 +211,32 @@ async def _sector_index_rows() -> list[dict] | None:
         return None
 
 
+async def _kospi_closes_kiwoom(days: int = 150) -> list[float] | None:
+    """KOSPI 종가 시계열 — 키움 ka20006(업종일봉, inds_cd=001). 오래된순 정렬 반환.
+
+    2026-07-22 추가: FDR ^KS11 이 전일 종가를 **다음날 장중에야** 채워 08:50 screen 시점엔
+    항상 1영업일 지연 → 개별종목(pykrx, 전일까지)과 날짜가 어긋나 RS 게이트가 매일 하루 묵은
+    지수로 판정하던 문제. 키움은 당일 봉까지 제공해 정렬이 맞는다.
+    지수값은 ×100 스케일(674795=6747.95) → /100 정규화. 실패 시 None(호출자가 FDR 폴백).
+    """
+    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "sector_daily_chart",
+                           {"sector_code": "001", "limit": days})
+    rows = d.get("inds_dt_pole_qry")
+    if not isinstance(rows, list) or not rows:
+        logger.debug("[KOSPI] ka20006 배열 없음 — FDR 폴백")
+        return None
+    pairs = []
+    for r in rows:
+        dt, px = str(r.get("dt", "")), _num(r, "cur_prc", abs_val=True)
+        if len(dt) == 8 and px > 0:
+            pairs.append((dt, px / 100.0))
+    if len(pairs) < 61:                      # RS(60일) 계산 최소치 미달
+        logger.debug("[KOSPI] ka20006 %d봉 — 부족, FDR 폴백", len(pairs))
+        return None
+    pairs.sort()                             # 최신순 응답 → 오래된순
+    return [c for _, c in pairs]
+
+
 # ─── universe wrapper ──────────────────────────────────────────────────────
 # scripts/trend/market_data.py 가 삭제되면서 데몬용 get_universe (config 자동 주입) 흡수.
 def get_universe() -> list[tuple[str, str]]:

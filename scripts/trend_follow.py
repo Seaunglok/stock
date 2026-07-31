@@ -975,6 +975,14 @@ async def phase_intraday() -> None:
 async def phase_exit() -> None:
     logger.info("=" * 56); logger.info("[EXIT] %s", datetime.now().strftime("%H:%M:%S"))
     log_event("phase_start", {"phase": "exit"})
+    # 장 마감(15:30) 경과 감지 — 이 시각 이후 매도는 전량 거부(rc=20 505217 장종료)된다.
+    # 스케줄 드리프트는 위 데몬 루프에서 고쳤지만, 데몬 지연 기동·수동 실행 등 잔여 경로 방어.
+    now_m = datetime.now().hour * 60 + datetime.now().minute
+    if now_m >= 15 * 60 + 28 and get_state("positions"):
+        log_event("exit_late", {"time": datetime.now().strftime("%H:%M:%S")})
+        await notify(f"🚨 <b>청산 phase 지연</b> — {datetime.now().strftime('%H:%M')} 실행 "
+                     f"(장 마감 15:30 임박/경과)\n매도 주문이 거부될 수 있습니다. "
+                     f"청산 신호 발생 시 HTS 수동매도 검토.", critical=True)
     # 장중 끝까지 반등 못한 보류 후보 → 그날 진입 스킵
     pend = get_state("pending_entries", [])
     if pend:
@@ -1193,12 +1201,19 @@ async def scheduler_daemon() -> None:
             await asyncio.sleep(1800); continue
         items = sorted([(_next_run(h, m), p) for h, m, p in SCHEDULE], key=lambda x: x[0])
         nxt, phase = items[0]
-        wait = (nxt - now).total_seconds()
-        logger.info("[DAEMON] 다음: %s @ %s (%.0f분)", phase, nxt.strftime("%m/%d %H:%M"), wait / 60)
-        while wait > 0:
+        logger.info("[DAEMON] 다음: %s @ %s (%.0f분)", phase, nxt.strftime("%m/%d %H:%M"),
+                    (nxt - now).total_seconds() / 60)
+        # 대기는 **절대시각 기준 재계산**. 과거엔 sleep 시간만 wait 에서 차감해 phase_intraday()
+        # 실행시간이 누적 드리프트로 쌓였다(10분 폴링 × 수십 회 → exit 이 15:20→15:36 로 밀림).
+        # 2026-07-30·31 매도 거부(장종료 505217) 5건의 근본 원인 — 15:30 마감 후 주문 시도.
+        while True:
+            now2 = datetime.now()
+            wait = (nxt - now2).total_seconds()
+            if wait <= 0:
+                break
             active = bool(get_state("positions") or get_state("pending_entries"))
-            cap = INTRADAY_POLL_MIN * 60 if (active and _is_market_hours(datetime.now())) else 1800
-            await asyncio.sleep(min(wait, cap)); wait -= min(wait, cap)
+            cap = INTRADAY_POLL_MIN * 60 if (active and _is_market_hours(now2)) else 1800
+            await asyncio.sleep(min(wait, cap))
             if (get_state("positions") or get_state("pending_entries")) and _is_market_hours(datetime.now()) and datetime.now() < nxt:
                 try:
                     await phase_intraday()

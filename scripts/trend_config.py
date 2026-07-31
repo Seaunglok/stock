@@ -165,4 +165,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
                     handlers=[logging.StreamHandler(sys.stdout), _fh])
 logger = logging.getLogger("trend")
 
-SCHEDULE = [(8, 50, "screen"), (9, 30, "entry"), (15, 20, "exit")]
+# 진입 시각(HH:MM). 2026-08 09:30→11:00: 09~10시는 갭·시초 물량으로 일중 변동성이 가장 커
+# 슬리피지·휩소가 크다. 오전 변동성이 가라앉은 뒤 진입해 체결 품질을 높인다.
+# ※ 백테스트는 '신호일 익일 **시가**' 진입으로 검증됨 — 일봉 데이터엔 장중 시각 가격이 없어
+#   11시 진입은 백테스트 재현 불가(미검증 변경). 논리적 근거만 있는 상태이므로 journal 로 추적.
+# 보류(하락중) 후보 재시도 마감은 TREND_ENTRY_CUTOFF(14:00) — 진입시각보다 뒤여야 의미가 있다.
+ENTRY_TIME = os.getenv("TREND_ENTRY_TIME", "11:00")
+
+
+def _hhmm(s: str, default: tuple[int, int]) -> tuple[int, int]:
+    try:
+        h, m = (int(x) for x in s.split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except Exception:
+        pass
+    logger.warning("[CONFIG] 시각 파싱 실패 '%s' → 기본 %02d:%02d", s, *default)
+    return default
+
+
+_ENTRY_H, _ENTRY_M = _hhmm(ENTRY_TIME, (11, 0))
+SCHEDULE = [(8, 50, "screen"), (_ENTRY_H, _ENTRY_M, "entry"), (15, 20, "exit")]
+# 정합성: 보류(하락중) 재시도 마감이 진입시각보다 이르면 보류분이 즉시 스킵돼 무의미해진다.
+_CUT_H, _CUT_M = _hhmm(ENTRY_CUTOFF, (14, 0))
+if (_CUT_H, _CUT_M) <= (_ENTRY_H, _ENTRY_M):
+    logger.warning("[CONFIG] ⚠️ TREND_ENTRY_CUTOFF(%s) ≤ TREND_ENTRY_TIME(%s) — 하락보류 후보가 "
+                   "즉시 스킵됩니다. 컷오프를 진입시각보다 뒤로 설정하세요.", ENTRY_CUTOFF, ENTRY_TIME)

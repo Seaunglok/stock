@@ -1193,8 +1193,8 @@ async def scheduler_daemon() -> None:
                          critical=True)
     else:
         logger.info("[DAEMON] 🧪 MOCK MODE — 모의투자 API. KIWOOM_PRODUCTION_MODE=true 로 실전 전환.")
-    logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/09:30 진입/장중 트레일/15:20 청산",
-                UNIVERSE_MODE)
+    logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/%s 진입(보류마감 %s)/장중 트레일/15:20 청산",
+                UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF)
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
     _write_heartbeat()

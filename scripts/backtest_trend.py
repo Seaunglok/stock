@@ -63,6 +63,7 @@ V_BREADTH_MIN_PCT: float | None = None    # 시장 breadth 게이트: 일별 uni
 # 외인 청산룰(ka10008 완성일 5일합 < 0 이면 종가 청산): None=off / 0=부호만 / >0 = |합|≥ratio×20일평균거래량 일 때만 유효
 V_FOREIGN_MIN_RATIO: float | None = None
 V_FOREIGN_MAP: dict = {}                  # code → (sorted_dates["YYYY-MM-DD"], {date: chg_qty}) — ka10008 이력
+V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
 
 
 def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -> bool:
@@ -70,6 +71,7 @@ def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -
 
     당일(bar) 잠정치 제외 = bar 날짜 **이전** 완성일 5개 합산. V_FOREIGN_MIN_RATIO>0 이면
     |합| ≥ ratio×20일 평균거래량 일 때만 유효 신호. 데이터<5일 이면 미적용(fail-open).
+    V_FOREIGN_TREND_MA>0 이면 **추세 확인**: 종가 < MA(N) 일 때만 청산(라이브 ma_trend 대응).
     """
     if V_FOREIGN_MIN_RATIO is None or not code or code not in V_FOREIGN_MAP:
         return False
@@ -92,6 +94,10 @@ def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -
         avg_vol = sum(vols) / len(vols) if vols else 0.0
         if avg_vol > 0 and abs(net) < V_FOREIGN_MIN_RATIO * avg_vol:
             return False                 # 노이즈 — 신호 아님
+    if V_FOREIGN_TREND_MA:               # 추세 확인 — MA(N) 위면 수급만으로 청산하지 않음
+        ma = moving_average([b["close"] for b in full[:j + 1]], V_FOREIGN_TREND_MA)
+        if ma is None or bar["close"] >= ma:
+            return False
     return True
 
 
@@ -520,7 +526,7 @@ def report_pyramid_regime(mode: str, start: str, end: str, watch: list[str], cos
         nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
         m = metrics(nets)
         if not m.get("n"):
-            print(f"  {vlabel:30} 진입 0건"); continue
+            print(f"  {vlabel:36} 진입 0건"); continue
         po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
         pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
         print(f"  {vlabel:30} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
@@ -588,7 +594,7 @@ def report_foreignexit(mode: str, start: str, end: str, watch: list[str], costs:
     동기: 2026-07-15 삼성생명 오발동(노이즈 부호 + 당일 잠정치). ka10008 이력이 ~50완성일이라
     백테스트 창을 그 커버리지(약 2026-05 이후)로 제한 — 표본 적음(지시적 검증), 07-13 폭락 포함.
     """
-    global V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP, V_EXIT_MA, V_HARD_STOP_PCT
+    global V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP, V_EXIT_MA, V_HARD_STOP_PCT, V_FOREIGN_TREND_MA
     V_EXIT_MA, V_HARD_STOP_PCT = 120, 10.0        # 라이브 미러(.env EXIT_MA=120·HARD_STOP=10)
     key = (mode, tuple(watch), start, end, cfg_top)
     if key not in _UNIV_CACHE:
@@ -598,21 +604,24 @@ def report_foreignexit(mode: str, start: str, end: str, watch: list[str], costs:
     cover = [d for ds, _ in V_FOREIGN_MAP.values() for d in ds[:1]]
     print(f"  외인 데이터: {len(V_FOREIGN_MAP)}종목, 최고령 완성일 {min(cover) if cover else 'N/A'}"
           f" — 진입창 {start}~{end} 는 이 커버리지 내여야 유효")
-    variants = [("기준: 외인룰 off", None), ("부호만(구 룰, 잠정치만 제거)", 0.0),
-                ("임계 0.2×avg20vol (라이브 채택안)", 0.2), ("임계 0.5×avg20vol", 0.5)]
+    # (label, min_ratio, trend_ma) — trend_ma>0 이면 종가<MA(N) 일 때만 외인청산(추세 확인)
+    variants = [("기준: 외인룰 off", None, 0), ("부호만(구 룰, 잠정치만 제거)", 0.0, 0),
+                ("임계 0.2×avg20vol", 0.2, 0), ("임계 0.5×avg20vol", 0.5, 0),
+                ("임계 0.2 + MA60 추세확인 (신규채택)", 0.2, 60),
+                ("임계 0.2 + MA20 추세확인", 0.2, 20)]
     print("\n" + "=" * 96)
     print(f"외인 청산룰 A/B — {label} (비용 차감 후, MA120·하드10% 고정, 창={start}~{end})")
     print("=" * 96)
-    print(f"  {'변형':30} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
+    print(f"  {'변형':36} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
     base_nets: list[float] = []
-    for vlabel, ratio in variants:
-        V_FOREIGN_MIN_RATIO = ratio
+    for vlabel, ratio, tma in variants:
+        V_FOREIGN_MIN_RATIO, V_FOREIGN_TREND_MA = ratio, tma
         nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
         if ratio is None:
             base_nets = nets
         m = metrics(nets)
         if not m.get("n"):
-            print(f"  {vlabel:30} 진입 0건"); continue
+            print(f"  {vlabel:36} 진입 0건"); continue
         po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
         pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
         diff = ""
@@ -621,9 +630,9 @@ def report_foreignexit(mode: str, start: str, end: str, watch: list[str], costs:
             deltas = [b - a for a, b in zip(base_nets, nets) if abs(b - a) > 1e-9]
             better = sum(1 for d in deltas if d > 0)
             diff = f"  변경 {len(deltas)}건(개선 {better}) Δ누적 {sum(deltas):+.1f}%p"
-        print(f"  {vlabel:30} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+        print(f"  {vlabel:36} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
               f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+9.1f}%{diff}")
-    V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP = None, {}
+    V_FOREIGN_MIN_RATIO, V_FOREIGN_MAP, V_FOREIGN_TREND_MA = None, {}, 0
     V_EXIT_MA, V_HARD_STOP_PCT = None, 0.0
     print("  ※ 표본 작음(외인 이력 ~50완성일) — 방향성 판단용. 외인룰이 기대값·P10 을 개선 못 하면 off 권장.")
     print("  ※ 부호만 vs 임계: 임계가 노이즈 청산(본전 털림)을 줄여 기준에 근접할수록 룰의 실질 기여는 작다는 뜻.")

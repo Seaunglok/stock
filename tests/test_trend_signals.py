@@ -360,3 +360,40 @@ def test_foreign_signal_insufficient_or_bad_data():
     # 빈/깨진 입력 → None
     assert foreign_net_signal([], "20260715") is None
     assert foreign_net_signal([{"dt": "20260714", "chg_qty": "??"}] * 6, "20260715") is None
+
+
+# ─── 외인 청산 추세 확인 조건 (ma_trend) ─────────────────────────────────────
+
+def _ex(**kw):
+    base = dict(entry=100.0, cur=100.0, qty=10, target=200.0, stop=80.0,
+                partial_done=True, use_foreign=True, foreign_net=-5000.0)
+    base.update(kw)
+    return exit_decision(**base)
+
+
+def test_foreign_exit_blocked_when_trend_intact():
+    # 외인 순매도지만 현재가가 MA60 위 → 추세 유지 → 청산 안 함 (07-31 4종 오청산 방지)
+    act, reason, q = _ex(cur=100.0, ma_trend=95.0)
+    assert act is None and q == 0
+
+
+def test_foreign_exit_fires_when_trend_broken():
+    # 외인 순매도 + MA60 이탈 동시 → 청산
+    act, reason, q = _ex(cur=90.0, ma_trend=95.0)
+    assert act == "EXIT" and "외국인" in reason and "MA60" in reason and q == 10
+
+
+def test_foreign_exit_legacy_without_trend_ma():
+    # ma_trend=None(추세조건 off) → 수급만으로 청산(구 동작 하위호환)
+    act, reason, q = _ex(cur=100.0, ma_trend=None)
+    assert act == "EXIT" and reason == "외국인 5일 순매도 전환"
+
+
+def test_foreign_exit_trend_label_reflected():
+    act, reason, _ = _ex(cur=90.0, ma_trend=95.0, trend_ma_label=20)
+    assert "MA20" in reason
+
+
+def test_foreign_net_positive_never_exits():
+    # 순매수면 추세 무관하게 청산 안 함
+    assert _ex(cur=90.0, ma_trend=95.0, foreign_net=5000.0)[0] is None

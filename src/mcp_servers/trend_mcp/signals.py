@@ -398,6 +398,7 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
                   partial_done: bool, hard_stop_pct: float = 0.0, partial_pct: float = 30.0,
                   ma_exit: float | None = None, exit_ma_label: int = 120,
                   foreign_net: float | None = None, use_foreign: bool = False,
+                  ma_trend: float | None = None, trend_ma_label: int = 60,
                   aged_out: bool = False
                   ) -> tuple[str | None, str, int]:
     """포지션 청산/부분익절 판정 → (action, reason, sell_qty). action ∈ {None, PARTIAL, EXIT}.
@@ -407,6 +408,13 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
     부분익절 수량이 1주 미만(qty 소량)이면 쪼갤 수 없으므로 익절 없이 트레일 지속(우측꼬리 유지) —
     qty 전량이 나가면 qty=0 좀비 포지션이 되기 때문.
     aged_out: 백테스트 max_hold(60영업일 강제 마감)와 동일 의미의 시간청산.
+
+    ma_trend (2026-07-31 추가): 외인 청산의 **추세 확인 조건**(보통 MA60). 넘기면 외인 순매도
+    **AND** 현재가 < MA60 일 때만 청산 — 추세가 살아있는데 수급만으로 파는 것을 막는다.
+    배경: 07-31 KOSPI +17.9% 반등일에 4종(KT&G·GS·KB금융·하나금융) 동시 외인청산 신호가 났는데
+    전부 MA120 위·손절 위 정상 추세였다. 외인 5일 누적은 직전 폭락기를 포함해 반등 초입에도
+    음수라 '늦은 신호'가 된다. None 이면 추세조건 없이 기존 동작(하위호환).
+    ※ MA120(ma_exit)은 이미 단독 청산이라 AND 조건으로 쓰면 외인룰이 영구 미발동 → MA60 을 쓴다.
     """
     pnl = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
     if hard_stop_pct > 0 and pnl <= -hard_stop_pct:
@@ -420,7 +428,12 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
     if ma_exit is not None and cur < ma_exit:
         return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})", qty
     if use_foreign and foreign_net is not None and foreign_net < 0:
-        return "EXIT", "외국인 5일 순매도 전환", qty
+        if ma_trend is None:                      # 추세조건 off — 수급만으로 청산(구 동작)
+            return "EXIT", "외국인 5일 순매도 전환", qty
+        if cur < ma_trend:                        # 수급 이탈 + 추세(MA60) 이탈 동시
+            return "EXIT", (f"외국인 5일 순매도 전환 + MA{trend_ma_label} 이탈 "
+                            f"({cur:,.0f} < {ma_trend:,.0f})"), qty
+        # 외인 순매도지만 추세 유지(MA60 위) → 보유 (트레일/MA120 에 위임)
     if aged_out:
         return "EXIT", f"보유기간 만료 ({pnl:+.2f}%) — 시간청산", qty
     return None, "", 0

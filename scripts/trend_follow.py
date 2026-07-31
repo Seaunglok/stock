@@ -887,18 +887,28 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
                 pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
                 # 이평선/외인/보유만기 청산 신호는 15:20 청산 phase(do_exit_signals)에서만 평가
-                ma_exit, foreign, aged = None, None, False
+                ma_exit, foreign, aged, ma_trend = None, None, False, None
                 if do_exit_signals:
-                    ohlcv = get_ohlcv(sym, EXIT_MA + 40)
-                    ma_exit = moving_average([b["close"] for b in ohlcv] + [cur], EXIT_MA) if ohlcv else None
+                    ohlcv = get_ohlcv(sym, max(EXIT_MA, FOREIGN_TREND_MA) + 40)
+                    closes_cur = [b["close"] for b in ohlcv] + [cur] if ohlcv else []
+                    ma_exit = moving_average(closes_cur, EXIT_MA) if ohlcv else None
                     foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
+                    # 외인 청산 추세 확인선(MA60) — 수급만으로 정상추세 종목을 파는 것 방지.
+                    # 조건 ON 인데 MA 를 못 구하면 판정 불가 → 외인룰 자체를 스킵(fail-open 일관성).
+                    if USE_FOREIGN_EXIT and FOREIGN_TREND_MA > 0:
+                        ma_trend = moving_average(closes_cur, FOREIGN_TREND_MA) if ohlcv else None
+                        if ma_trend is None and foreign is not None:
+                            logger.info("[FOREIGN] %s MA%d 산출 불가 — 추세확인 불가로 외인룰 스킵",
+                                        sym, FOREIGN_TREND_MA)
+                            foreign = None
                     # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지
                     aged = MAX_HOLD_DAYS > 0 and _busdays_since(pos.get("buy_date")) >= MAX_HOLD_DAYS
                 action, reason, sell_qty = exit_decision(
                     entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
                     partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
                     partial_pct=CFG.partial_pct, ma_exit=ma_exit, exit_ma_label=EXIT_MA,
-                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT, aged_out=aged)
+                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT,
+                    ma_trend=ma_trend, trend_ma_label=FOREIGN_TREND_MA, aged_out=aged)
                 if not action:
                     remaining.append(pos); continue
                 # 매도 시도(클라이언트 단의 8005 자동복구 1회 포함). 실패 시 1회 추가 재시도.

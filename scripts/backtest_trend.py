@@ -64,6 +64,10 @@ V_BREADTH_MIN_PCT: float | None = None    # 시장 breadth 게이트: 일별 uni
 V_FOREIGN_MIN_RATIO: float | None = None
 V_FOREIGN_MAP: dict = {}                  # code → (sorted_dates["YYYY-MM-DD"], {date: chg_qty}) — ka10008 이력
 V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
+# 시장 레짐/변동성 필터(2026-08-03): 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장)과
+# 실전구간(5.71%·-20.5% 하락장)의 레짐 불일치가 주원인. 하락장·고변동성 신규진입을 원천 차단.
+V_REGIME_MA: int | None = None            # KOSPI < MA(N) 이면 그날 신규진입 차단(None=off)
+V_VOL_MAX_PCT: float | None = None        # 최근 20일 KOSPI 일간변동성(표준편차%) > 이 값이면 차단(None=off)
 
 
 def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -> bool:
@@ -249,6 +253,18 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             continue
         date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
         kospi_upto = kospi_close[:i_day + 1]
+
+        # ── 시장 레짐 필터 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 차단(추세추종 대가 표준: Weinstein/O'Neil 'M')
+        if V_REGIME_MA:
+            kma = moving_average(kospi_upto, V_REGIME_MA)
+            if kma is None or kospi_upto[-1] < kma:
+                continue
+        # ── 변동성 필터 — 최근 20일 KOSPI 일간변동성이 임계 초과면 진입 금지("너무 거친 장엔 안 논다")
+        if V_VOL_MAX_PCT:
+            w = kospi_upto[-21:]
+            rets = [(w[i] - w[i - 1]) / w[i - 1] * 100 for i in range(1, len(w)) if w[i - 1] > 0]
+            if rets and (sum(r * r for r in rets) / len(rets)) ** 0.5 > V_VOL_MAX_PCT:
+                continue
 
         # 후보 종목 모으기
         day_rows = []
@@ -638,6 +654,44 @@ def report_foreignexit(mode: str, start: str, end: str, watch: list[str], costs:
     print("  ※ 부호만 vs 임계: 임계가 노이즈 청산(본전 털림)을 줄여 기준에 근접할수록 룰의 실질 기여는 작다는 뜻.")
 
 
+def report_regime(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
+    """시장 레짐/변동성 필터 A/B — 하락장·고변동성 신규진입 차단 효과.
+
+    동기: 실전(2026-07~08) 6전6패. 진단 결과 검증구간(일간변동성 2.16%·상승 +136%)과
+    실전구간(5.71%·하락 -20.5%)의 레짐 불일치가 주원인 — 이 전략엔 시장필터가 없다(설계 선택).
+    라이브 미러(MA120 청산·하드손절 10%·breadth 0.4)에서 필터만 켜고 비교한다.
+    """
+    global V_REGIME_MA, V_VOL_MAX_PCT, V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT
+    V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT = 120, 10.0, 0.40   # 라이브 미러
+    variants = [
+        ("기준(필터 off, 현행)",        None, None),
+        ("① 레짐 KOSPI>MA60",          60,   None),
+        ("① 레짐 KOSPI>MA120",         120,  None),
+        ("② 변동성 ≤4%",               None, 4.0),
+        ("② 변동성 ≤3%",               None, 3.0),
+        ("①+② MA120 & 변동성≤4%",      120,  4.0),
+        ("①+② MA60 & 변동성≤3%",       60,   3.0),
+    ]
+    print("\n" + "=" * 100)
+    print(f"시장 레짐/변동성 필터 A/B — {label} (비용 차감 후, 라이브 미러: MA120·하드10%·breadth0.4)")
+    print("=" * 100)
+    print(f"  {'변형':26} {'진입':>5} {'승률':>6} {'기대값':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'누적':>10}")
+    for vlabel, rma, vmax in variants:
+        V_REGIME_MA, V_VOL_MAX_PCT = rma, vmax
+        nets = [n for _, n in run(mode, start, end, watch, costs, cfg)]
+        m = metrics(nets)
+        if not m.get("n"):
+            print(f"  {vlabel:26} 진입 0건 (필터가 전 구간 차단)"); continue
+        po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+        pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+        print(f"  {vlabel:26} {m['n']:>5} {m['win']:>5.1f}% {m['avg']:>+7.2f}% "
+              f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['total']:>+9.1f}%")
+    V_REGIME_MA, V_VOL_MAX_PCT = None, None
+    V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT = None, 0.0, None
+    print("  ※ 필터는 진입 수를 줄인다 — 기대값·PF·P10(꼬리손실)이 개선되면 채택 가치.")
+    print("  ※ 누적↓ 라도 기대값·P10 개선이면 '덜 벌지만 덜 잃는' 트레이드오프 — 하락장 방어 목적에 부합.")
+
+
 def report_hardstop(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """하드손절 임계값 A/B — off / 5% / 7% / 10% / 15% 비교.
 
@@ -812,6 +866,7 @@ def main():
     p.add_argument("--pullbacktest", action="store_true", help="눌림목 게이트 폭 A/B(pullback_pct 3/5/8/12/20/off)")
     p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
     p.add_argument("--foreignexit", action="store_true", help="외인 청산룰 A/B(off/부호만/임계 0.2·0.5) — investor-domain 필요")
+    p.add_argument("--regimetest", action="store_true", help="시장 레짐/변동성 필터 A/B(KOSPI>MA · 변동성 상한)")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
@@ -841,6 +896,8 @@ def main():
         report_hardstop(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.foreignexit:
         report_foreignexit(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.regimetest:
+        report_regime(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

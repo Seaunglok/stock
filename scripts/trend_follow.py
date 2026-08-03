@@ -654,6 +654,21 @@ async def phase_entry() -> None:
     if not cands or slots <= 0:
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
         return
+    # 시장 레짐 게이트 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 전면 차단(보유분 관리는 계속).
+    # breadth 게이트가 '당일 상승종목 비율'만 보는 것과 달리 **지수 추세**를 본다(상호보완).
+    # 2026-08-03 도입: 실전 진입 11건 중 10건이 KOSPI<MA60 일 발생 → 실현손실 -33.3%p 회피 추정.
+    if REGIME_MA > 0:
+        kospi = await _kospi_closes()
+        kma = moving_average(kospi, REGIME_MA) if kospi else None
+        if kma is None:
+            logger.warning("[REGIME] KOSPI MA%d 산출 불가 — 레짐 게이트 미적용(fail-open)", REGIME_MA)
+        elif kospi[-1] < kma:
+            log_event("regime_block", {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
+                                       "ma_n": REGIME_MA, "candidates": len(cands)})
+            _mark_done("entry")
+            await notify(f"🚫 시장 레짐 게이트 — 신규 진입 차단 (KOSPI {kospi[-1]:,.0f} < MA{REGIME_MA} {kma:,.0f})\n"
+                         f"하락장 신규진입 중단 · 후보 {len(cands)}종 스킵 (보유분 청산규칙은 정상 작동)")
+            return
     broken, why = await _circuit_broken()
     if broken:
         log_event("circuit_break", {"phase": "entry", "reason": why})

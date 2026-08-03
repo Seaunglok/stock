@@ -88,6 +88,12 @@ FOREIGN_MIN_RATIO = float(os.getenv("TREND_FOREIGN_MIN_RATIO", "0.2") or 0)
 # 직전 폭락기 포함이라 반등 초입에도 음수 = 늦은 신호). 추세 확인으로 수급 단독 청산 차단.
 # ※ MA120 은 이미 단독 청산조건이라 AND 로 쓰면 외인룰 영구 미발동 → MA60 사용.
 FOREIGN_TREND_MA = int(os.getenv("TREND_FOREIGN_TREND_MA", "60") or 0)
+# 시장 레짐 필터(2026-08-03): KOSPI 가 자기 MA(N) 아래면 하락장 → 그날 신규진입 전면 차단. 0=off.
+# 근거: 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장) vs 실전구간(5.71%·-20.5% 하락장)
+# 레짐 불일치가 주원인. 이 전략은 원래 '시장필터 없음'이 설계 선택이었으나 하락장 방어가 부재했다.
+# 실전 진입 11건 중 10건이 KOSPI<MA60 일에 발생(차단 시 실현손실 -33.3%p 회피). 추세추종 대가 표준
+# (Weinstein Stage·O'Neil 'M'). ※breadth 게이트는 '당일 상승종목 비율'이라 지수 추세를 못 본다 — 상호보완.
+REGIME_MA = int(os.getenv("TREND_REGIME_MA", "60") or 0)
 NEWS_VETO = os.getenv("TREND_NEWS_VETO", "true").lower() == "true"
 INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
 # 프리장(장전 동시호가) 갭다운 소프트veto: >0 이면 예상체결가가 기준가 대비 그 %p 초과 하락 시 후보 제외. 기본 0=off(표시만).

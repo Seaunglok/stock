@@ -1018,6 +1018,13 @@ async def phase_exit() -> None:
     await phase_reconcile()   # 신규 계좌 보유분 편입 후 청산판단
     await _manage(do_exit_signals=True, when="exit")
     await write_daily_journal()   # 마감 후 그날 매매일지 자동 작성
+    # 분봉 축적(진입 시각 09:30 vs 11:00 검증용 — 일봉 백테스트로는 불가). ka10080 은 ~12영업일치만
+    # 주므로 매일 받아야 유실이 없다. 청산·일지에 영향 없도록 완전 격리(실패해도 무시).
+    try:
+        from collect_minute_bars import collect, _targets
+        await collect(_targets())
+    except Exception as e:
+        logger.warning("[MINUTE] 분봉 수집 실패(무시): %s", str(e)[:120])
 
 
 async def write_daily_journal() -> None:

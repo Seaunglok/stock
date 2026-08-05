@@ -42,19 +42,29 @@
 비교: closing-bet `atr2_h3` OOS 기대값 +1.15%(동일 구간 0거래) / 진입규칙 고정(파라미터 피팅 없음 → 과최적화 낮음).
 블로그 철학 "승률 낮아도 손익비만 맞추면 수익" 확인. 동일 구간 closing-bet 0거래 → **검증불가 문제 해소**.
 
-## 라이브 (MOCK 우선) — `scripts/trend_follow.py`
+## 라이브 (**실거래 운영 중**, 2026-06-29 전환) — `scripts/trend_follow.py`
 `direct_closing_bet.py` 구조 미러. MCP 서버만 떠 있으면 동작. **별도 트랙**.
+실거래 계좌 64044475 · `KIWOOM_PRODUCTION_MODE=true`. 전환 절차 [live_trading_switchover.md](live_trading_switchover.md),
+첫 달 성적/진단 [2026-08-03-live-first-month-review.md](2026-08-03-live-first-month-review.md).
 
 **스케줄** (영업일):
 | 시각 | phase | 동작 |
 |------|-------|------|
 | 08:50 | `screen` | 모드별 유니버스 스캔(완성봉) → entry_signal 게이트·점수 → 후보. 프리장 예상가·JH ZONE·실적 YoY 가점 표시 |
-| 09:30 | `entry` | 동일비중 매수(최대 `TREND_MAX_POS`=5). 주도섹터 가점 재정렬. **하락 중 후보 보류→장중 반등 시 진입(10:30 컷오프 후 스킵)**. return_code 게이트(유령 방지) |
-| (장중) | `intraday` | `TREND_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 + 하드손절(`TREND_HARD_STOP_PCT`, 기본off) + 보류분 반등 점검 |
-| 15:20 | `exit` | 계좌 보유분 편입(reconcile) → **MA120 이탈**(`TREND_EXIT_MA`) / 외인 5일 순매도전환 / 트레일 이탈 청산 |
+| **11:00** (`TREND_ENTRY_TIME`) | `entry` | 리스크 균등 사이징 매수(최대 `TREND_MAX_POS`=5). **시장 레짐 게이트**(KOSPI<MA60 차단) → 서킷 → breadth → 주도섹터 가점 재정렬. **하락 중 후보 보류→장중 반등 시 진입(`TREND_ENTRY_CUTOFF` 14:00 후 스킵)**. return_code 게이트(유령 방지) |
+| (장중) | `intraday` | `TREND_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 + 하드손절(`TREND_HARD_STOP_PCT`=10) + 보류분 반등 점검 |
+| 15:20 | `exit` | 계좌 보유분 편입(reconcile) → **MA120 이탈**(`TREND_EXIT_MA`) / 외인 5일 순매도전환(규모임계+MA60 추세확인) / 트레일 이탈 / 시간청산(`TREND_MAX_HOLD`=60영업일) → 매매일지 → 분봉 수집 → 그림자 원장 갱신 |
 
-**안전장치**: 주문 `return_code` 검증 + `[REJECT]` 로깅, 단일 인스턴스 락(`data/trend_follow/daemon.lock`),
-물타기 금지(1종목 1진입), 텔레그램 HTML 안전화, exit_ledger net 손익, 자정 회전 로그(`logs/trend_follow/`, 30일), `events.jsonl`.
+> 진입 시각은 2026-08 에 09:30 → **11:00** 으로 변경(09~10시 최대 변동성 회피).
+> 일봉 백테스트로는 검증 불가 → [collect_minute_bars.py](../scripts/collect_minute_bars.py) 로 5분봉을 축적해 사후 검증 중.
+
+**안전장치**: 주문 `return_code` 검증 + `[REJECT]` 로깅, 체결 즉시 state 영속화, 단일 인스턴스 락(`data/trend_follow/daemon.lock`),
+물타기 금지(1종목 1진입), 매수 후 `_verify_buy_fills` broker 대조, 매도 거부 시 재시도+critical 알림,
+LIVE-GUARD 과대사이징 감지, 텔레그램 HTML 안전화, exit_ledger net 손익, 자정 회전 로그(`logs/trend_follow/`, 30일), `events.jsonl`.
+긴급정지 `python scripts/trend_panic.py --full`.
+
+**그림자 원장** — 게이트가 **차단한 후보**의 사후 성과를 추적해 게이트 가치를 판정한다.
+차단만 하고 결과를 안 보면 임계값을 영영 못 고친다. 상세 [shadow_ledger.md](shadow_ledger.md).
 
 **매매일지** (`data/trend_follow/journal.jsonl`, append-only):
 - 자동(진입/부분/청산): 일시·종목·모드·진입가/손절/목표·청산가·수량·**손익률·net·손익비·청산사유·진입근거(게이트)·보유일수**.
@@ -79,36 +89,65 @@
    (`/RI 5 /DU 07:15` = 08:40~15:55 5분 반복. `/ET`는 `/SC DAILY`에서 종료*일*로 오인되니 `/DU` 사용.)
    로그 `logs/trend_follow/watchdog.log`(이상 시에만 기록)·`daemon_stdout.log`.
 
-**실거래 전환 전 권장 .env**(MOCK 에서도 동작): `TREND_HARD_STOP_PCT=7`(트레일 무관 즉시 손절 백스톱),
-`TREND_DAILY_LOSS_LIMIT_PCT=2`(당일 실현손실>예탁 2% 시 신규진입 중단). 첫 실전은 사이징·종목수 축소
-(예: `TREND_POSITION_PCT=2~3`·`TREND_MAX_POS=3~5`)로 실체결 경로(return_code/슬리피지/reconcile) 검증 후 확대.
+**실거래 전환 완료(2026-06-29)** — 현행 방어 설정: `TREND_HARD_STOP_PCT=10`(트레일 무관 즉시 손절 백스톱),
+`TREND_DAILY_LOSS_LIMIT_PCT=2`(당일 실현손실>예탁 2% 시 신규진입 중단), `TREND_REGIME_MA=60`(하락장 신규진입 차단),
+`TREND_MAX_POS=5`, `TREND_ADOPT_MODE=off`(HTS 수동매수분이 trend 청산룰로 처분되는 것 방지).
+데몬 기동 시 과대 사이징 감지하면 `[LIVE-GUARD]` 경고 + 텔레그램 알림.
 
-## 파라미터 (env, 기본값)
+## 파라미터 (env)
+
+> **★ = 현재 실거래 `.env` 값** (코드 기본값과 다른 것). 나머지는 코드 기본값.
+
 ```bash
-TREND_UNIVERSE=watchlist            # watchlist(기본) | largecap | gainers(v2)
-TREND_WATCHLIST=005930,000660       # watchlist 모드 종목 (삼성전자·SK하이닉스)
-TREND_TOP_N=100                     # largecap 시총상위 / gainers 등락률상위(30)
-TREND_MIN_VALUE_KRW=1e11            # 거래대금 floor 1,000억 (잡주/저유동 배제)
-TREND_MAX_POS=10                    # 최대 동시 보유(편입분 포함). .env 영속
-TREND_SIZING_MODE=pct_equity        # pct_equity(예탁자산 %) | fixed(고정금액)
-TREND_POSITION_PCT=8                 # 종목당 예탁자산의 8% (현금 한도 내). 10종목 ≈ 80% 투입·20% 버퍼
-TREND_INVEST_PER_TRADE=500000       # fixed 모드 또는 예탁자산 조회 실패 시 폴백
-TREND_EXIT_MA=120                   # 청산 이평선(A/B 검증 채택). MA50→MA120
-TREND_ENTRY_WAIT_FALLING=true TREND_ENTRY_CUTOFF=10:30  # 하락 보류→반등 진입, 마감시각
-TREND_HARD_STOP_PCT=0               # 하드손절 %(0=off, ATR 트레일 우월)
-TREND_DAILY_LOSS_LIMIT_PCT=0        # 일일 최대손실 서킷브레이커: 당일 실현손실>예탁자산 X% 시 신규진입 중단(0=off)
-TREND_PYRAMID_ADDS=0                # 피라미딩 종목당 최대 추가유닛(0=off). 진입+k×R 도달 시 1유닛 추가
-TREND_PYRAMID_STEP_R=1.0           # 추가 트리거 간격(R배수)  TREND_PYRAMID_LOOKBACK=20  # equity게이트 청산표본
-TREND_PYRAMID_MIN_NET=0            # equity게이트: 최근 LOOKBACK 청산 net 평균>이 값 일 때만 불타기(검증 채택)
-TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_PULLBACK_PCT=3 TREND_RS_DAYS=60
-TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
+# ── 유니버스 ────────────────────────────────────────────────────────
+TREND_UNIVERSE=largecap          # ★ watchlist | largecap(현행) | gainers(v2 보류)
+TREND_WATCHLIST=005930,000660    # watchlist 모드 종목 (삼성전자·SK하이닉스)
+TREND_TOP_N=100                  # largecap 시총상위 / gainers 등락률상위(30)
+TREND_MIN_VALUE_KRW=1e11         # 거래대금 floor 1,000억 (잡주/저유동 배제)
+
+# ── 사이징 (2026-07-13 포트폴리오 A/B 로 risk 채택) ──────────────────
+TREND_SIZING_MODE=risk           # ★ risk(현행) | pct_equity | fixed
+TREND_RISK_PCT=1.5               # ★ risk 모드: 예탁 1.5% ÷ 손절폭 = 거래별 리스크 균등(터틀식)
+TREND_MAX_NOTIONAL_PCT=25        # ★ risk 모드 notional 상한 (1종목 과대비중 방지)
+TREND_POSITION_PCT=15            # ★ pct_equity 폴백값(손절폭 무효/조회실패 시)
+TREND_INVEST_PER_TRADE=500000    # fixed 모드 또는 예탁자산 조회 실패 시 최종 폴백
+TREND_MAX_POS=5                  # ★ 최대 동시 보유(편입분 포함)
+
+# ── 진입 시각/게이트 ────────────────────────────────────────────────
+TREND_ENTRY_TIME=11:00           # ★ 진입 시각(09:30→11:00, 2026-08). SCHEDULE 이 이 값으로 구성됨
+TREND_ENTRY_CUTOFF=14:00         # ★ 하락보류 후보 재시도 마감(진입시각보다 뒤여야 의미 있음)
+TREND_ENTRY_WAIT_FALLING=true    # 하락 중 후보는 보류 → 장중 반등 시 진입
+TREND_REGIME_MA=60               # ★ 시장 레짐 게이트: KOSPI<MA60 이면 신규진입 전면 차단(0=off)
+TREND_BREADTH_MIN_PCT=0.4        # ★ 당일 상승종목 비율 하한(미달 시 보류, 장중 회복 재확인)
+TREND_PULLBACK_PCT=12            # ★ 눌림 게이트 폭(A/B 검증 채택, 코드 기본 3)
+TREND_DAILY_LOSS_LIMIT_PCT=2     # ★ 일일 손실 서킷: 당일 실현손실>예탁 2% 시 신규진입 중단(0=off)
+
+# ── 청산 ───────────────────────────────────────────────────────────
+TREND_EXIT_MA=120                # 청산 이평선(A/B 검증 채택). MA50→MA120
+TREND_HARD_STOP_PCT=10           # ★ 하드손절 %(트레일 무관 즉시 손절 백스톱, 0=off)
+TREND_MAX_HOLD=60                # 시간청산(영업일). 백테스트 max_hold 와 정합
+TREND_USE_FOREIGN_EXIT=true      # 외인 5일 순매도 전환 청산
+TREND_FOREIGN_MIN_RATIO=0.2      # ★ 외인 규모 임계(0.2×avg20vol 미만은 노이즈로 무시)
+TREND_FOREIGN_TREND_MA=60        # ★ 추세 확인: 외인 순매도 AND 현재가<MA60 일 때만 청산(0=수급만)
 TREND_STOP_PCT=7 TREND_ATR_K=2.0 TREND_RR=3 TREND_PARTIAL_PCT=30
-TREND_USE_FOREIGN_EXIT=true TREND_NEWS_VETO=true   # 라이브. MOCK_MODE 공유.
-TREND_FUND_BONUS=5                  # 실적 가점: 매출·영업이익 YoY 동반↑ +5점(영업이익만 +2.5) — 순위만, 0=off
-TREND_SECTOR_BONUS=5                # 주도섹터 가점: 집단상승 섹터 소속 후보 +5점 — 0=off
-TREND_SECTOR_GATE=false             # true 면 주도섹터 소속 후보만 진입(하드 게이트) — 기본 가점만
+
+# ── 계좌 편입 / 피라미딩 ────────────────────────────────────────────
+TREND_ADOPT_MODE=off             # ★ 계좌 보유분 편입: all | watchlist | off(실전 권장)
+TREND_PYRAMID_ADDS=0             # 피라미딩 종목당 최대 추가유닛(0=off). 진입+k×R 도달 시 1유닛 추가
+TREND_PYRAMID_STEP_R=1.0         # 추가 트리거 간격(R배수)  TREND_PYRAMID_LOOKBACK=20  # equity게이트 청산표본
+TREND_PYRAMID_MIN_NET=0          # equity게이트: 최근 LOOKBACK 청산 net 평균>이 값 일 때만 불타기(검증 채택)
+
+# ── 지표 / 가점 ────────────────────────────────────────────────────
+TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_RS_DAYS=60
+TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
+TREND_FUND_BONUS=5               # 실적 가점: 매출·영업이익 YoY 동반↑ +5점(영업이익만 +2.5) — 순위만, 0=off
+TREND_SECTOR_BONUS=5             # 주도섹터 가점: 집단상승 섹터 소속 후보 +5점 — 0=off
+TREND_SECTOR_GATE=false          # true 면 주도섹터 소속 후보만 진입(하드 게이트) — 기본 가점만
 TREND_SECTOR_MIN_AVG=1.0 TREND_SECTOR_BREADTH=0.6 TREND_SECTOR_TOP_K=3  # 주도 판정: 평균등락/상승비율/상위K
 ```
+
+> `MOCK_MODE` env 는 2026-06-29 **제거**됐다 — 라벨↔주문경로 불일치 footgun 때문에
+> `KIWOOM_PRODUCTION_MODE` 단일 소스로 통일.
 
 ## 실행
 ```bash
@@ -116,23 +155,38 @@ TREND_SECTOR_MIN_AVG=1.0 TREND_SECTOR_BREADTH=0.6 TREND_SECTOR_TOP_K=3  # 주도
 python scripts/backtest_trend.py --mode watchlist --watchlist 005930,000660 --start 2025-01-01 --end 2026-05-31
 python scripts/backtest_trend.py --mode largecap
 
-# 라이브 (MOCK) — MCP 서버 가동 후
+# 라이브 (실거래) — MCP 서버 가동 후
 python scripts/trend_follow.py --phase screen     # 후보 선별 (주문 없음)
-python scripts/trend_follow.py --daemon           # 08:50/09:30/장중/15:20 자동
+python scripts/trend_follow.py --daemon           # 08:50/11:00/장중/15:20 자동
 python scripts/trend_follow.py --status
+python scripts/trend_follow.py --phase shadow     # 그림자 원장 갱신+리포트
 python scripts/trend_dashboard.py                 # http://localhost:8091
+python scripts/trend_panic.py --full              # 긴급정지(데몬 kill + 전량 청산)
 
 # 순수함수 회귀
-python -m pytest tests/test_trend_signals.py -q
+python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 76)
 ```
 
 ## 파일
-- `src/mcp_servers/trend_mcp/signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산 + `classify_zone` JH ZONE + `fundamentals_bonus` 실적 + `leading_sectors` 주도섹터 + `position_size`/`exit_decision`/`is_rising` 실행결정). scorer·exit_rules 재사용.
-- `scripts/backtest_trend.py` — 비용포함 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`) + A/B(`--abtest`). `backtest_dynamic`·`backtest_walkforward` 재사용.
-- `scripts/trend/` — 데몬 레이어 패키지: `config.py`(env·상수·logger), `kiwoom_io.py`(키움 MCP I/O), `market_data.py`(pykrx 시세/유니버스).
-- `scripts/trend_follow.py` — MOCK 라이브 데몬(상태/락/매매일지/알림 + 스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 실적·섹터 가점 + 일일손실 서킷브레이커) + 일별로그.
-- `scripts/trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지, 프리장·근거 표시).
-- `tests/test_trend_signals.py` — 순수함수 회귀(54: 지표/진입/청산 + JH ZONE 6 + 실적 3 + 주도섹터 3).
+
+**순수 도메인** (`src/mcp_servers/trend_mcp/` — 백테스트/외부 에이전트도 사용, 키움 의존 없음):
+- `signals.py` — 순수 함수(MA/기울기/횡보후장대양봉/RS/종합점수/청산 + `classify_zone` JH ZONE + `fundamentals_bonus` 실적 + `leading_sectors` 주도섹터 + `foreign_net_signal` 외인수급 + `position_size`/`exit_decision`/`is_rising` 실행결정). scorer·exit_rules 재사용.
+- `market_data.py` — pykrx OHLCV·KOSPI지수·시총상위 유니버스.
+- `server.py` — :8061 FastMCP 5도구.
+
+**데몬 부트스트랩** (`scripts/` 평탄 잔존 — `trend_mcp` import 시 키움 MCP 의존 footgun 회피, 2026-06-22 리팩터):
+- `trend_config.py` — env·상수·logger·CFG·paths·SCHEDULE.
+- `trend_kiwoom_io.py` — 키움 MCP 클라이언트 wrapper(주문/시세/계좌/업종지수/외인/유니버스).
+- `trend_follow.py` — **실거래 데몬**(상태/락/매매일지/알림 + 스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 레짐·breadth·섹터 게이트 + 서킷브레이커 + 그림자 원장 기록) + 일별로그.
+
+**분석/검증**:
+- `backtest_trend.py` — 거래당 기대값 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`) + A/B(`--abtest`/`--foreignexit`/`--regimetest`).
+- `backtest_trend_portfolio.py` — **포트폴리오 레벨**(equity곡선/MDD/MAR/Sharpe) — 사이징·섹터상한·동시보유 검증용.
+- `shadow_ledger.py` — **그림자 원장**: 차단된 후보 사후추적 → 게이트 판정. [shadow_ledger.md](shadow_ledger.md).
+- `collect_minute_bars.py` — ka10080 5분봉 축적(진입 시각 검증용).
+- `trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지, 프리장·근거 표시).
+- `trend_watchdog.py`/`.cmd` — 멱등 복구(MCP 포트·데몬 락 감시). `trend_panic.py` — 긴급정지.
+- `tests/test_trend_signals.py` — 순수함수 회귀 46 케이스(지표/진입/청산 + JH ZONE + 실적 + 주도섹터 + 외인수급 + 사이징).
 
 ## PDF 설계가이드(이종호 대형주 추세추종) 대조
 

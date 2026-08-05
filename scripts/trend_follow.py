@@ -35,6 +35,7 @@ from trend_kiwoom_io import (               # noqa: E402
     _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
     get_universe,
 )
+from shadow_ledger import record as shadow_record  # noqa: E402  차단 후보 사후추적(원장 기록)
 from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
@@ -550,6 +551,7 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     # 물타기 금지(PDF 절대원칙 #1) — 이미 보유 종목엔 재진입 안 함(1종목 1진입)
     if any(p["symbol"] == sym for p in get_state("positions", [])):
         logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
+        shadow_record("already_held", [c])
         return None
     price = await _realtime_price(sym) or c["price"]
     # risk 사이징용 손절가는 사이징 시점 가격 기준으로 추정(체결 후 entry 기준 재계산은 아래에서).
@@ -557,12 +559,14 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     qty = await _size_qty(price, size_stop)
     if qty < 1:
         logger.warning("[ENTRY] %s 현금 부족/수량 0 — 스킵 (price %.0f)", sym, price)
+        shadow_record("size_zero", [c], {"price": round(price), "stop": round(size_stop)})
         return None
     resp = await _place(mcp, "buy", sym, qty)
     ok, why = _order_accepted(resp)
     if not ok:
         logger.error("[REJECT] entry %s — %s", sym, why)
         log_event("order_reject", {"phase": "entry", "symbol": sym, "why": why, "raw": resp})
+        shadow_record("order_reject", [c], {"why": why})
         await notify(f"❌ 진입 거부 {c['name']}({sym}) — {why}")
         return None
     d = resp.get("data", {}) if isinstance(resp, dict) else {}
@@ -585,6 +589,8 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
                     "fundamental": c.get("fundamental"), "sector": c.get("sector"),
                     "sector_lead": c.get("sector_lead", False)})
     log_event("entry", {"symbol": sym, "qty": qty, "entry": entry, "stop": stop, "target": target})
+    # 대조군 — 차단분과 **같은 잣대**로 재야 게이트 판정이 성립한다(shadow_ledger 참조).
+    shadow_record("taken", [{**c, "stop": stop, "target": target}], {"qty": qty, "entry": entry})
     logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
                 sym, c["name"][:10], qty, entry, stop, target, mode_tag)
     return pos
@@ -631,6 +637,7 @@ async def _apply_sector_rally(cands: list[dict]) -> list[dict]:
         if skipped:
             log_event("entry_skip", {"symbols": [c["symbol"] for c in skipped],
                                      "reason": "주도섹터 아님(SECTOR_GATE)"})
+            shadow_record("sector_gate", skipped, {"leaders": sorted(lead_names)})
     return cands
 
 
@@ -652,6 +659,10 @@ async def phase_entry() -> None:
     positions = get_state("positions", [])
     slots = MAX_POS - len(positions)
     if not cands or slots <= 0:
+        if cands:
+            log_event("entry_skip", {"symbols": [c["symbol"] for c in cands],
+                                     "reason": f"슬롯 만석({len(positions)}/{MAX_POS})"})
+            shadow_record("no_slot", cands, {"held": len(positions), "max_pos": MAX_POS})
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
         return
     # 시장 레짐 게이트 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 전면 차단(보유분 관리는 계속).
@@ -665,6 +676,8 @@ async def phase_entry() -> None:
         elif kospi[-1] < kma:
             log_event("regime_block", {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
                                        "ma_n": REGIME_MA, "candidates": len(cands)})
+            shadow_record("regime", cands, {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
+                                            "ma_n": REGIME_MA})
             _mark_done("entry")
             await notify(f"🚫 시장 레짐 게이트 — 신규 진입 차단 (KOSPI {kospi[-1]:,.0f} < MA{REGIME_MA} {kma:,.0f})\n"
                          f"하락장 신규진입 중단 · 후보 {len(cands)}종 스킵 (보유분 청산규칙은 정상 작동)")
@@ -672,6 +685,7 @@ async def phase_entry() -> None:
     broken, why = await _circuit_broken()
     if broken:
         log_event("circuit_break", {"phase": "entry", "reason": why})
+        shadow_record("circuit", cands, {"why": why})
         await notify(f"🛑 서킷브레이커 — 신규 진입 중단\n{why}")
         return
     # 시장 breadth 게이트(2026-06-24 추가): KOSPI universe 양봉비율 < BREADTH_MIN_PCT 시 신규진입 차단.
@@ -702,7 +716,9 @@ async def phase_entry() -> None:
                 return
             for c in cands:
                 if len(bought) >= slots:
-                    break
+                    # 슬롯 소진 — 남은 후보는 오늘 기회를 잃는다. 사후 성과 추적 대상.
+                    shadow_record("no_slot", [c], {"held": len(positions), "max_pos": MAX_POS})
+                    continue
                 if ENTRY_WAIT_FALLING:
                     cur, opn = await _cur_and_open(c["symbol"])
                     if not _is_rising(cur, opn):
@@ -752,6 +768,7 @@ async def _try_pending() -> None:
         return
     if _past_entry_cutoff():
         log_event("entry_skip", {"symbols": [c["symbol"] for c in pending], "reason": f"진입마감({ENTRY_CUTOFF}) 경과"})
+        shadow_record("cutoff", pending, {"cutoff": ENTRY_CUTOFF})
         await notify(f"⏭️ 보류 후보 진입마감({ENTRY_CUTOFF}) 경과 → 스킵: " +
                      ", ".join(f"{c['name']}({c['symbol']})" for c in pending))
         _save_pending([])
@@ -759,6 +776,7 @@ async def _try_pending() -> None:
     positions = get_state("positions", [])
     slots = MAX_POS - len(positions)
     if slots <= 0:
+        shadow_record("no_slot", pending, {"held": len(positions), "max_pos": MAX_POS})
         _save_pending([])
         return
     broken, why = await _circuit_broken()
@@ -1012,6 +1030,7 @@ async def phase_exit() -> None:
     pend = get_state("pending_entries", [])
     if pend:
         log_event("entry_skip", {"symbols": [c["symbol"] for c in pend], "reason": "장중 미반등"})
+        shadow_record("no_rebound", pend, {"breadth_min": BREADTH_MIN_PCT})
         await notify("⏭️ 보류 후보 진입 스킵 (장중 시가 회복 실패): " +
                      ", ".join(f"{c['name']}({c['symbol']})" for c in pend))
         _save_pending([])
@@ -1025,6 +1044,13 @@ async def phase_exit() -> None:
         await collect(_targets())
     except Exception as e:
         logger.warning("[MINUTE] 분봉 수집 실패(무시): %s", str(e)[:120])
+    # 그림자 원장 사후 성과 갱신 — 차단된 후보가 이후 어떻게 됐는지(손절/목표 선행) 채운다.
+    # 분봉 수집 **뒤에** 호출해야 그날 진입시각 체결가를 가상 진입가로 쓸 수 있다.
+    try:
+        from shadow_ledger import update as shadow_update
+        shadow_update()
+    except Exception as e:
+        logger.warning("[SHADOW] 원장 갱신 실패(무시): %s", str(e)[:120])
 
 
 async def write_daily_journal() -> None:
@@ -1280,7 +1306,8 @@ def print_status() -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile", "journal"])
+    g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile",
+                                       "journal", "shadow"])
     g.add_argument("--daemon", action="store_true")
     g.add_argument("--status", action="store_true")
     g.add_argument("--journal-note", metavar="ID")
@@ -1298,6 +1325,9 @@ if __name__ == "__main__":
             logger.info("[DAEMON] 종료")
         finally:
             release_lock()
+    elif args.phase == "shadow":
+        from shadow_ledger import report as shadow_report, update as shadow_update
+        shadow_update(); shadow_report()
     else:
         asyncio.run({"screen": phase_screen, "entry": phase_entry,
                      "intraday": phase_intraday, "exit": phase_exit,

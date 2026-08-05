@@ -590,7 +590,9 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
                     "sector_lead": c.get("sector_lead", False)})
     log_event("entry", {"symbol": sym, "qty": qty, "entry": entry, "stop": stop, "target": target})
     # 대조군 — 차단분과 **같은 잣대**로 재야 게이트 판정이 성립한다(shadow_ledger 참조).
-    shadow_record("taken", [{**c, "stop": stop, "target": target}], {"qty": qty, "entry": entry})
+    # entry_actual(실체결가)을 넘겨야 손절/목표와 기준이 맞아 R 이 성립한다.
+    shadow_record("taken", [{**c, "stop": stop, "target": target, "entry_actual": entry}],
+                  {"qty": qty, "entry": entry})
     logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
                 sym, c["name"][:10], qty, entry, stop, target, mode_tag)
     return pos
@@ -709,6 +711,7 @@ async def phase_entry() -> None:
         return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     bought, pending = [], []
+    held0 = len(positions)          # 매수 전 보유수 — 루프 중 positions 가 늘어나므로 미리 잡는다
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
@@ -717,7 +720,7 @@ async def phase_entry() -> None:
             for c in cands:
                 if len(bought) >= slots:
                     # 슬롯 소진 — 남은 후보는 오늘 기회를 잃는다. 사후 성과 추적 대상.
-                    shadow_record("no_slot", [c], {"held": len(positions), "max_pos": MAX_POS})
+                    shadow_record("no_slot", [c], {"held": held0, "max_pos": MAX_POS})
                     continue
                 if ENTRY_WAIT_FALLING:
                     cur, opn = await _cur_and_open(c["symbol"])
@@ -1327,7 +1330,7 @@ if __name__ == "__main__":
             release_lock()
     elif args.phase == "shadow":
         from shadow_ledger import report as shadow_report, update as shadow_update
-        shadow_update(); shadow_report()
+        shadow_update(); shadow_report(detail=True)
     else:
         asyncio.run({"screen": phase_screen, "entry": phase_entry,
                      "intraday": phase_intraday, "exit": phase_exit,

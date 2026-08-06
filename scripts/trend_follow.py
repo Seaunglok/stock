@@ -17,12 +17,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 import os
 import sys
 import uuid
 from datetime import datetime, timedelta
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -31,145 +29,29 @@ sys.path.insert(0, str(Path(__file__).parent))   # scripts/ → trend 패키지 
 from trend_config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
 from trend_config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
 from trend_kiwoom_io import (               # noqa: E402
-    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d, _kospi_closes_kiwoom,
+    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d,
     _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
-    get_universe,
+    get_universe, kospi_closes as _kospi_closes,
 )
 from shadow_ledger import record as shadow_record  # noqa: E402  차단 후보 사후추적(원장 기록)
-from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  # noqa: E402
+from trend_journal import write_daily_journal      # noqa: E402  일별 매매일지 md(보고 계층)
+from trend_runtime import (                        # noqa: E402  알림·상태·락·이벤트(인프라 계층)
+    acquire_lock, get_state, journal_append, journal_note, load_state, log_event,
+    notify, release_lock, save_state,
+)
+from src.mcp_servers.trend_mcp.market_data import get_ohlcv  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    TrendConfig, entry_signal, atr, moving_average, classify_zone,
+    entry_signal, atr, moving_average, classify_zone,
     fundamentals_bonus, leading_sectors, market_breadth, position_size, exit_decision, is_rising,
 )
 
 # 설정·상수·CFG·paths·logger·SCHEDULE 는 trend_config 로 이동 (import * 로 노출)
 
 
-# ─── 알림/상태/락 ──────────────────────────────────────────────────────────
-def _html_safe(msg: str) -> str:
-    """의도한 <b>/</b> 외의 < > & 를 이스케이프 — 사유의 '<'(예: 가격비교) 가 HTML 파싱 깨뜨려
-    텔레그램 400(can't parse entities) 되던 문제 방지."""
-    return (msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-               .replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>"))
-
-
-async def notify(msg: str, critical: bool = False) -> None:
-    """텔레그램 알림. critical=True 면 TELEGRAM_CRITICAL_CHAT_ID 로 전송(미설정 시 기본 채팅).
-
-    Critical 용도: 매도거부, 누적실패, 긴급정지 등 즉시대응 필요 알림.
-    """
-    tag = "[CRITICAL] " if critical else "[NOTIFY] "
-    logger.info("%s%s", tag, msg[:200].replace("\n", " "))
-    if not TELEGRAM_TOKEN:
-        return
-    chat = TELEGRAM_CRITICAL_CHAT_ID if critical else TELEGRAM_CHAT_ID
-    if not chat:
-        return
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                             json={"chat_id": chat, "text": _html_safe(msg), "parse_mode": "HTML"})
-            if r.status_code != 200:
-                logger.warning("[TELEGRAM%s] 전송 실패 %s: %s",
-                               " CRIT" if critical else "", r.status_code, r.text[:200])
-    except Exception as e:
-        logger.warning("[TELEGRAM] %s", e)
-
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def save_state(key: str, content: Any) -> None:
-    st = load_state()
-    st[key] = content
-    st["last_updated"] = datetime.now().isoformat()
-    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def get_state(key: str, default=None) -> Any:
-    return load_state().get(key, default)
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        import psutil
-        return psutil.pid_exists(pid)
-    except Exception:
-        try:
-            os.kill(pid, 0); return True
-        except OSError:
-            return False
-        except Exception:
-            return True
-
-
-def acquire_lock() -> bool:
-    if LOCK_FILE.exists():
-        try:
-            old = int(LOCK_FILE.read_text().strip() or "0")
-        except Exception:
-            old = 0
-        if old and old != os.getpid() and _pid_alive(old):
-            logger.error("[LOCK] 이미 실행 중 (PID=%d)", old)
-            return False
-    LOCK_FILE.write_text(str(os.getpid()))
-    return True
-
-
-def release_lock() -> None:
-    try:
-        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
-            LOCK_FILE.unlink()
-    except Exception:
-        pass
-
-
-def log_event(event: str, payload: dict) -> None:
-    day = DATA_DIR / datetime.now().strftime("%Y-%m-%d")
-    day.mkdir(parents=True, exist_ok=True)
-    with (day / "events.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
-                            "event": event, "payload": payload}, ensure_ascii=False) + "\n")
-
-
-# ─── 매매일지 ──────────────────────────────────────────────────────────────
-def journal_append(rec: dict) -> None:
-    rec = {"ts": datetime.now().isoformat(timespec="seconds"), **rec}
-    with JOURNAL_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def journal_note(jid: str, psych: str = "", mistake: str = "", improve: str = "") -> None:
-    """매매일지 항목에 심리/실수/개선 메모 추가 (대시보드/ CLI)."""
-    journal_append({"type": "note", "id": jid,
-                    "psych": psych, "mistake": mistake, "improve": improve})
-    print(f"매매일지 메모 추가: id={jid}")
-
-
 _is_rising = is_rising   # signals.is_rising 재노출(호출부 호환)
-
-
-async def _kospi_closes() -> list[float]:
-    """RS 게이트용 KOSPI 종가 — 키움 ka20006 우선, 실패 시 FDR(순수도메인 market_data) 폴백.
-
-    FDR 은 전일 종가를 다음날 장중에 채워 08:50 screen 시점 1영업일 지연 → 개별종목과
-    날짜가 어긋나 RS 가 하루 묵은 지수로 판정되던 문제(2026-07-22 수정). 키움은 당일 봉 포함.
-    """
-    k = await _kospi_closes_kiwoom()
-    if k:
-        return k
-    logger.warning("[KOSPI] 키움 ka20006 실패 — FDR 폴백(1영업일 지연 가능)")
-    return get_kospi_closes()
 
 
 async def phase_reconcile() -> None:
@@ -196,7 +78,6 @@ async def phase_reconcile() -> None:
     positions = get_state("positions", [])
     held = {p["symbol"] for p in positions}
     adopted = []
-    skipped = []
     for h in holdings:
         if h["symbol"] in held:
             continue
@@ -643,6 +524,90 @@ async def _apply_sector_rally(cands: list[dict]) -> list[dict]:
     return cands
 
 
+async def _market_gates(cands: list[dict]) -> list[dict] | None:
+    """진입 전 시장 게이트 3종 — 레짐 → 서킷 → breadth. 통과 시 후보, 차단 시 None.
+
+    순서에 의미가 있다: 레짐(지수 추세, 하루 단위 판정)이 가장 넓은 그물이라 먼저 걸러
+    아래 게이트의 조회 비용을 아낀다. breadth 만 '보류'(장중 회복 시 재시도)이고 나머지는 종착.
+    """
+    # 레짐 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 전면 차단(보유분 관리는 계속).
+    # breadth 가 '당일 상승종목 비율'만 보는 것과 달리 **지수 추세**를 본다(상호보완).
+    # 2026-08-03 도입: 실전 진입 11건 중 10건이 KOSPI<MA60 일 발생 → 실현손실 -33.3%p 회피 추정.
+    if REGIME_MA > 0:
+        kospi = await _kospi_closes()
+        kma = moving_average(kospi, REGIME_MA) if kospi else None
+        if kma is None:
+            logger.warning("[REGIME] KOSPI MA%d 산출 불가 — 레짐 게이트 미적용(fail-open)", REGIME_MA)
+        elif kospi[-1] < kma:
+            log_event("regime_block", {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
+                                       "ma_n": REGIME_MA, "candidates": len(cands)})
+            shadow_record("regime", cands, {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
+                                            "ma_n": REGIME_MA})
+            _mark_done("entry")
+            await notify(f"🚫 시장 레짐 게이트 — 신규 진입 차단 (KOSPI {kospi[-1]:,.0f} < MA{REGIME_MA} {kma:,.0f})\n"
+                         f"하락장 신규진입 중단 · 후보 {len(cands)}종 스킵 (보유분 청산규칙은 정상 작동)")
+            return None
+    broken, why = await _circuit_broken()
+    if broken:
+        log_event("circuit_break", {"phase": "entry", "reason": why})
+        shadow_record("circuit", cands, {"why": why})
+        await notify(f"🛑 서킷브레이커 — 신규 진입 중단\n{why}")
+        return None
+    # breadth(2026-06-24 추가): KOSPI universe 양봉비율 < BREADTH_MIN_PCT 시 신규진입 차단.
+    # 06-23 사고(9종 동시 hard stop) 같은 광범위 약세장 자동 감지. 백테스트 P10 -9.33→-7.07%(0.5) 검증.
+    # 2026-07-03: 단발 차단이 '약한 출발→회복' 장을 통째로 놓치던 문제 → 후보를 버리지 않고 보류로 유지,
+    #   _try_pending 이 장중 breadth 재확인해 회복(≥임계)+후보 반등 시 진입(컷오프까지). 약세 유지 시 계속 보류.
+    if BREADTH_MIN_PCT > 0:
+        rows = await _sector_index_rows()
+        if rows:
+            breadth = market_breadth(rows)
+            if breadth is not None and breadth < BREADTH_MIN_PCT:
+                log_event("breadth_block", {"breadth": round(breadth, 3),
+                                            "threshold": BREADTH_MIN_PCT, "held": len(cands)})
+                _save_pending(cands)   # 버리지 않고 보류 → 장중 회복 시 재시도
+                _mark_done("entry")
+                await notify(f"🚫 시장 breadth 게이트 — 신규 진입 보류 (양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%})\n"
+                             f"회복(≥{BREADTH_MIN_PCT:.0%}) + 후보 반등 시 진입 재시도 (~{ENTRY_CUTOFF})")
+                return None
+    return cands
+
+
+async def _execute_buys(cands: list[dict], positions: list[dict], slots: int,
+                        mode_tag: str) -> tuple[bool, list[dict], list[dict]]:
+    """후보 순회 매수 → (정상종료, 매수분, 보류분). positions 는 체결분이 append 된다(in-place).
+
+    하락 중인 후보는 사지 않고 보류 → _try_pending 이 장중 반등 시 재시도.
+    슬롯이 도중에 소진되면 남은 후보는 그림자 원장에 기회비용으로 남긴다.
+    """
+    bought, pending = [], []
+    held0 = len(positions)          # 매수 전 보유수 — 루프 중 positions 가 늘어나므로 미리 잡는다
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            if not mcp.tools:
+                await notify("❌ trading-domain 연결 실패")
+                return False, [], []
+            for c in cands:
+                if len(bought) >= slots:
+                    # 슬롯 소진 — 남은 후보는 오늘 기회를 잃는다. 사후 성과 추적 대상.
+                    shadow_record("no_slot", [c], {"held": held0, "max_pos": MAX_POS})
+                    continue
+                if ENTRY_WAIT_FALLING:
+                    cur, opn = await _cur_and_open(c["symbol"])
+                    if not _is_rising(cur, opn):
+                        pending.append(c)
+                        logger.info("[ENTRY] %s %-10s 하락중(현재%.0f<시가%.0f) → 보류",
+                                    c["symbol"], c["name"][:10], cur, opn)
+                        continue
+                pos = await _buy_one(mcp, c, mode_tag)
+                if pos:
+                    positions.append(pos); bought.append(pos)
+                    save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 포지션 방지
+    except Exception as e:
+        logger.error("[ENTRY] %s", e); await notify(f"❌ 진입 오류: {e}")
+        return False, bought, pending
+    return True, bought, pending
+
+
 async def phase_entry() -> None:
     logger.info("=" * 56); logger.info("[ENTRY] %s", datetime.now().strftime("%H:%M:%S"))
     log_event("phase_start", {"phase": "entry"})
@@ -667,73 +632,17 @@ async def phase_entry() -> None:
             shadow_record("no_slot", cands, {"held": len(positions), "max_pos": MAX_POS})
         await notify(f"ℹ️ 추세추종 진입: 후보 {len(cands)} 슬롯 {slots} — 진입 없음")
         return
-    # 시장 레짐 게이트 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 전면 차단(보유분 관리는 계속).
-    # breadth 게이트가 '당일 상승종목 비율'만 보는 것과 달리 **지수 추세**를 본다(상호보완).
-    # 2026-08-03 도입: 실전 진입 11건 중 10건이 KOSPI<MA60 일 발생 → 실현손실 -33.3%p 회피 추정.
-    if REGIME_MA > 0:
-        kospi = await _kospi_closes()
-        kma = moving_average(kospi, REGIME_MA) if kospi else None
-        if kma is None:
-            logger.warning("[REGIME] KOSPI MA%d 산출 불가 — 레짐 게이트 미적용(fail-open)", REGIME_MA)
-        elif kospi[-1] < kma:
-            log_event("regime_block", {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
-                                       "ma_n": REGIME_MA, "candidates": len(cands)})
-            shadow_record("regime", cands, {"kospi": round(kospi[-1], 1), "ma": round(kma, 1),
-                                            "ma_n": REGIME_MA})
-            _mark_done("entry")
-            await notify(f"🚫 시장 레짐 게이트 — 신규 진입 차단 (KOSPI {kospi[-1]:,.0f} < MA{REGIME_MA} {kma:,.0f})\n"
-                         f"하락장 신규진입 중단 · 후보 {len(cands)}종 스킵 (보유분 청산규칙은 정상 작동)")
-            return
-    broken, why = await _circuit_broken()
-    if broken:
-        log_event("circuit_break", {"phase": "entry", "reason": why})
-        shadow_record("circuit", cands, {"why": why})
-        await notify(f"🛑 서킷브레이커 — 신규 진입 중단\n{why}")
+    cands = await _market_gates(cands)
+    if cands is None:
         return
-    # 시장 breadth 게이트(2026-06-24 추가): KOSPI universe 양봉비율 < BREADTH_MIN_PCT 시 신규진입 차단.
-    # 06-23 사고(9종 동시 hard stop) 같은 광범위 약세장 자동 감지. 백테스트 P10 -9.33→-7.07%(0.5) 검증.
-    # 2026-07-03: 09:30 단발 차단이 '약한 출발→회복' 장을 통째로 놓치던 문제 → 후보를 버리지 않고 보류로 유지,
-    #   _try_pending 이 장중 breadth 재확인해 회복(≥임계)+후보 반등 시 진입(14:00 컷오프). 약세 유지 시 계속 보류(방어 유지).
-    if BREADTH_MIN_PCT > 0:
-        rows = await _sector_index_rows()
-        if rows:
-            breadth = market_breadth(rows)
-            if breadth is not None and breadth < BREADTH_MIN_PCT:
-                log_event("breadth_block", {"breadth": round(breadth, 3), "threshold": BREADTH_MIN_PCT, "held": len(cands)})
-                _save_pending(cands)   # 버리지 않고 보류 → 장중 회복 시 재시도
-                _mark_done("entry")
-                await notify(f"🚫 시장 breadth 게이트 — 09:30 신규 진입 보류 (양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%})\n"
-                             f"회복(≥{BREADTH_MIN_PCT:.0%}) + 후보 반등 시 진입 재시도 (~{ENTRY_CUTOFF})")
-                return
     cands = await _apply_sector_rally(cands)
     if not cands:
         await notify("⏭️ 주도섹터 게이트: 주도섹터 소속 후보 없음 — 진입 스킵")
         return
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
-    bought, pending = [], []
-    held0 = len(positions)          # 매수 전 보유수 — 루프 중 positions 가 늘어나므로 미리 잡는다
-    try:
-        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
-            if not mcp.tools:
-                await notify("❌ trading-domain 연결 실패")
-                return
-            for c in cands:
-                if len(bought) >= slots:
-                    # 슬롯 소진 — 남은 후보는 오늘 기회를 잃는다. 사후 성과 추적 대상.
-                    shadow_record("no_slot", [c], {"held": held0, "max_pos": MAX_POS})
-                    continue
-                if ENTRY_WAIT_FALLING:
-                    cur, opn = await _cur_and_open(c["symbol"])
-                    if not _is_rising(cur, opn):
-                        pending.append(c)
-                        logger.info("[ENTRY] %s %-10s 하락중(현재%.0f<시가%.0f) → 보류", c["symbol"], c["name"][:10], cur, opn)
-                        continue
-                pos = await _buy_one(mcp, c, mode_tag)
-                if pos:
-                    positions.append(pos); bought.append(pos)
-                    save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 포지션 방지
-    except Exception as e:
-        logger.error("[ENTRY] %s", e); await notify(f"❌ 진입 오류: {e}"); return
+    ok, bought, pending = await _execute_buys(cands, positions, slots, mode_tag)
+    if not ok:
+        return
     bought, positions = await _verify_buy_fills(bought, positions)
     save_state("positions", positions)
     _save_pending(pending)
@@ -899,6 +808,72 @@ async def _pyramid_adds(when: str) -> None:
 
 
 # ─── 포지션 관리 공통 (트레일/목표/청산) ──────────────────────────────────────
+async def _exit_signals(pos: dict, cur: float) -> dict:
+    """15:20 청산 phase 전용 신호 — MA 이탈선·외인 수급·추세확인선·보유만기.
+
+    장중(intraday)엔 평가하지 않는다(트레일/하드손절만) — 일봉 신호는 마감가 기준이라
+    장중 판정이 무의미하고 조회 비용만 든다.
+    데이터를 못 구하면 해당 신호는 None = 미적용(fail-open) — 조회 실패로 팔지 않는다.
+    """
+    sym = pos["symbol"]
+    ohlcv = get_ohlcv(sym, max(EXIT_MA, FOREIGN_TREND_MA) + 40)
+    closes_cur = [b["close"] for b in ohlcv] + [cur] if ohlcv else []
+    ma_exit = moving_average(closes_cur, EXIT_MA) if ohlcv else None
+    foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
+    ma_trend = None
+    # 외인 청산 추세 확인선(MA60) — 수급만으로 정상추세 종목을 파는 것 방지.
+    # 조건 ON 인데 MA 를 못 구하면 판정 불가 → 외인룰 자체를 스킵(fail-open 일관성).
+    if USE_FOREIGN_EXIT and FOREIGN_TREND_MA > 0:
+        ma_trend = moving_average(closes_cur, FOREIGN_TREND_MA) if ohlcv else None
+        if ma_trend is None and foreign is not None:
+            logger.info("[FOREIGN] %s MA%d 산출 불가 — 추세확인 불가로 외인룰 스킵", sym, FOREIGN_TREND_MA)
+            foreign = None
+    # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지
+    aged = MAX_HOLD_DAYS > 0 and _busdays_since(pos.get("buy_date")) >= MAX_HOLD_DAYS
+    return {"ma_exit": ma_exit, "foreign": foreign, "ma_trend": ma_trend, "aged": aged}
+
+
+def _exit_line(x: dict) -> str:
+    p, n = x["pos"], x["net"]
+    rr = f" 손익비 {x['rr']}" if x["rr"] is not None else ""
+    return (f"{'🟢' if n > 0 else '🔴'} <b>{p['name']}</b>({p['symbol']}) {x['qty']}주 @{x['cur']:,.0f}\n"
+            f"   net {n:+.2f}% ({x['pnl_amt']:+,}원{rr}) · {x['hold']}일 보유 — {x['reason']}")
+
+
+async def _manage_alerts(when: str, closed: list[dict], sell_failures: list[dict],
+                         price_fails: list[str]) -> None:
+    """포지션 관리 후 알림 — 시세조회 실패·매도거부 누적·청산 요약."""
+    # 청산 phase 에서 시세조회 실패 = 청산 기회를 침묵 속에 놓칠 수 있음 → 알림
+    if price_fails and when == "exit":
+        await notify("⚠️ 청산 phase 시세조회 실패 — 청산판정 보류(다음 cycle 재시도): " + ", ".join(price_fails))
+    # 매도 거부 누적이 임계치 초과(시도 절반 이상 또는 3건+) → 시스템적 문제 가능성 → critical alert
+    attempts = len(closed) + len(sell_failures)
+    if sell_failures and (len(sell_failures) >= 3 or len(sell_failures) >= attempts / 2):
+        await notify(f"🚨🚨 <b>[{when}] 매도 거부 누적 {len(sell_failures)}/{attempts}건</b> — 시스템 점검 필요\n"
+                     "8005 토큰/계좌권한/거래시간/잔고 확인. 필요 시 `python scripts/trend_panic.py --flatten`",
+                     critical=True)
+    if closed:
+        await notify(f"📤 추세추종 청산 [{datetime.now().strftime('%m/%d %H:%M')}]\n" +
+                     "\n".join(_exit_line(x) for x in closed))
+
+
+async def _sell_with_retry(mcp, when: str, sym: str, qty: int) -> tuple[Any, bool, str]:
+    """매도 1회 + 실패 시 2초 후 1회 재시도 → (raw응답, 수락여부, 사유).
+
+    클라이언트 단에 8005 토큰 자동복구가 이미 1회 있으므로 여기 재시도는 그 위의 방어층이다.
+    """
+    resp = await _place(mcp, "sell", sym, qty)
+    ok, why = _order_accepted(resp)
+    if ok:
+        return resp, True, why
+    logger.warning("[RETRY] %s %s 매도 첫 시도 실패 (%s) — 2초 후 재시도", when, sym, why)
+    await asyncio.sleep(2.0)
+    resp = await _place(mcp, "sell", sym, qty)
+    ok, why = _order_accepted(resp)
+    return resp, ok, why
+
+
+
 async def _manage(do_exit_signals: bool, when: str) -> None:
     positions = get_state("positions", [])
     if not positions:
@@ -922,39 +897,17 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                 a = float(pos.get("atr", 0) or 0)
                 peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
                 pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
-                # 이평선/외인/보유만기 청산 신호는 15:20 청산 phase(do_exit_signals)에서만 평가
-                ma_exit, foreign, aged, ma_trend = None, None, False, None
-                if do_exit_signals:
-                    ohlcv = get_ohlcv(sym, max(EXIT_MA, FOREIGN_TREND_MA) + 40)
-                    closes_cur = [b["close"] for b in ohlcv] + [cur] if ohlcv else []
-                    ma_exit = moving_average(closes_cur, EXIT_MA) if ohlcv else None
-                    foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
-                    # 외인 청산 추세 확인선(MA60) — 수급만으로 정상추세 종목을 파는 것 방지.
-                    # 조건 ON 인데 MA 를 못 구하면 판정 불가 → 외인룰 자체를 스킵(fail-open 일관성).
-                    if USE_FOREIGN_EXIT and FOREIGN_TREND_MA > 0:
-                        ma_trend = moving_average(closes_cur, FOREIGN_TREND_MA) if ohlcv else None
-                        if ma_trend is None and foreign is not None:
-                            logger.info("[FOREIGN] %s MA%d 산출 불가 — 추세확인 불가로 외인룰 스킵",
-                                        sym, FOREIGN_TREND_MA)
-                            foreign = None
-                    # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지
-                    aged = MAX_HOLD_DAYS > 0 and _busdays_since(pos.get("buy_date")) >= MAX_HOLD_DAYS
+                sig = await _exit_signals(pos, cur) if do_exit_signals else {}
                 action, reason, sell_qty = exit_decision(
                     entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
                     partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
-                    partial_pct=CFG.partial_pct, ma_exit=ma_exit, exit_ma_label=EXIT_MA,
-                    foreign_net=foreign, use_foreign=USE_FOREIGN_EXIT,
-                    ma_trend=ma_trend, trend_ma_label=FOREIGN_TREND_MA, aged_out=aged)
+                    partial_pct=CFG.partial_pct, exit_ma_label=EXIT_MA,
+                    use_foreign=USE_FOREIGN_EXIT, trend_ma_label=FOREIGN_TREND_MA,
+                    ma_exit=sig.get("ma_exit"), foreign_net=sig.get("foreign"),
+                    ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False))
                 if not action:
                     remaining.append(pos); continue
-                # 매도 시도(클라이언트 단의 8005 자동복구 1회 포함). 실패 시 1회 추가 재시도.
-                resp = await _place(mcp, "sell", sym, sell_qty)
-                ok, why = _order_accepted(resp)
-                if not ok:
-                    logger.warning("[RETRY] %s %s 매도 첫 시도 실패 (%s) — 2초 후 재시도", when, sym, why)
-                    await asyncio.sleep(2.0)
-                    resp = await _place(mcp, "sell", sym, sell_qty)
-                    ok, why = _order_accepted(resp)
+                resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
                 if not ok:
                     logger.error("[REJECT] %s %s 매도 거부 (재시도 후에도 실패) — %s", when, sym, why)
                     log_event("order_reject", {"phase": when, "symbol": sym, "qty": sell_qty,
@@ -992,23 +945,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     except Exception as e:
         logger.error("[%s] %s", when, e); return
     save_state("positions", remaining)
-    # 청산 phase 에서 시세조회 실패 = 청산 기회를 침묵 속에 놓칠 수 있음 → 알림
-    if price_fails and when == "exit":
-        await notify("⚠️ 청산 phase 시세조회 실패 — 청산판정 보류(다음 cycle 재시도): " + ", ".join(price_fails))
-    # 매도 거부 누적이 임계치 초과(시도 절반 이상 또는 3건+) → 시스템적 문제 가능성 → critical alert
-    attempts = len(closed) + len(sell_failures)
-    if sell_failures and (len(sell_failures) >= 3 or len(sell_failures) >= attempts / 2):
-        await notify(f"🚨🚨 <b>[{when}] 매도 거부 누적 {len(sell_failures)}/{attempts}건</b> — 시스템 점검 필요\n"
-                     "8005 토큰/계좌권한/거래시간/잔고 확인. 필요 시 `python scripts/trend_panic.py --flatten`",
-                     critical=True)
-    if closed:
-        def _exit_line(x: dict) -> str:
-            p, n = x["pos"], x["net"]
-            rr = f" 손익비 {x['rr']}" if x["rr"] is not None else ""
-            return (f"{'🟢' if n>0 else '🔴'} <b>{p['name']}</b>({p['symbol']}) {x['qty']}주 @{x['cur']:,.0f}\n"
-                    f"   net {n:+.2f}% ({x['pnl_amt']:+,}원{rr}) · {x['hold']}일 보유 — {x['reason']}")
-        await notify(f"📤 추세추종 청산 [{datetime.now().strftime('%m/%d %H:%M')}]\n" +
-                     "\n".join(_exit_line(x) for x in closed))
+    await _manage_alerts(when, closed, sell_failures, price_fails)
 
 
 async def phase_intraday() -> None:
@@ -1054,121 +991,6 @@ async def phase_exit() -> None:
         shadow_update()
     except Exception as e:
         logger.warning("[SHADOW] 원장 갱신 실패(무시): %s", str(e)[:120])
-
-
-async def write_daily_journal() -> None:
-    """그날 매매일지 md 자동 생성 — journal.json(진입/청산/부분/메모) + 보유 P&L + KOSPI.
-
-    docs/YYYY-MM-DD-trend-journal.md 작성. 15:20 청산 후 자동 호출 + `--phase journal` 수동.
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-    recs = []
-    if JOURNAL_FILE.exists():
-        for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    recs.append(json.loads(line))
-                except Exception:
-                    pass
-    todays = [r for r in recs if str(r.get("ts", "")).startswith(today)]
-    entries = [r for r in todays if r.get("type") == "entry"]
-    exits = [r for r in todays if r.get("type") == "exit"]
-    partials = [r for r in todays if r.get("type") == "partial"]
-
-    k = await _kospi_closes()
-    kline = (f"{k[-2]:,.1f} → {k[-1]:,.1f} ({(k[-1]-k[-2]) / k[-2] * 100:+.2f}%)"
-             if len(k) >= 2 else "N/A")
-
-    positions = get_state("positions", [])
-    rows, tot = [], 0.0
-    for p in positions:
-        live = await _realtime_price(p["symbol"]) or p["entry_price"]
-        pnl = (live - p["entry_price"]) / p["entry_price"] * 100 if p["entry_price"] else 0.0
-        amt = (live - p["entry_price"]) * p["qty"]
-        tot += amt
-        rows.append((p, live, pnl, amt))
-    rows.sort(key=lambda x: -x[2])
-    realized = sum(e.get("entry_price", 0) * e.get("qty", 0) * e.get("net_pct", 0) / 100.0 for e in exits)
-
-    L = [f"# 추세추종 매매일지 — {today}", "",
-         f"> 대형주 추세추종 (MOCK) · 모드 {UNIVERSE_MODE} · 자동 생성 · 대시보드 :8091", "",
-         f"## 시장\n- KOSPI {kline}", "",
-         f"## 매매 (신규 {len(entries)} · 청산 {len(exits)} · 부분익절 {len(partials)})"]
-    if entries:
-        L.append("| 종목 | 진입가 | 수량 | 금액 | 점수 |")
-        L.append("|------|--------|------|------|------|")
-        for e in entries:
-            L.append(f"| {e['name']}({e['symbol']}) | {e['entry_price']:,.0f} | {e['qty']} | "
-                     f"{e['entry_price'] * e['qty']:,.0f} | {e.get('score', '')} |")
-    for e in exits:
-        L.append(f"- 청산 {e['name']}({e['symbol']}) {e['qty']}주 @{e['exit_price']:,.0f} "
-                 f"net {e.get('net_pct', 0):+.2f}% — {e.get('reason', '')}")
-    if not entries and not exits:
-        L.append("- 신규/청산 없음 (보유 유지)")
-    L += ["", f"## 보유 {len(positions)}종 · 평가손익 **{tot:+,.0f}원** (당일 실현 {realized:+,.0f}원)",
-          "| 종목 | 수량 | 진입 | 현재 | 손익 | 평가손익 |", "|------|------|------|------|------|------|"]
-    for p, live, pnl, amt in rows:
-        L.append(f"| {p['name']}({p['symbol']}) | {p['qty']} | {p['entry_price']:,.0f} | "
-                 f"{live:,.0f} | {pnl:+.2f}% | {amt:+,.0f} |")
-
-    # 안전 이벤트 카운터 (events.jsonl 스캔) — 운영 모니터링용
-    events_file = DATA_DIR / today / "events.jsonl"
-    counts = {"hard_stop": 0, "circuit_break": 0, "sell_reject": 0,
-              "adopted": 0, "fill_partial": 0, "fill_missing": 0, "pyramid": 0}
-    if events_file.exists():
-        for ln in events_file.read_text(encoding="utf-8").splitlines():
-            if not ln.strip():
-                continue
-            try:
-                ev = json.loads(ln)
-            except Exception:
-                continue
-            name = ev.get("event", "")
-            payload = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
-            if name == "exit" and "하드" in str(payload.get("reason", "")):
-                counts["hard_stop"] += 1
-            elif name == "circuit_break":
-                counts["circuit_break"] += 1
-            elif name == "order_reject" and payload.get("phase") in ("exit", "intraday", "force_close"):
-                counts["sell_reject"] += 1
-            elif name == "reconcile_adopt":
-                counts["adopted"] += 1
-            elif name == "fill_partial":
-                counts["fill_partial"] += 1
-            elif name == "fill_missing":
-                counts["fill_missing"] += 1
-            elif name == "pyramid_add":
-                counts["pyramid"] += 1
-    if any(v > 0 for v in counts.values()):
-        L += ["", "## ⚙️ 안전 이벤트 (당일)"]
-        if counts["hard_stop"]:    L.append(f"- 🔴 하드손절 발동 **{counts['hard_stop']}건**")
-        if counts["circuit_break"]: L.append(f"- 🛑 서킷브레이커 발동 **{counts['circuit_break']}건**")
-        if counts["sell_reject"]:  L.append(f"- 🚨 매도 거부 **{counts['sell_reject']}건** (재시도 후 실패)")
-        if counts["fill_missing"]: L.append(f"- ⚠️ 미체결 감지 **{counts['fill_missing']}건**")
-        if counts["fill_partial"]: L.append(f"- ⚠️ 부분체결 감지 **{counts['fill_partial']}건**")
-        if counts["adopted"]:      L.append(f"- 📥 계좌보유분 편입 **{counts['adopted']}종**")
-        if counts["pyramid"]:      L.append(f"- 📈 피라미딩 추가매수 **{counts['pyramid']}건**")
-
-    L += ["", "*자동 생성. 심리/실수/개선은 `--journal-note <id>` 또는 대시보드에서 추가.*", ""]
-
-    out = _ROOT / "docs" / f"{today}-trend-journal.md"
-    out.write_text("\n".join(L), encoding="utf-8")
-    logger.info("[JOURNAL] 매매일지 자동작성: %s", out.name)
-    log_event("journal_write", {"file": out.name, "entries": len(entries), "exits": len(exits), "eval_pnl": round(tot)})
-    # 마감 요약 알림 — 모드 + 진입/청산/보유 + 실현/평가 + 안전이벤트 카운트
-    safety_line = ""
-    if any(v > 0 for v in counts.values()):
-        bits = []
-        if counts["hard_stop"]:     bits.append(f"하드손절 {counts['hard_stop']}")
-        if counts["circuit_break"]: bits.append(f"서킷 {counts['circuit_break']}")
-        if counts["sell_reject"]:   bits.append(f"매도거부 {counts['sell_reject']}")
-        if counts["fill_missing"]:  bits.append(f"미체결 {counts['fill_missing']}")
-        if counts["fill_partial"]:  bits.append(f"부분체결 {counts['fill_partial']}")
-        safety_line = "\n⚠️ " + " · ".join(bits)
-    mode_tag = "💰 REAL" if PRODUCTION_MODE else "🧪 MOCK"
-    await notify(f"📓 <b>마감 {today}</b> ({mode_tag})\n"
-                 f"진입 {len(entries)} · 청산 {len(exits)} · 보유 {len(positions)}\n"
-                 f"실현 {realized:+,.0f}원 · 평가 {tot:+,.0f}원" + safety_line)
 
 
 # ─── 데몬 ──────────────────────────────────────────────────────────────────

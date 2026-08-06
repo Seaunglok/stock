@@ -174,10 +174,15 @@ python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 
 - `market_data.py` — pykrx OHLCV·KOSPI지수·시총상위 유니버스.
 - `server.py` — :8061 FastMCP 5도구.
 
-**데몬 부트스트랩** (`scripts/` 평탄 잔존 — `trend_mcp` import 시 키움 MCP 의존 footgun 회피, 2026-06-22 리팩터):
+**데몬 계층** (`scripts/` 평탄 잔존 — `trend_mcp` import 시 키움 MCP 의존 footgun 회피, 2026-06-22 리팩터):
 - `trend_config.py` — env·상수·logger·CFG·paths·SCHEDULE.
-- `trend_kiwoom_io.py` — 키움 MCP 클라이언트 wrapper(주문/시세/계좌/업종지수/외인/유니버스).
-- `trend_follow.py` — **실거래 데몬**(상태/락/매매일지/알림 + 스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 레짐·breadth·섹터 게이트 + 서킷브레이커 + 그림자 원장 기록) + 일별로그.
+- `trend_kiwoom_io.py` — 키움 MCP I/O(주문/시세/계좌/업종지수/외인/`kospi_closes`/유니버스).
+- `trend_runtime.py` — **인프라**(알림·상태·락·이벤트로그·일지 append). 매매 판단 없음 → 단독 테스트 가능.
+- `trend_journal.py` — **보고**(일별 매매일지 md + 안전 이벤트 집계). 주문 경로 무관.
+- `trend_follow.py` — **실거래 데몬**(스크린/진입/장중/청산 + 하락보류진입 + 계좌편입 reconcile + 레짐·breadth·섹터 게이트 + 서킷브레이커 + 그림자 원장 기록).
+
+> **분리 원칙**(2026-08-06 리팩터): 주문을 내는 코드와 안 내는 코드를 나눈다. 인프라·보고를 손볼 때
+> 실거래 로직을 건드리지 않게 하는 게 목적 — 데몬 1334줄 → 1145줄, 60줄 초과 함수 6개 → 5개.
 
 **분석/검증**:
 - `backtest_trend.py` — 거래당 기대값 백테스트(3모드) + 갭다운 veto 스윕(`--gapdown-sweep`) + A/B(`--abtest`/`--foreignexit`/`--regimetest`).
@@ -186,7 +191,7 @@ python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 
 - `collect_minute_bars.py` — ka10080 5분봉 축적(진입 시각 검증용).
 - `trend_dashboard.py` — :8091 대시보드(보유/거래/매매일지, 프리장·근거 표시).
 - `trend_watchdog.py`/`.cmd` — 멱등 복구(MCP 포트·데몬 락 감시). `trend_panic.py` — 긴급정지.
-- `tests/test_trend_signals.py` — 순수함수 회귀 46 케이스(지표/진입/청산 + JH ZONE + 실적 + 주도섹터 + 외인수급 + 사이징).
+- `tests/` — 회귀 안전망 **109 케이스**: `test_trend_signals.py` 46(지표/진입/청산 + JH ZONE + 실적 + 주도섹터 + 외인수급 + 사이징) · `test_shadow_ledger.py` 21(그림자 원장 측정 정합성) · `test_trend_journal.py` 12(일지 집계) · 종가매매 30.
 
 ## PDF 설계가이드(이종호 대형주 추세추종) 대조
 

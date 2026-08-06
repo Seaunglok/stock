@@ -237,6 +237,20 @@ async def _kospi_closes_kiwoom(days: int = 150) -> list[float] | None:
     return [c for _, c in pairs]
 
 
+async def kospi_closes() -> list[float]:
+    """RS 게이트/일지용 KOSPI 종가 — 키움 ka20006 우선, 실패 시 FDR(순수도메인) 폴백.
+
+    FDR 은 전일 종가를 다음날 장중에 채워 08:50 screen 시점 1영업일 지연 → 개별종목과
+    날짜가 어긋나 RS 가 하루 묵은 지수로 판정되던 문제(2026-07-22 수정). 키움은 당일 봉 포함.
+    """
+    k = await _kospi_closes_kiwoom()
+    if k:
+        return k
+    logger.warning("[KOSPI] 키움 ka20006 실패 — FDR 폴백(1영업일 지연 가능)")
+    from src.mcp_servers.trend_mcp.market_data import get_kospi_closes
+    return get_kospi_closes()
+
+
 # ─── universe wrapper ──────────────────────────────────────────────────────
 # scripts/trend/market_data.py 가 삭제되면서 데몬용 get_universe (config 자동 주입) 흡수.
 def get_universe() -> list[tuple[str, str]]:

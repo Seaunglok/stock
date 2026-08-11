@@ -17,6 +17,7 @@ from trend_config import (
     DATA_DIR, JOURNAL_FILE, LOCK_FILE, STATE_FILE,
     TELEGRAM_CHAT_ID, TELEGRAM_CRITICAL_CHAT_ID, TELEGRAM_TOKEN, logger,
 )
+from trend_lock import describe, owned_by_me, owner_alive, read_lock, write_lock
 
 
 # ─── 알림 ──────────────────────────────────────────────────────────────────
@@ -73,35 +74,26 @@ def get_state(key: str, default=None) -> Any:
 
 
 # ─── 단일 인스턴스 락 ───────────────────────────────────────────────────────
-def _pid_alive(pid: int) -> bool:
-    try:
-        import psutil
-        return psutil.pid_exists(pid)
-    except Exception:
-        try:
-            os.kill(pid, 0); return True
-        except OSError:
-            return False
-        except Exception:
-            return True
-
-
 def acquire_lock() -> bool:
-    if LOCK_FILE.exists():
-        try:
-            old = int(LOCK_FILE.read_text().strip() or "0")
-        except Exception:
-            old = 0
-        if old and old != os.getpid() and _pid_alive(old):
-            logger.error("[LOCK] 이미 실행 중 (PID=%d)", old)
+    """단일 인스턴스 락 획득. 소유권은 PID **+ 기동시각**으로 판정(PID 재사용 방어).
+
+    2026-08-11: PID 만 보다가 죽은 데몬의 PID(6536)를 vmware-authd 가 재할당받아,
+    거래일 내내 "이미 실행 중" 으로 기동이 막혔다. 상세 scripts/trend_lock.py.
+    """
+    rec = read_lock(LOCK_FILE)
+    if rec and int(rec.get("pid") or 0) != os.getpid():
+        if owner_alive(rec):
+            logger.error("[LOCK] 이미 실행 중 — %s", describe(rec))
             return False
-    LOCK_FILE.write_text(str(os.getpid()))
+        logger.warning("[LOCK] 죽은 락 정리 후 인수 — %s", describe(rec))
+    write_lock(LOCK_FILE)
     return True
 
 
 def release_lock() -> None:
+    """내 락일 때만 해제 — 남이 인수한 락을 지워 이중 기동을 만들지 않는다."""
     try:
-        if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+        if owned_by_me(read_lock(LOCK_FILE)):
             LOCK_FILE.unlink()
     except Exception:
         pass

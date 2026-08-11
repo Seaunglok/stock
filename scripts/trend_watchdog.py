@@ -21,6 +21,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/ → trend_lock
+
+from trend_lock import describe, owner_alive, read_lock   # noqa: E402  (stdlib+psutil 만 의존)
 
 # Windows 콘솔/리다이렉트 기본 cp949 → 이모지(⚠️·→) print 시 UnicodeEncodeError 로
 # watchdog 자체가 죽어 자동복구가 멈추는 것을 방지. utf-8·errors=replace 로 강제.
@@ -68,28 +71,9 @@ def port_up(port: int, host: str = "127.0.0.1", timeout: float = 1.5) -> bool:
         return False
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        import psutil
-        return psutil.pid_exists(pid)
-    except Exception:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-        except Exception:
-            return True
-
-
 def daemon_alive() -> bool:
-    if not LOCK_FILE.exists():
-        return False
-    try:
-        pid = int(LOCK_FILE.read_text().strip() or "0")
-    except Exception:
-        return False
-    return bool(pid) and _pid_alive(pid)
+    """락 소유자가 **우리 데몬으로** 살아있는지. PID 재사용이면 False (2026-08-11 장애)."""
+    return owner_alive(read_lock(LOCK_FILE))
 
 
 def heartbeat_stale() -> bool:
@@ -105,17 +89,28 @@ def heartbeat_stale() -> bool:
 
 
 def kill_daemon() -> None:
-    """lock PID(hung 데몬) 강제 종료 — 재기동 전 정리(신규 데몬 acquire_lock 위해)."""
-    try:
-        pid = int(LOCK_FILE.read_text().strip() or "0")
-    except Exception:
+    """hung 데몬 강제 종료 — **소유권 확인 후에만**.
+
+    2026-08-11: PID 재사용된 vmware-authd.exe 를 `taskkill /F /T` 로 죽이려 했다.
+    /T 는 프로세스 트리째 죽이므로, 확인 없는 kill 은 시스템을 망가뜨릴 수 있다.
+    """
+    rec = read_lock(LOCK_FILE)
+    if not rec:
         return
-    if pid:
+    if not owner_alive(rec):
+        # 우리 데몬이 아니거나 이미 죽음 → 죽일 대상 없음. 고착된 락만 치운다.
+        log(f"[DAEMON] 락 소유자가 데몬 아님/이미 종료 — kill 생략, 락 정리 ({describe(rec)})")
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=15)
-            log(f"[DAEMON] hung 데몬 PID={pid} 강제 종료")
-        except Exception as e:
-            log(f"[DAEMON] kill 예외: {e}")
+            LOCK_FILE.unlink()
+        except Exception:
+            pass
+        return
+    pid = int(rec["pid"])
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=15)
+        log(f"[DAEMON] hung 데몬 PID={pid} 강제 종료")
+    except Exception as e:
+        log(f"[DAEMON] kill 예외: {e}")
 
 
 def _detached_kwargs() -> dict:
@@ -131,7 +126,7 @@ def _detached_kwargs() -> dict:
 
 
 def start_servers() -> None:
-    log(f"[MCP] 필수 포트 다운 → stop(정리) 후 start (중복 세트 누적 방지)")
+    log("[MCP] 필수 포트 다운 → stop(정리) 후 start (중복 세트 누적 방지)")
     try:
         # 먼저 추적 중인(죽었을 수 있는) PID 정리 → 중복 서버 세트 누적 방지
         subprocess.run([sys.executable, "run_mcp_local.py", "stop"],

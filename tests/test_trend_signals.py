@@ -19,7 +19,6 @@ from src.mcp_servers.trend_mcp.signals import (
     moving_average,
     position_size,
     relative_strength,
-    trend_exit,
     volume_surge_ok,
 )
 
@@ -102,25 +101,32 @@ def test_entry_insufficient_data():
 
 # ── 청산 신호 ───────────────────────────────────────────────────────────────
 
-def test_trend_exit_stop():
-    d = trend_exit(100, current_price=92, ma_support=95, stop_price=93)
-    assert d["action"] == "SELL_ALL" and "이탈" in d["reason"]
+# 구 trend_exit() 의 4케이스를 exit_decision 으로 이관(2026-08-17 — trend_exit 제거).
+# 프로덕션 호출부가 0곳인데 청산 우선순위를 별도로 구현하고 있어, 라이브 규칙이 바뀔 때
+# 조용히 어긋나는 '세 번째 사다리'였다.
+def test_exit_stop_breach():
+    act, reason, _ = exit_decision(entry=100, cur=92, qty=10, target=130, stop=93,
+                                   partial_done=True, ma_exit=95)
+    assert act == "EXIT" and "트레일" in reason
 
 
-def test_trend_exit_ma_break():
-    d = trend_exit(100, current_price=94, ma_support=95, stop_price=80)  # stop 안 깨졌지만 MA 이탈
-    assert d["action"] == "SELL_ALL"
+def test_exit_ma_break_without_stop_breach():
+    act, reason, _ = exit_decision(entry=100, cur=94, qty=10, target=130, stop=80,
+                                   partial_done=True, ma_exit=95)
+    assert act == "EXIT" and "MA" in reason
 
 
-def test_trend_exit_foreign():
-    d = trend_exit(100, current_price=110, ma_support=95, stop_price=80,
-                   foreign_net_5d=-5, use_foreign_exit=True)
-    assert d["action"] == "SELL_ALL" and "외국인" in d["reason"]
+def test_exit_foreign_net_selling():
+    act, reason, _ = exit_decision(entry=100, cur=110, qty=10, target=130, stop=80,
+                                   partial_done=True, ma_exit=95,
+                                   foreign_net=-5, use_foreign=True)
+    assert act == "EXIT" and "외국인" in reason
 
 
-def test_trend_exit_hold():
-    d = trend_exit(100, current_price=110, ma_support=95, stop_price=90)
-    assert d["action"] == "HOLD"
+def test_exit_hold_when_all_clear():
+    act, _, _ = exit_decision(entry=100, cur=110, qty=10, target=130, stop=90,
+                              partial_done=True, ma_exit=95)
+    assert act is None
 
 
 # ── JH ZONE ─────────────────────────────────────────────────────────────────

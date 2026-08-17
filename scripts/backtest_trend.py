@@ -208,18 +208,22 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
 
 
 def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
-                   allow_pyramid: bool = True) -> list[float]:
-    """피라미딩: 초기 유닛 + 가격 상승 시 추가 유닛. 각 유닛의 net%(공통 트레일/MA 청산) 리스트 반환.
+                   allow_pyramid: bool = True) -> tuple[list[float], int]:
+    """피라미딩: 초기 유닛 + 가격 상승 시 추가 유닛 → **(유닛 net% 리스트, 보유 영업일수)**.
 
     부분익절 없음(불타기와 상충). 추가 유닛은 진입+ (k+1)×STEP_R×R 도달(장중 고가) 시 그 가격에 진입.
     모든 유닛은 동일 청산(트레일 이탈/MA 하방돌파/보유만기 종가)에서 빠진다 — 공통 트레일 스톱.
     allow_pyramid=False(레짐 게이트 미충족) 면 추가 유닛 없이 초기 1유닛만.
+
+    2026-08-17: 조기반환만 `[]`(리스트)를 돌려주고 정상경로는 2-튜플이라, 시가가 0/결측인
+    종목을 만나면 호출부의 `nets, held = ...` 언패킹이 ValueError 로 터져 A/B 실행 전체가
+    죽었다. 반환형을 튜플로 통일한다.
     """
     if i + 1 >= len(full):
-        return []
+        return [], 0
     entry = full[i + 1]["open"]
     if entry <= 0:
-        return []
+        return [], 0
     a = atr(full[:i + 1], cfg.atr_period)
     stop, _target = levels(entry, cfg, atr_value=a)     # 라이브와 동일 공식(단일 정본)
     exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support

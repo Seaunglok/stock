@@ -319,30 +319,6 @@ def foreign_net_signal(rows: list[dict], today: str, min_ratio: float = 0.2,
     return net
 
 
-# ─── 청산 신호 ──────────────────────────────────────────────────────────────
-
-def trend_exit(
-    entry_price: float,
-    current_price: float,
-    ma_support: float | None,
-    stop_price: float,
-    foreign_net_5d: float | None = None,
-    use_foreign_exit: bool = False,
-) -> dict:
-    """청산 판정: 트레일/손절 이탈 → 이평선(MA50) 하방돌파 → 외인 순매도전환 → 보유.
-
-    트레일 stop 갱신은 호출자가 ratchet_stop 으로 수행 후 stop_price 를 넘긴다.
-    """
-    pnl = (current_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
-    if stop_price > 0 and current_price <= stop_price:
-        return {"action": "SELL_ALL", "reason": f"트레일/손절 이탈 ({pnl:+.2f}%) — stop {stop_price:,.0f}"}
-    if ma_support is not None and current_price < ma_support:
-        return {"action": "SELL_ALL", "reason": f"이평선(MA지지) 하방돌파 ({pnl:+.2f}%)"}
-    if use_foreign_exit and foreign_net_5d is not None and foreign_net_5d < 0:
-        return {"action": "SELL_ALL", "reason": f"외국인 5일 순매도 전환 ({pnl:+.2f}%)"}
-    return {"action": "HOLD", "reason": f"보유 ({pnl:+.2f}%)"}
-
-
 # ─── JH ZONE (PDF 매매구역 모델) ─────────────────────────────────────────────
 
 def classify_zone(price: float, ma60: float | None, ma120: float | None, *,

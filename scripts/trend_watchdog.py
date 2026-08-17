@@ -35,6 +35,10 @@ for _s in (sys.stdout, sys.stderr):
 
 LOCK_FILE = ROOT / "data" / "trend_follow" / "daemon.lock"
 HEARTBEAT_FILE = ROOT / "data" / "trend_follow" / "daemon.heartbeat"
+# trend_config.HEARTBEAT_STALE_SEC 과 **같은 값이어야 한다**(= INTERVAL × 10).
+# 여기서 import 하지 않는 이유: watchdog 은 설정/도메인이 깨져도 떠야 하므로 stdlib+psutil 만
+# 의존한다(trend_config 는 signals→closing_bet→pykrx 까지 끌고 온다).
+# 대신 tests/test_trend_follow_helpers.py 가 두 값의 일치를 검증한다.
 HEARTBEAT_STALE_SEC = 600   # heartbeat 10분 이상 정체 → hung 판정(정상 screen 은 <2~3분, 60초마다 갱신)
 LOG_DIR = ROOT / "logs" / "trend_follow"
 LOG_DIR.mkdir(parents=True, exist_ok=True)

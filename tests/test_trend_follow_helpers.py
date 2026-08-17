@@ -130,3 +130,17 @@ def test_next_run_rolls_to_tomorrow_when_past():
     nxt = tf._next_run(0, 1)
     assert nxt.date() >= datetime.now().date()
     assert (nxt - datetime.now()).total_seconds() > 0
+
+
+# ─── heartbeat 주기 ↔ watchdog stale 임계 (두 파일에 흩어진 한 쌍) ─────────────
+def test_heartbeat_pair_consistent():
+    """watchdog 은 stdlib 만 의존해야 해서 임계값을 자기 파일에 literal 로 갖는다.
+    기록 주기만 늘리면 watchdog 이 정상 데몬을 hung 으로 오판해 taskkill /F /T 한다 —
+    한 쌍이라는 사실을 여기서 잠근다."""
+    import re
+    from trend_config import HEARTBEAT_INTERVAL_SEC, HEARTBEAT_STALE_SEC
+    assert HEARTBEAT_STALE_SEC == HEARTBEAT_INTERVAL_SEC * 10
+    src = (_ROOT / "scripts" / "trend_watchdog.py").read_text(encoding="utf-8")
+    m = re.search(r"^HEARTBEAT_STALE_SEC\s*=\s*(\d+)", src, re.M)
+    assert m and int(m.group(1)) == HEARTBEAT_STALE_SEC, \
+        f"watchdog({m.group(1) if m else '?'}) != config({HEARTBEAT_STALE_SEC})"

@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from trend_config import DATA_DIR, MARKET_URL, logger  # noqa: E402
+from trend_config import DATA_DIR, MARKET_URL, logger, setup_daemon_runtime  # noqa: E402
 
 MINUTE_DIR = DATA_DIR / "minute"
 INTERVAL = 5           # 5분봉 — 09:30/11:00 등 정각 시각을 정확히 집어낼 수 있는 최소 해상도
@@ -216,4 +216,5 @@ def main():
 
 
 if __name__ == "__main__":
+    setup_daemon_runtime()   # 파일로깅·소켓 타임아웃 (스크립트 진입점에서만)
     main()

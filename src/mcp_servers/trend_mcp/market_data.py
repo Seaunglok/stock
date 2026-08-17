@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -127,16 +127,38 @@ def _name(code: str) -> str:
     return code
 
 
-def _broad_codes() -> list[str]:
-    """KOSPI 시총상위 캐시(docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스.
+_BROAD_CACHE = _ROOT / "docs_cache" / "broad_universe.json"
+_BROAD_LIMIT = 150
 
-    scripts/backtest_dynamic.get_broad_universe 를 lazy import (sys.path 추가는 함수 내부 한정).
+
+def _broad_codes() -> list[str]:
+    """KOSPI 시총상위 ~150 (docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스.
+
+    2026-08-17: 과거엔 sys.path 에 scripts/ 를 끼워넣고 `backtest_dynamic.get_broad_universe`
+    를 import 했다. 순수 도메인이 스크립트를 의존하는 역방향 참조이자, 데몬의 유니버스 경로가
+    backtest_dynamic 을 통해 pykrx·FDR·closing_bet scorer 를 전이 import 하는 원인이었다
+    (이 파일 docstring 의 "외부 의존 없음" 이 사실이 아니게 된 지점). 구현을 여기로 가져오고
+    backtest_dynamic 이 이걸 쓰도록 방향을 뒤집었다.
     """
-    scripts_dir = str(_ROOT / "scripts")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    from backtest_dynamic import get_broad_universe  # 백테스트와 동일 유니버스
-    return get_broad_universe()
+    if _BROAD_CACHE.exists():
+        try:
+            codes = json.loads(_BROAD_CACHE.read_text(encoding="utf-8"))
+            if codes:
+                return codes
+        except Exception as e:
+            logger.warning("[UNIVERSE] broad 캐시 판독 실패(재생성): %s", e)
+    snaps = sorted((_ROOT / "docs_cache").glob("universe_kiwoom_*.json"), reverse=True)
+    if not snaps:
+        raise RuntimeError("docs_cache/universe_kiwoom_*.json 없음 — scripts/_universe_kiwoom.py 로 생성")
+    raw = json.loads(snaps[0].read_text(encoding="utf-8"))
+    kospi = [s for s in raw if s.get("market") in ("거래소", "KOSPI") and s.get("market_cap", 0) > 0]
+    kospi.sort(key=lambda s: -s["market_cap"])
+    codes = [str(s["code"]).zfill(6) for s in kospi[:_BROAD_LIMIT]]
+    try:
+        _BROAD_CACHE.write_text(json.dumps(codes, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("[UNIVERSE] broad 캐시 기록 실패(무시): %s", e)
+    return codes
 
 
 def get_universe(mode: str, top_n: int, watchlist: list[str],

@@ -26,8 +26,21 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))   # scripts/ → trend 패키지 import 가능
 
-from trend_config import *                  # noqa: F401,F403  env·상수·logger·CFG·paths·SCHEDULE
-from trend_config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
+from trend_config import (                  # noqa: E402  env·상수·logger·CFG·paths·SCHEDULE
+    # 스타 임포트였다(2026-08-17 전환). 상수 47개가 출처 없는 전역으로 들어와 "이 값이 어디서
+    # 오는가"를 추적할 수 없었고, `_ROOT`/`logger` 는 밑줄이라 스타에 안 실려 두 번째 import 를
+    # 하는 숨은 순서 의존까지 있었다. 실거래 파라미터를 읽는 코드에서 출처 불명은 그 자체가 위험.
+    ACCOUNT_NO, ADOPT_MODE, BREADTH_MIN_PCT, CFG, DAILY_LOSS_LIMIT_PCT, DATA_DIR,
+    ENTRY_CUTOFF, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA, FORCE_PHASE,
+    FOREIGN_TREND_MA, FUND_BONUS, HARD_STOP_PCT, HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
+    INTRADAY_POLL_MIN,
+    INVEST_PER_TRADE, JOURNAL_FILE, MAX_HOLD_DAYS, MAX_NOTIONAL_PCT, MAX_POS, MOCK_MODE,
+    POSITION_PCT, PREMARKET_GAPDOWN_VETO, PRODUCTION_MODE, PYRAMID_ADDS, PYRAMID_BYPASS_GATE,
+    PYRAMID_LOOKBACK, PYRAMID_MIN_NET, PYRAMID_STEP_R, REGIME_MA, RISK_PCT,
+    ROUNDTRIP_COST_PCT, SCHEDULE, SECTOR_BONUS, SECTOR_BREADTH, SECTOR_GATE, SECTOR_MIN_AVG,
+    SECTOR_TOP_K, SIZING_MODE, TRADING_URL, UNIVERSE_MODE, USE_FOREIGN_EXIT, WATCHLIST,
+    _ROOT, logger, setup_daemon_runtime,
+)
 from trend_kiwoom_io import (               # noqa: E402
     _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d,
     _is_unknown, _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
@@ -49,9 +62,6 @@ from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
 )
 
 # 설정·상수·CFG·paths·logger·SCHEDULE 는 trend_config 로 이동 (import * 로 노출)
-
-
-_is_rising = is_rising   # signals.is_rising 재노출(호출부 호환)
 
 
 async def phase_reconcile() -> None:
@@ -644,7 +654,7 @@ async def _execute_buys(cands: list[dict], positions: list[dict], slots: int,
                     continue
                 if ENTRY_WAIT_FALLING:
                     cur, opn = await _cur_and_open(c["symbol"])
-                    if not _is_rising(cur, opn):
+                    if not is_rising(cur, opn):
                         pending.append(c)
                         logger.info("[ENTRY] %s %-10s 하락중(현재%.0f<시가%.0f) → 보류",
                                     c["symbol"], c["name"][:10], cur, opn)
@@ -772,7 +782,7 @@ async def _try_pending() -> None:
                     still.append(c); continue
                 try:
                     cur, opn = await _cur_and_open(c["symbol"])
-                    if _is_rising(cur, opn):
+                    if is_rising(cur, opn):
                         pos = await _buy_one(mcp, c, mode_tag)
                         if pos:
                             positions.append(pos); bought.append(pos)
@@ -835,7 +845,7 @@ async def _pyramid_adds(when: str) -> None:
                     continue
                 if cur < trigger:
                     continue
-                if opn > 0 and not _is_rising(cur, opn):
+                if opn > 0 and not is_rising(cur, opn):
                     logger.info("[PYRAMID] %s 하락중(현재%.0f<시가%.0f) — 추가 보류(다음 cycle 재평가)",
                                 pos["symbol"], cur, opn)
                     continue
@@ -1140,7 +1150,7 @@ async def _heartbeat_loop() -> None:
     굶어 heartbeat 가 정체 → watchdog 이 stale 감지 후 재기동."""
     while True:
         _write_heartbeat()
-        await asyncio.sleep(60)
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
 async def scheduler_daemon() -> None:
@@ -1256,6 +1266,7 @@ def print_status() -> None:
 
 # ─── 진입점 ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    setup_daemon_runtime()   # 소켓 타임아웃·파일로깅·stdout UTF-8 (데몬 진입점에서만)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--phase", choices=["screen", "entry", "intraday", "exit", "reconcile",

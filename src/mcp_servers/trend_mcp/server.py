@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +89,7 @@ class TrendMCPServer(BaseMCPServer):
                 return self.create_standard_response(
                     success=True,
                     query=f"evaluate_entry_signal: mode={mode}",
-                    data=sig.to_dict() if hasattr(sig, "to_dict") else sig.__dict__,
+                    data=asdict(sig),   # TrendSignal 은 dataclass — to_dict 없음(구 분기 제거)
                 )
             except Exception as e:
                 return await self.create_error_response(

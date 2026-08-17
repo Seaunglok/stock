@@ -1,6 +1,15 @@
 """추세추종 데몬 공유 설정 — .env 로드 + 상수 + 로거 (scripts/trend_config.py).
 
-trend_follow.py / trend_kiwoom_io.py 가 공유. import 시 .env 로드 + 로깅 설정 1회.
+trend_follow.py / trend_kiwoom_io.py / 백테스트 / 대시보드가 공유한다.
+
+**부작용 정책**(2026-08-17): import 만으로 프로세스 전역을 바꾸는 것은
+`setup_daemon_runtime()` 안으로 모았다 — 소켓 기본 타임아웃, 루트 로거 점유, stdout 재설정.
+데몬 진입점만 이 함수를 부른다.
+
+이유: 대시보드가 이 모듈을 import 하지 않으려고 경로 상수·journal 파싱·state 로딩을
+통째로 복사해 두고 있었다(trend_dashboard.py 주석 "config.py 와 동일 파일명"). 부작용이
+부담스러우면 재사용 대신 복붙이 일어나고, 그러면 파일 포맷이 바뀔 때 한쪽만 조용히 어긋난다.
+상수·경로는 부작용 없이 import 가능해야 한다.
 """
 from __future__ import annotations
 
@@ -11,18 +20,9 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-# 네트워크 stall 방어(2026-07-02 08:50 screen hang → entry 누락 재발방지):
-# pykrx/DART 등 동기 네트워크 호출이 무한 hang 되면 async 데몬 전체가 얼어붙는다.
-# 소켓 read 30s 초과 시 예외 → 기존 try/except 가 graceful skip(종목 스킵/폴백). async httpx(MCP)는 자체 타임아웃 사용해 영향 없음.
-socket.setdefaulttimeout(30)
-
 _ROOT = Path(__file__).resolve().parents[1]   # scripts/trend_config.py → repo root
 if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+    sys.path.insert(0, str(_ROOT))            # src.* 절대 import 부트스트랩(불가피)
 
 from src.mcp_servers.trend_mcp import costs as _costs  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import TrendConfig  # noqa: E402
@@ -53,7 +53,7 @@ def _load_env() -> None:
             os.environ[k] = v
 
 
-_load_env()
+_load_env()   # 상수 계산에 필요하므로 이건 import 시점에 수행(파일 읽기 외 전역 변경 없음)
 
 # 외부 라이브러리 로그 억제
 logging.Handler.handleError = lambda self, record: None  # noqa: E731
@@ -177,20 +177,53 @@ CFG = TrendConfig(
 )
 
 DATA_DIR = _ROOT / "data" / "trend_follow"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)   # 경로만 쓰는 쪽도 쓰기 가능해야 함(무해·멱등)
 STATE_FILE = DATA_DIR / "state.json"
 LOCK_FILE = DATA_DIR / "daemon.lock"
 HEARTBEAT_FILE = DATA_DIR / "daemon.heartbeat"   # 데몬 진행 heartbeat — watchdog hang 감지용
+# heartbeat 기록 주기 ↔ watchdog stale 판정 임계는 **한 쌍**이다(임계 = 주기 × 10).
+# 2026-08-17 이전엔 60 이 trend_follow 에, 600 이 trend_watchdog 에 따로 있어서, 기록 주기를
+# 늘리면 watchdog 이 정상 데몬을 hung 으로 오판해 taskkill 하는 구조였다.
+HEARTBEAT_INTERVAL_SEC = 60
+HEARTBEAT_STALE_SEC = HEARTBEAT_INTERVAL_SEC * 10   # 정상 screen 은 <2~3분
 JOURNAL_FILE = DATA_DIR / "journal.json"
 LOG_DIR = _ROOT / "logs" / "trend_follow"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "trend_follow.log"
 
-_fh = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1, backupCount=30, encoding="utf-8")
-_fh.suffix = "%Y-%m-%d"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout), _fh])
 logger = logging.getLogger("trend")
+_RUNTIME_READY = False
+
+
+def setup_daemon_runtime() -> None:
+    """데몬/장기 실행 진입점 전용 초기화 — **프로세스 전역을 바꾸는 것만** 여기 모았다.
+
+    상수만 필요한 쪽(대시보드·백테스트·테스트)은 이 함수를 부르지 않고 import 만 하면 된다.
+    멱등 — 여러 번 불러도 안전하다.
+
+    하는 일:
+      · 소켓 기본 타임아웃 30s — pykrx/DART 동기 호출이 무한 hang 되면 async 데몬 전체가
+        얼어붙는다(2026-07-02 08:50 screen hang → entry 누락). 예외로 바뀌면 기존 try/except 가
+        graceful skip 한다. async httpx(MCP)는 자체 타임아웃이라 영향 없음.
+      · 로그 디렉터리/파일 핸들러(자정 회전·30일 보관) + 루트 로거 basicConfig
+      · stdout UTF-8 재설정 — Windows cp949 콘솔에서 이모지 출력 시 UnicodeEncodeError 로
+        데몬이 죽는 것 방지
+    """
+    global _RUNTIME_READY
+    if _RUNTIME_READY:
+        return
+    _RUNTIME_READY = True
+    socket.setdefaulttimeout(30)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _fh = TimedRotatingFileHandler(LOG_FILE, when="midnight", interval=1,
+                                   backupCount=30, encoding="utf-8")
+    _fh.suffix = "%Y-%m-%d"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                        handlers=[logging.StreamHandler(sys.stdout), _fh])
 
 # 진입 시각(HH:MM). 2026-08 09:30→11:00: 09~10시는 갭·시초 물량으로 일중 변동성이 가장 커
 # 슬리피지·휩소가 크다. 오전 변동성이 가라앉은 뒤 진입해 체결 품질을 높인다.

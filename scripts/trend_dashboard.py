@@ -7,9 +7,8 @@
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 import uvicorn
@@ -17,30 +16,19 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
-_ROOT = Path(__file__).parent.parent
-DATA_DIR = _ROOT / "data" / "trend_follow"
-STATE_FILE = DATA_DIR / "state.json"
-JOURNAL_FILE = DATA_DIR / "journal.json"   # config.py 와 동일 파일명
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/ → trend_* 모듈
 
-
-def _read_journal() -> list[dict]:
-    if not JOURNAL_FILE.exists():
-        return []
-    out = []
-    for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-    return out
+# 경로·파싱은 데몬과 **같은 구현**을 쓴다. 2026-08-17 이전엔 이 파일이 경로 상수·journal 파싱·
+# state 로딩을 통째로 복사해 뒀었다("config.py 와 동일 파일명" 이라는 주석까지 달린 채) —
+# 파일 포맷이 바뀌면 대시보드만 조용히 어긋나는 구조였다. trend_config 는 이제 import 부작용이
+# 없어(setup_daemon_runtime 미호출) 안전하게 재사용할 수 있다.
+from trend_runtime import journal_append, load_state, read_journal  # noqa: E402
 
 
 def _trades() -> list[dict]:
     """journal.jsonl → 거래(id)별 통합 뷰 (진입+부분+청산+메모)."""
     by_id: dict[str, dict] = defaultdict(lambda: {"partials": [], "notes": []})
-    for r in _read_journal():
+    for r in read_journal():
         jid = r.get("id")
         if not jid:
             continue
@@ -65,7 +53,11 @@ def _trades() -> list[dict]:
 
 
 async def api_state(request):
-    st = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+    try:
+        st = load_state()
+    except Exception as e:            # StateCorrupted 포함 — 대시보드가 500 으로 죽지 않게
+        return JSONResponse({"positions": [], "candidates": [], "updated": "",
+                             "error": f"state 판독 실패: {e}"}, status_code=200)
     return JSONResponse({"positions": st.get("positions", []), "candidates": st.get("candidates", []),
                          "updated": st.get("last_updated", "")})
 
@@ -91,11 +83,8 @@ async def api_note(request):
     jid = body.get("id")
     if not jid:
         return JSONResponse({"ok": False, "error": "id 필요"}, status_code=400)
-    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "type": "note", "id": jid,
-           "psych": body.get("psych", ""), "mistake": body.get("mistake", ""), "improve": body.get("improve", "")}
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with JOURNAL_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    journal_append({"type": "note", "id": jid, "psych": body.get("psych", ""),
+                    "mistake": body.get("mistake", ""), "improve": body.get("improve", "")})
     return JSONResponse({"ok": True})
 
 

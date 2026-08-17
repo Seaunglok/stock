@@ -41,26 +41,16 @@ def _suppress():
     return contextlib.redirect_stdout(io.StringIO())
 
 
-_BROAD_UNIVERSE_CACHE = CACHE_DIR / "broad_universe.json"
-
-
 def get_broad_universe() -> list[str]:
-    """KOSPI 시가총액 상위 ~150종목 (kiwoom universe cache 기반)."""
-    if _BROAD_UNIVERSE_CACHE.exists():
-        return json.loads(_BROAD_UNIVERSE_CACHE.read_text(encoding="utf-8"))
+    """KOSPI 시가총액 상위 ~150종목 (kiwoom universe cache 기반).
 
-    cache_dir = Path(__file__).parent.parent / "docs_cache"
-    candidates = sorted(cache_dir.glob("universe_kiwoom_*.json"), reverse=True)
-    if not candidates:
-        raise RuntimeError("docs_cache/universe_kiwoom_*.json 파일이 없습니다")
-
-    raw = json.loads(candidates[0].read_text(encoding="utf-8"))
-    # KOSPI(거래소)만 + 시총 정렬 상위 150
-    kospi = [s for s in raw if s.get("market") in ("거래소", "KOSPI") and s.get("market_cap", 0) > 0]
-    kospi.sort(key=lambda s: -s["market_cap"])
-    codes = [str(s["code"]).zfill(6) for s in kospi[:150]]
-    _BROAD_UNIVERSE_CACHE.write_text(json.dumps(codes, ensure_ascii=False), encoding="utf-8")
-    return codes
+    2026-08-17: 구현이 trend_mcp.market_data 로 이동했다. 과거엔 반대 방향이었다 —
+    순수 도메인(market_data)이 sys.path 에 scripts/ 를 끼워넣고 이 함수를 import 해서,
+    데몬의 유니버스 조회가 이 모듈(pykrx·FDR·closing_bet scorer)을 전이 import 했다.
+    라이브와 백테스트가 **동일 유니버스**를 쓴다는 성질은 그대로 유지된다.
+    """
+    from src.mcp_servers.trend_mcp.market_data import _broad_codes
+    return _broad_codes()
 
 
 def get_top50_by_date(yyyymmdd: str, broad: dict[str, list[dict]]) -> list[tuple[str, float]]:

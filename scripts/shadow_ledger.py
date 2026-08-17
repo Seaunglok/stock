@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from trend_config import DATA_DIR, ENTRY_TIME, logger  # noqa: E402
+from trend_config import DATA_DIR, ENTRY_TIME, logger, setup_daemon_runtime  # noqa: E402
 
 from src.mcp_servers.trend_mcp.market_data import get_ohlcv  # noqa: E402
 
@@ -547,4 +547,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    setup_daemon_runtime()   # 파일로깅·소켓 타임아웃 (스크립트 진입점에서만)
     main()

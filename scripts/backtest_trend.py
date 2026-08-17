@@ -33,11 +33,52 @@ with contextlib.redirect_stdout(io.StringIO()):
 from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs, metrics              # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
+from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, entry_signal, atr, levels, moving_average, relative_strength,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억
+
+
+def apply_live_mirror(cfg: TrendConfig) -> list[str]:
+    """백테스트 노브를 **지금 실제로 도는 라이브 설정**에 맞춘다 → 미러 못 한 항목 목록 반환.
+
+    2026-08-17 이전엔 V_ 노브 기본값이 전부 off 라, 무플래그 실행이 라이브와 다른 전략을
+    돌리고 있었다:
+
+        항목            무플래그 백테스트      라이브(.env/기본값)
+        청산 이평선     MA50 (cfg.ma_support)  MA120
+        하드손절        없음                   -10%
+        눌림목 게이트   3%                     12%
+        breadth 게이트  없음                   0.4
+        레짐 게이트     없음                   KOSPI>MA60
+        외인 청산       없음                   ON
+
+    그 상태로 산출한 기대값을 문서에 '검증 완료'로 적어 왔다. 실전 성과를 그 숫자와 비교해
+    판단해 온 근거가 어긋나 있었다는 뜻이다. 기본을 라이브 미러로 바꿔, 무플래그 실행이
+    곧 '우리 전략의 백테스트'가 되게 한다. A/B 함수들은 여기서 명시적으로 이탈시킨다.
+    """
+    global V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT, V_REGIME_MA, V_FOREIGN_TREND_MA
+    from trend_config import (                      # 지연 import — 모듈 로드 시 .env/로깅 부작용 회피
+        BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, FOREIGN_TREND_MA, HARD_STOP_PCT,
+        MAX_HOLD_DAYS, REGIME_MA, USE_FOREIGN_EXIT,
+    )
+    V_EXIT_MA = EXIT_MA
+    V_HARD_STOP_PCT = HARD_STOP_PCT
+    V_BREADTH_MIN_PCT = BREADTH_MIN_PCT or None
+    V_REGIME_MA = REGIME_MA or None
+    V_FOREIGN_TREND_MA = FOREIGN_TREND_MA
+    cfg.pullback_pct = LIVE.pullback_pct
+    cfg.atr_k, cfg.stop_pct = LIVE.atr_k, LIVE.stop_pct
+    cfg.rr, cfg.partial_pct = LIVE.rr, LIVE.partial_pct
+    if MAX_HOLD_DAYS > 0:
+        cfg.max_hold = MAX_HOLD_DAYS
+    gaps = []
+    if USE_FOREIGN_EXIT:
+        # ka10008 외인 이력은 키움 MCP 조회가 필요하고 커버리지도 ~50영업일뿐이라 전 구간 미러 불가.
+        gaps.append("외인 청산 ON — 일봉만으로는 재현 불가(`--foreignexit` 로 별도 검증)")
+    return gaps
 
 
 def _gap_pct(full: list[dict], i: int) -> float:
@@ -851,9 +892,11 @@ def main():
     p.add_argument("--end", default="2026-05-31")
     p.add_argument("--watchlist", default="005930,000660")
     p.add_argument("--top-n", type=int, default=None)
-    p.add_argument("--tax-bps", type=float, default=18.0)
-    p.add_argument("--fee-bps", type=float, default=1.5)
-    p.add_argument("--slippage-bps", type=float, default=10.0)
+    # 기본값은 라이브와 동일한 단일 소스(trend_mcp.costs). 과거 18bps 하드코딩 탓에
+    # 매매일지 net_pct(왕복 0.43%)와 검증 기대값(0.41%)이 비교 불가능한 수치였다.
+    p.add_argument("--tax-bps", type=float, default=COSTS.TAX_BPS)
+    p.add_argument("--fee-bps", type=float, default=COSTS.FEE_BPS)
+    p.add_argument("--slippage-bps", type=float, default=COSTS.SLIPPAGE_BPS)
     p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
     p.add_argument("--abtest", action="store_true", help="검증대기 항목 A/B 비교(첫익절/청산선/하드손절)")
     p.add_argument("--rstest", action="store_true", help="RS 게이트 A/B 비교(절대값 vs 상위 20/30/40%)")
@@ -867,12 +910,24 @@ def main():
     p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
     p.add_argument("--foreignexit", action="store_true", help="외인 청산룰 A/B(off/부호만/임계 0.2·0.5) — investor-domain 필요")
     p.add_argument("--regimetest", action="store_true", help="시장 레짐/변동성 필터 A/B(KOSPI>MA · 변동성 상한)")
+    p.add_argument("--legacy-defaults", action="store_true",
+                   help="라이브 미러 없이 구 기본값(MA50·게이트 전부 off·눌림 3%%)으로 실행 — 과거 수치 재현용")
     args = p.parse_args()
 
     cfg = TrendConfig(mode=args.mode)
     cfg_top = args.top_n or (30 if args.mode == "gainers" else 100)
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
     watch = [c.strip() for c in args.watchlist.split(",") if c.strip()]
+
+    # 기본 = 라이브 미러. "무플래그 백테스트 = 우리 전략의 백테스트" 가 성립해야 한다.
+    if args.legacy_defaults:
+        print("⚠️ --legacy-defaults: 라이브와 다른 구 설정(MA50·게이트 off·눌림 3%)으로 실행합니다.")
+    else:
+        gaps = apply_live_mirror(cfg)
+        print(f"라이브 미러: 청산MA{V_EXIT_MA} · 하드손절 {V_HARD_STOP_PCT:g}% · 눌림 {cfg.pullback_pct:g}% · "
+              f"breadth {V_BREADTH_MIN_PCT or 'off'} · 레짐 MA{V_REGIME_MA or 'off'} · 보유상한 {cfg.max_hold}일")
+        for g in gaps:
+            print(f"  ※ 미러 불가: {g}")
 
     if args.abtest:
         report_abtest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")

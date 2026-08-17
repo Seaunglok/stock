@@ -44,6 +44,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs                       # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
+from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, atr, entry_signal, levels, moving_average,
 )
@@ -180,8 +181,12 @@ def _signal(code, date_str, full, kospi_upto, cfg):
 
 # ─── 시뮬레이션 ───────────────────────────────────────────────────────────────
 def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, sz: Sizing,
-             max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str]) -> Result:
-    """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일."""
+             max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str],
+             hard_stop_pct: float = 0.0) -> Result:
+    """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
+
+    hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
+    """
     dates, bars, closes, ordered = _load(start, end, top_n)
     buy_f = 1 + (costs.fee + costs.slip) / 100.0             # 매수 체결가 가산(수수료+슬리피지)
     sell_f = 1 - (costs.tax + costs.fee + costs.slip) / 100.0  # 매도 체결가 차감(세금+수수료+슬리피지)
@@ -249,10 +254,13 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                     p.partial_done = True
             # (b) 트레일 갱신(종가)
             p.peak, p.stop = ratchet_stop(p.entry, p.peak, p.stop, b["close"], p.atr0, cfg.atr_k, -cfg.stop_pct)
-            # (c) 트레일/손절 이탈 — 장중 저가
-            if b["low"] <= p.stop:
-                cash += p.shares * p.stop * sell_f
-                res.closed.append((p.stop - p.entry) / p.entry * 100)
+            # (c) 트레일/손절 이탈 — 장중 저가. 하드손절은 트레일의 **바닥값**으로 적용
+            #     (2026-08-17 추가: 라이브엔 HARD_STOP_PCT=10 이 있는데 이 하니스엔 없었다.
+            #      사이징·MDD·Sharpe 를 하드손절 없는 전략으로 측정해 온 셈이다.)
+            eff_stop = max(p.stop, p.entry * (1 - hard_stop_pct / 100.0)) if hard_stop_pct > 0 else p.stop
+            if b["low"] <= eff_stop:
+                cash += p.shares * eff_stop * sell_f
+                res.closed.append((eff_stop - p.entry) / p.entry * 100)
                 exited = True
             if not exited:
                 # (d) MA120 종가 이탈
@@ -355,7 +363,8 @@ def statistics_pstdev(xs: list[float]) -> float:
 
 # ─── 리포트 ──────────────────────────────────────────────────────────────────
 def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
-           max_pos: int, base_pct: float, risk_pct: float, sector_cap: int) -> None:
+           max_pos: int, base_pct: float, risk_pct: float, sector_cap: int,
+           hard_stop: float = 0.0) -> None:
     secmap = _sector_map()
     _SIG_MEMO.clear()
     dates, *_ = _load(start, end, top_n)
@@ -379,7 +388,8 @@ def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
           f"{'Sharpe':>7} {'청산승률':>7} {'거래':>5} {'평균보유':>7} {'섹터거절':>7}")
     rows = []
     for label, sizing, cap, partial in variants:
-        res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, cap, partial, secmap)
+        res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, cap, partial, secmap,
+                       hard_stop_pct=hard_stop)
         m = pmetrics(res, dl)
         rows.append((label, m))
         mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
@@ -401,15 +411,32 @@ def main():
     p.add_argument("--position-pct", type=float, default=15.0)
     p.add_argument("--risk-pct", type=float, default=1.0)
     p.add_argument("--sector-cap", type=int, default=2)
-    p.add_argument("--tax-bps", type=float, default=20.0)
-    p.add_argument("--fee-bps", type=float, default=1.5)
-    p.add_argument("--slippage-bps", type=float, default=10.0)
+    p.add_argument("--tax-bps", type=float, default=COSTS.TAX_BPS)      # 라이브와 단일 소스
+    p.add_argument("--fee-bps", type=float, default=COSTS.FEE_BPS)
+    p.add_argument("--slippage-bps", type=float, default=COSTS.SLIPPAGE_BPS)
+    p.add_argument("--legacy-defaults", action="store_true",
+                   help="라이브 미러 없이 구 설정(MA50 청산·하드손절 off·눌림 3%%)으로 실행")
     args = p.parse_args()
 
     cfg = TrendConfig(mode="largecap")
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
+    # 기본 = 라이브 미러. 이 하니스는 사이징·MDD 판단의 근거라, 라이브와 다른 청산룰로 돌면
+    # "리스크 균등 사이징이 MDD 를 줄인다" 같은 결론 자체가 다른 전략의 결론이 된다.
+    hard_stop = 0.0
+    if args.legacy_defaults:
+        print("⚠️ --legacy-defaults: 구 설정(MA50·하드손절 off·눌림 3%)으로 실행합니다.")
+    else:
+        from trend_config import CFG as LIVE, EXIT_MA, HARD_STOP_PCT, MAX_HOLD_DAYS
+        cfg.ma_slow = EXIT_MA                    # 청산 이평선(라이브 MA120)
+        cfg.pullback_pct = LIVE.pullback_pct
+        cfg.atr_k, cfg.stop_pct, cfg.rr, cfg.partial_pct = LIVE.atr_k, LIVE.stop_pct, LIVE.rr, LIVE.partial_pct
+        if MAX_HOLD_DAYS > 0:
+            cfg.max_hold = MAX_HOLD_DAYS
+        hard_stop = HARD_STOP_PCT
+        print(f"라이브 미러: 청산MA{cfg.ma_slow} · 하드손절 {hard_stop:g}% · 눌림 {cfg.pullback_pct:g}% · "
+              f"보유상한 {cfg.max_hold}일   ※ 외인 청산은 일봉 재현 불가로 미반영")
     report(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
-           args.position_pct, args.risk_pct, args.sector_cap)
+           args.position_pct, args.risk_pct, args.sector_cap, hard_stop=hard_stop)
 
 
 if __name__ == "__main__":

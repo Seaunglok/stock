@@ -24,6 +24,7 @@ try:
 except Exception:
     pass
 
+from src.mcp_servers.trend_mcp import costs as _costs  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import TrendConfig  # noqa: E402
 
 
@@ -138,13 +139,13 @@ SECTOR_GATE = os.getenv("TREND_SECTOR_GATE", "false").lower() == "true"
 SECTOR_MIN_AVG = float(os.getenv("TREND_SECTOR_MIN_AVG", "1.0"))     # 주도 판정: 섹터 평균 등락률 하한 %
 SECTOR_BREADTH = float(os.getenv("TREND_SECTOR_BREADTH", "0.6"))    # 주도 판정: 상승종목 비율 하한 (집단상승)
 SECTOR_TOP_K = int(os.getenv("TREND_SECTOR_TOP_K", "3"))
-# 거래비용 (편도 bps). 거래세는 정부 정책 가변 → 보수 20bps(코스피 0.20%·코스닥 0.20%, 2026 기준).
-# 키움 비대면 위탁수수료 0.015% 편도, 대형주 시장가 슬리피지 0.10% 편도 (실전 첫주 후 보정).
-# 환경변수 prefix CLOSING_BET_* 공용(과거 잔존, 변경하면 closing-bet 도 영향). 실전에선 .env 로 override.
-TAX_BPS = float(os.getenv("CLOSING_BET_TAX_BPS", "20.0"))
-FEE_BPS = float(os.getenv("CLOSING_BET_FEE_BPS", "1.5"))
-SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
-ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0  # 매도세 + 2×수수료 + 2×슬리피지
+# 거래비용 (편도 bps) — 기본값은 trend_mcp.costs 단일 소스(백테스트와 동일 숫자).
+# 2026-08-17: 과거엔 CLOSING_BET_* 를 공용으로 읽어 ① 종가매매 비용을 바꾸면 추세추종 손익이
+# 같이 움직였고 ② 백테스트 기본값(18bps)과 달라 매매일지 net_pct 와 검증 기대값이 비교 불가였다.
+TAX_BPS = float(os.getenv("TREND_TAX_BPS") or _costs.TAX_BPS)
+FEE_BPS = float(os.getenv("TREND_FEE_BPS") or _costs.FEE_BPS)
+SLIPPAGE_BPS = float(os.getenv("TREND_SLIPPAGE_BPS") or _costs.SLIPPAGE_BPS)
+ROUNDTRIP_COST_PCT = _costs.roundtrip_pct(TAX_BPS, FEE_BPS, SLIPPAGE_BPS)
 FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
 # 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "2") or 0)

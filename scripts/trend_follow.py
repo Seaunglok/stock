@@ -309,12 +309,17 @@ def _save_pending(items: list[dict]) -> None:
     save_state("pending_date", datetime.now().strftime("%Y-%m-%d"))
 
 
-def _busdays_since(buy_date: str | None) -> int:
-    """buy_date 이후 경과 영업일 수(주말 제외 근사 — 공휴일 미반영). 시간청산(MAX_HOLD_DAYS) 판정용."""
+def _busdays_since(buy_date: str | None) -> int | None:
+    """buy_date 이후 경과 영업일 수(주말 제외 근사 — 공휴일 미반영). 시간청산(MAX_HOLD_DAYS) 판정용.
+
+    파싱 실패 시 **None**(판정 불가). 과거엔 0 을 돌려줘 MAX_HOLD 시간청산이 그 종목에 대해
+    영원히 발동하지 않았다 — 무기한 보유가 조용히 성립한다.
+    """
     try:
         d0 = datetime.strptime(str(buy_date), "%Y-%m-%d").date()
     except Exception:
-        return 0
+        logger.warning("[HOLD] buy_date 파싱 실패(%r) — 보유기간 판정 불가", buy_date)
+        return None
     d1 = datetime.now().date()
     return sum(1 for i in range(1, (d1 - d0).days + 1)
                if (d0 + timedelta(days=i)).weekday() < 5)
@@ -331,11 +336,16 @@ async def _circuit_broken() -> tuple[bool, str]:
     realized = 0.0
     try:
         for line in JOURNAL_FILE.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
             r = json.loads(line)
             if r.get("type") == "exit" and str(r.get("ts", "")).startswith(today):
                 realized += r.get("entry_price", 0) * r.get("qty", 0) * r.get("net_pct", 0) / 100.0
-    except Exception:
-        return False, ""
+    except Exception as e:
+        # fail-CLOSED: 당일 손실을 알 수 없으면 서킷이 이미 발동했을 수도 있다.
+        # 과거엔 (False,"") 를 돌려줘, 일지가 안 읽히는 순간 서킷이 조용히 무력화됐다.
+        logger.error("[CIRCUIT] 매매일지 판독 실패 — 신규 진입 차단(안전측): %s", e)
+        return True, f"일일손실 판정 불가(매매일지 판독 실패: {str(e)[:60]})"
     if realized >= 0:
         return False, ""
     equity, _ = await _account_equity()
@@ -398,7 +408,13 @@ async def _verify_buy_fills(bought: list[dict], positions: list[dict]) -> tuple[
     try:
         held = await _broker_holdings()
     except Exception as e:
-        logger.warning("[VERIFY] broker 조회 실패 — fill 검증 스킵: %s", e)
+        # 검증 스킵은 '미체결분이 실포지션으로 등록된 채 남는' 결과가 된다 — 조용히 넘기면 안 된다.
+        # state 는 그대로 두되(팔 것도 없는데 지우면 실보유를 놓친다) 사람이 볼 수 있게 알린다.
+        logger.error("[VERIFY] broker 조회 실패 — 체결 검증 불가: %s", e)
+        log_event("fill_unverified", {"symbols": [p["symbol"] for p in bought], "why": str(e)[:120]})
+        await notify("⚠️ <b>체결 검증 불가</b> — broker 잔고 조회 실패\n"
+                     + "\n".join(f"• {p['name']}({p['symbol']}) {p['qty']}주" for p in bought)
+                     + "\n→ HTS 로 실보유 수량 대조 권장", critical=True)
         return bought, positions
     held_map = {h["symbol"]: h["qty"] for h in held}
     fixed_bought, removed, partial = [], [], []
@@ -693,13 +709,18 @@ async def phase_entry() -> None:
 
 
 def _past_entry_cutoff() -> bool:
-    """진입 마감 시각(PDF 09:30~10:30) 경과 여부."""
+    """진입 마감 시각(TREND_ENTRY_CUTOFF) 경과 여부.
+
+    파싱 실패 시 **True**(경과로 간주 = 진입 차단). 과거엔 False 를 돌려줘, 설정이 깨지면
+    컷오프가 조용히 사라지고 장 마감까지 진입이 허용됐다 — 안전장치는 실패 시 닫혀야 한다.
+    """
     try:
         ch, cm = map(int, ENTRY_CUTOFF.split(":"))
         now = datetime.now()
         return now >= now.replace(hour=ch, minute=cm, second=0, microsecond=0)
     except Exception:
-        return False
+        logger.error("[ENTRY] 컷오프 파싱 실패(%r) — 진입 차단(안전측)", ENTRY_CUTOFF)
+        return True
 
 
 async def _try_pending() -> None:
@@ -747,22 +768,31 @@ async def _try_pending() -> None:
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
-                return
+                return                       # 아무것도 안 샀으므로 보류분 그대로 둔다
             for c in pending:
                 if len(bought) >= slots:
                     still.append(c); continue
-                cur, opn = await _cur_and_open(c["symbol"])
-                if _is_rising(cur, opn):
-                    pos = await _buy_one(mcp, c, mode_tag)
-                    if pos:
-                        positions.append(pos); bought.append(pos)
-                        save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 방지
+                try:
+                    cur, opn = await _cur_and_open(c["symbol"])
+                    if _is_rising(cur, opn):
+                        pos = await _buy_one(mcp, c, mode_tag)
+                        if pos:
+                            positions.append(pos); bought.append(pos)
+                            save_state("positions", positions)   # 체결 즉시 영속화 — 이후 예외 시 유령 방지
+                        else:
+                            still.append(c)
                     else:
                         still.append(c)
-                else:
+                except Exception as e:       # 한 종목 실패가 나머지 후보를 막지 않게
+                    logger.error("[PENDING] %s 처리 실패 — 보류 유지: %s", c.get("symbol"), e)
                     still.append(c)
     except Exception as e:
-        logger.error("[PENDING] %s", e); return
+        # 미처리분은 보류로 되돌린다(신호는 당일 한정이라 잃어도 안전측이지만, 매수분은 반드시 뺀다).
+        done = {p["symbol"] for p in bought} | {c["symbol"] for c in still}
+        still += [c for c in pending if c["symbol"] not in done]
+        logger.error("[PENDING] %s", e)
+    # ★ 아래 3줄은 예외 여부와 무관하게 실행돼야 한다. 과거엔 except 에서 return 해버려
+    #   이미 매수한 종목이 pending 에 남았고, 다음 intraday 폴링이 그대로 재매수했다.
     bought, positions = await _verify_buy_fills(bought, positions)
     save_state("positions", positions)
     _save_pending(still)
@@ -872,8 +902,10 @@ async def _exit_signals(pos: dict, cur: float) -> dict:
         if ma_trend is None and foreign is not None:
             logger.info("[FOREIGN] %s MA%d 산출 불가 — 추세확인 불가로 외인룰 스킵", sym, FOREIGN_TREND_MA)
             foreign = None
-    # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지
-    aged = MAX_HOLD_DAYS > 0 and _busdays_since(pos.get("buy_date")) >= MAX_HOLD_DAYS
+    # 시간청산 — 백테스트 max_hold(60영업일 강제 마감)와 동일 조건 유지.
+    # buy_date 파싱 실패(None)면 판정 불가 → 미적용(다른 신호들과 같은 fail-open). 경고는 남는다.
+    held_days = _busdays_since(pos.get("buy_date"))
+    aged = MAX_HOLD_DAYS > 0 and held_days is not None and held_days >= MAX_HOLD_DAYS
     return {"ma_exit": ma_exit, "foreign": foreign, "ma_trend": ma_trend, "aged": aged}
 
 
@@ -885,11 +917,15 @@ def _exit_line(x: dict) -> str:
 
 
 async def _manage_alerts(when: str, closed: list[dict], sell_failures: list[dict],
-                         price_fails: list[str]) -> None:
-    """포지션 관리 후 알림 — 시세조회 실패·매도거부 누적·청산 요약."""
+                         price_fails: list[str], eval_fails: list[str] | None = None) -> None:
+    """포지션 관리 후 알림 — 시세조회 실패·평가 실패·매도거부 누적·청산 요약."""
     # 청산 phase 에서 시세조회 실패 = 청산 기회를 침묵 속에 놓칠 수 있음 → 알림
     if price_fails and when == "exit":
         await notify("⚠️ 청산 phase 시세조회 실패 — 청산판정 보류(다음 cycle 재시도): " + ", ".join(price_fails))
+    # 평가 자체가 실패한 종목 = 청산 신호가 있었는지조차 모른다 → 시세실패보다 심각
+    if eval_fails:
+        await notify(f"🚨 <b>[{when}] 청산판정 실패 {len(eval_fails)}종</b> — 해당 종목은 이번 cycle 미평가\n"
+                     + ", ".join(eval_fails) + "\n→ 로그 확인 후 필요 시 HTS 수동 대응", critical=True)
     # 매도 거부 누적이 임계치 초과(시도 절반 이상 또는 3건+) → 시스템적 문제 가능성 → critical alert
     attempts = len(closed) + len(sell_failures)
     if sell_failures and (len(sell_failures) >= 3 or len(sell_failures) >= attempts / 2):
@@ -926,6 +962,13 @@ async def _sell_with_retry(mcp, when: str, sym: str, qty: int) -> tuple[Any, boo
 
 
 async def _manage(do_exit_signals: bool, when: str) -> None:
+    """보유 포지션 트레일 갱신 + 청산 판정/집행.
+
+    예외 처리 원칙(2026-08-17): **한 종목의 실패가 나머지 포지션의 손절을 막지 않는다.**
+    과거엔 루프 전체를 감싼 except 가 `return` 해버려, 3번째 종목에서 예외가 나면 4·5번은
+    평가조차 안 되고 로그 한 줄만 남았다 — 트레일 갱신도 폐기되고, 누적 매도거부 critical
+    알림(_manage_alerts)도 발송되지 않았다. 손절 대기 중인 포지션이 방치되는 경로다.
+    """
     positions = get_state("positions", [])
     if not positions:
         return
@@ -933,70 +976,90 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     closed = []
     sell_failures: list[dict] = []   # phase 내 매도 거부 누적 (8005/거부/예외) — 임계 초과 시 critical alert
     price_fails: list[str] = []      # 시세조회 실패 종목 — exit phase 면 알림(무경고 HOLD 방지)
+    eval_fails: list[str] = []       # 종목 단위 평가 실패 — 청산판정이 아예 안 된 종목
+    async def handle(mcp, idx: int, pos: dict) -> None:
+        """포지션 1건: 트레일 갱신 → 청산판정 → 집행. 공유 리스트에 결과를 모은다."""
+        sym, entry, qty = pos["symbol"], pos["entry_price"], int(pos["qty"])
+        cur = await _realtime_price(sym)
+        if not cur:
+            # entry 폴백은 pnl 0 으로 위장돼 트레일/손절이 침묵 — 최소한 경고는 남긴다
+            price_fails.append(f"{pos['name']}({sym})")
+            logger.warning("[%s] %s 시세조회 실패 — entry 폴백(청산판정 보류)", when, sym)
+            cur = entry
+        a = float(pos.get("atr", 0) or 0)
+        peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
+        pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
+        sig = await _exit_signals(pos, cur) if do_exit_signals else {}
+        action, reason, sell_qty = exit_decision(
+            entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
+            partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
+            partial_pct=CFG.partial_pct, exit_ma_label=EXIT_MA,
+            use_foreign=USE_FOREIGN_EXIT, trend_ma_label=FOREIGN_TREND_MA,
+            ma_exit=sig.get("ma_exit"), foreign_net=sig.get("foreign"),
+            ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False))
+        if not action:
+            remaining.append(pos); return
+        resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
+        if not ok:
+            logger.error("[REJECT] %s %s 매도 거부 (재시도 후에도 실패) — %s", when, sym, why)
+            log_event("order_reject", {"phase": when, "symbol": sym, "qty": sell_qty,
+                                       "reason": reason, "why": why, "raw": resp})
+            # 매도 거부는 시장 노출 직결 → critical alert (개별 알림)
+            await notify(f"🚨 <b>매도 거부</b> [{when}] {pos['name']}({sym}) {sell_qty}주 "
+                         f"@{cur:,.0f} 사유:{reason}\n원인:{why}\n→ HTS 수동매도 검토",
+                         critical=True)
+            sell_failures.append({"symbol": sym, "name": pos["name"], "qty": sell_qty,
+                                  "reason": reason, "why": why})
+            remaining.append(pos); return
+        pnl_pct = round((cur - entry) / entry * 100, 2)
+        if action == "PARTIAL":
+            pos["partial_done"] = True; pos["qty"] = qty - sell_qty
+            remaining.append(pos)
+            save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
+            journal_append({"type": "partial", "id": pos["journal_id"], "symbol": sym, "qty": sell_qty,
+                            "price": cur, "pnl_pct": pnl_pct, "reason": reason})
+            log_event("partial", {"symbol": sym, "qty": sell_qty, "price": cur, "pnl_pct": pnl_pct})
+            await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{cur:,.0f} "
+                         f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
+        else:
+            save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
+            hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
+            net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
+            rr_real = round((cur - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
+            pnl_amt = round((cur - entry) * sell_qty)
+            closed.append({"pos": pos, "cur": cur, "net": net, "reason": reason, "qty": sell_qty,
+                           "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
+            journal_append({"type": "exit", "id": pos["journal_id"], "symbol": sym, "name": pos["name"],
+                            "qty": sell_qty, "entry_price": entry, "exit_price": cur, "pnl_pct": pnl_pct,
+                            "net_pct": net, "pnl_amount": round((cur - entry) * sell_qty), "rr_realized": rr_real,
+                            "reason": reason, "hold_days": hold_days})
+            log_event("exit", {"symbol": sym, "exit": cur, "net_pct": net, "reason": reason})
+
+    processed = 0
     try:
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             if not mcp.tools:
                 logger.warning("[%s] trading-domain 연결 실패", when); return
             for idx, pos in enumerate(positions):
-                sym, entry, qty = pos["symbol"], pos["entry_price"], int(pos["qty"])
-                cur = await _realtime_price(sym)
-                if not cur:
-                    # entry 폴백은 pnl 0 으로 위장돼 트레일/손절이 침묵 — 최소한 경고는 남긴다
-                    price_fails.append(f"{pos['name']}({sym})")
-                    logger.warning("[%s] %s 시세조회 실패 — entry 폴백(청산판정 보류)", when, sym)
-                    cur = entry
-                a = float(pos.get("atr", 0) or 0)
-                peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
-                pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
-                sig = await _exit_signals(pos, cur) if do_exit_signals else {}
-                action, reason, sell_qty = exit_decision(
-                    entry=entry, cur=cur, qty=qty, target=pos["target"], stop=stop,
-                    partial_done=bool(pos.get("partial_done")), hard_stop_pct=HARD_STOP_PCT,
-                    partial_pct=CFG.partial_pct, exit_ma_label=EXIT_MA,
-                    use_foreign=USE_FOREIGN_EXIT, trend_ma_label=FOREIGN_TREND_MA,
-                    ma_exit=sig.get("ma_exit"), foreign_net=sig.get("foreign"),
-                    ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False))
-                if not action:
-                    remaining.append(pos); continue
-                resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
-                if not ok:
-                    logger.error("[REJECT] %s %s 매도 거부 (재시도 후에도 실패) — %s", when, sym, why)
-                    log_event("order_reject", {"phase": when, "symbol": sym, "qty": sell_qty,
-                                               "reason": reason, "why": why, "raw": resp})
-                    # 매도 거부는 시장 노출 직결 → critical alert (개별 알림)
-                    await notify(f"🚨 <b>매도 거부</b> [{when}] {pos['name']}({sym}) {sell_qty}주 "
-                                 f"@{cur:,.0f} 사유:{reason}\n원인:{why}\n→ HTS 수동매도 검토",
-                                 critical=True)
-                    sell_failures.append({"symbol": sym, "name": pos["name"], "qty": sell_qty,
-                                          "reason": reason, "why": why})
-                    remaining.append(pos); continue
-                pnl_pct = round((cur - entry) / entry * 100, 2)
-                if action == "PARTIAL":
-                    pos["partial_done"] = True; pos["qty"] = qty - sell_qty
+                try:
+                    await handle(mcp, idx, pos)
+                except Exception as e:
+                    # 이 종목만 포기하고 계속 — 나머지 포지션의 손절이 이것 때문에 멈추면 안 된다.
+                    logger.error("[%s] %s 평가 실패 — 보유 유지하고 다음 종목 진행: %s",
+                                 when, pos.get("symbol"), e, exc_info=True)
+                    eval_fails.append(f"{pos.get('name','?')}({pos.get('symbol','?')})")
                     remaining.append(pos)
-                    save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
-                    journal_append({"type": "partial", "id": pos["journal_id"], "symbol": sym, "qty": sell_qty,
-                                    "price": cur, "pnl_pct": pnl_pct, "reason": reason})
-                    log_event("partial", {"symbol": sym, "qty": sell_qty, "price": cur, "pnl_pct": pnl_pct})
-                    await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{cur:,.0f} "
-                                 f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
-                else:
-                    save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
-                    hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
-                    net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
-                    rr_real = round((cur - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
-                    pnl_amt = round((cur - entry) * sell_qty)
-                    closed.append({"pos": pos, "cur": cur, "net": net, "reason": reason, "qty": sell_qty,
-                                   "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
-                    journal_append({"type": "exit", "id": pos["journal_id"], "symbol": sym, "name": pos["name"],
-                                    "qty": sell_qty, "entry_price": entry, "exit_price": cur, "pnl_pct": pnl_pct,
-                                    "net_pct": net, "pnl_amount": round((cur - entry) * sell_qty), "rr_realized": rr_real,
-                                    "reason": reason, "hold_days": hold_days})
-                    log_event("exit", {"symbol": sym, "exit": cur, "net_pct": net, "reason": reason})
+                processed += 1
     except Exception as e:
-        logger.error("[%s] %s", when, e); return
+        # 세션/연결 단위 실패 — 미처리 포지션을 remaining 에 되돌려 state 유실을 막는다.
+        logger.error("[%s] 청산 세션 실패(%d/%d 처리): %s", when, processed, len(positions), e, exc_info=True)
+        remaining += positions[processed:]
+        await notify(f"🚨 <b>청산 세션 중단</b> [{when}] {processed}/{len(positions)}종 처리 후 실패\n"
+                     f"{str(e)[:200]}\n→ 미처리분은 다음 cycle 재판정", critical=True)
+    # ★ 아래 2줄은 예외 여부와 무관하게 실행돼야 한다. 과거엔 except 에서 return 해버려
+    #   트레일 갱신이 폐기되고, 누적 매도거부 critical 알림도 발송되지 않았다.
     save_state("positions", remaining)
-    await _manage_alerts(when, closed, sell_failures, price_fails)
+    await _manage_alerts(when, closed, sell_failures, price_fails, eval_fails)
 
 
 async def phase_intraday() -> None:

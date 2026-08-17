@@ -42,9 +42,9 @@ from trend_runtime import (                        # noqa: E402  알림·상태�
 from src.mcp_servers.trend_mcp.market_data import get_ohlcv  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
-from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    entry_signal, atr, moving_average, classify_zone,
+    entry_signal, atr, levels, moving_average, classify_zone,
     fundamentals_bonus, leading_sectors, market_breadth, position_size, exit_decision, is_rising,
 )
 
@@ -87,9 +87,8 @@ async def phase_reconcile() -> None:
             continue
         ohlcv = get_ohlcv(h["symbol"])
         a = round(atr(ohlcv, CFG.atr_period), 2) if ohlcv else round(cur * 0.02, 2)
-        stop = round(init_stop_price(cur, a, CFG.atr_k, -CFG.stop_pct), 2)      # 현재가 기준 트레일
-        e_stop = init_stop_price(entry, a, CFG.atr_k, -CFG.stop_pct)
-        target = round(entry + CFG.rr * (entry - e_stop), 2)                    # 1:3 (평단 기준)
+        # 손절은 '현재가' 기준(편입 즉시 손절 방지 — 편입 시점부터 추적), 목표는 '평단' 기준 1:3.
+        stop, target = levels(entry, CFG, atr_value=a, stop_ref=cur)
         jid = uuid.uuid4().hex[:8]
         # 이미 목표가(평단 기준 3R) 위에서 편입되는 장기보유 승자는 partial_done=True —
         # 편입 직후 30% 즉시 매도 방지(편입 취지는 트레일 관리, 신규 진입이 아님).
@@ -475,7 +474,7 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         return None
     price = await _realtime_price(sym) or c["price"]
     # risk 사이징용 손절가는 사이징 시점 가격 기준으로 추정(체결 후 entry 기준 재계산은 아래에서).
-    size_stop = init_stop_price(price, float(c["atr"]), CFG.atr_k, -CFG.stop_pct)
+    size_stop, _ = levels(price, CFG, atr_value=float(c["atr"]))
     qty = await _size_qty(price, size_stop)
     if qty < 1:
         logger.warning("[ENTRY] %s 현금 부족/수량 0 — 스킵 (price %.0f)", sym, price)
@@ -507,8 +506,7 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     fill = d.get("cntr_pric") or d.get("체결가")
     entry = adopted_entry or (float(str(fill).lstrip("+-").replace(",", "")) if fill else price)
     # 손절/목표는 '실제 체결가' 기준 재계산 — 손익비 1:3 보존(백테스트와 동일).
-    stop = round(init_stop_price(entry, float(c["atr"]), CFG.atr_k, -CFG.stop_pct), 2)
-    target = round(entry + CFG.rr * (entry - stop), 2)
+    stop, target = levels(entry, CFG, atr_value=float(c["atr"]))
     jid = uuid.uuid4().hex[:8]
     pos = {"symbol": sym, "name": c["name"], "mode": UNIVERSE_MODE, "qty": qty,
            "entry_price": entry, "stop_price": stop, "target": target, "peak_price": entry,

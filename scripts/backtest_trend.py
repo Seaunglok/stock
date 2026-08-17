@@ -32,9 +32,9 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs, metrics              # noqa: E402
-from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop, init_stop_price  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    TrendConfig, entry_signal, atr, moving_average, relative_strength,
+    TrendConfig, entry_signal, atr, levels, moving_average, relative_strength,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억
@@ -118,9 +118,9 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
     if entry <= 0:
         return None
     a = atr(full[:i + 1], cfg.atr_period)
-    stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
+    stop, _target = levels(entry, cfg, atr_value=a)     # 라이브와 동일 공식(단일 정본)
     first_r = V_FIRST_PARTIAL_R if V_FIRST_PARTIAL_R is not None else cfg.rr
-    first_target = entry + first_r * (entry - stop)
+    first_target = entry + first_r * (entry - stop)     # A/B 노브가 rr 을 덮어쓸 수 있어 별도 산출
     exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support
     hard_floor = entry * (1 - V_HARD_STOP_PCT / 100.0) if V_HARD_STOP_PCT > 0 else None
     closes = [b["close"] for b in full]
@@ -180,7 +180,7 @@ def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
     if entry <= 0:
         return []
     a = atr(full[:i + 1], cfg.atr_period)
-    stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
+    stop, _target = levels(entry, cfg, atr_value=a)     # 라이브와 동일 공식(단일 정본)
     exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support
     closes = [b["close"] for b in full]
     R = entry - stop

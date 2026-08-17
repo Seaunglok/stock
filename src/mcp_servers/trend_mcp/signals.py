@@ -142,11 +142,28 @@ def _composite_score(ohlcv: list[dict], foreign_net: float | None, inst_net: flo
     return round(score, 1), {"volume": vb, "candle": cb, "consolidation": ob, "institutional": ib}
 
 
-def _levels(entry: float, ohlcv: list[dict], cfg: TrendConfig) -> tuple[float, float]:
-    a = atr(ohlcv, cfg.atr_period)
-    stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
-    target = entry + cfg.rr * (entry - stop)
-    return round(stop, 2), round(target, 2)
+def levels(entry: float, cfg: TrendConfig, *,
+           ohlcv: list[dict] | None = None, atr_value: float | None = None,
+           stop_ref: float | None = None) -> tuple[float, float]:
+    """진입가 → (손절, 목표). 손익비 1:cfg.rr 을 만드는 **단일 정본**.
+
+    이 3줄 공식이 라이브·백테스트·그림자원장 8곳에 각각 복제돼 있었다(2026-08-17 통합).
+    복제된 채로 두면 atr_k/stop_pct/rr 을 바꿀 때 일부만 반영돼, 검증한 손익비와 실제 손익비가
+    조용히 갈린다 — 이 전략의 기대값은 전적으로 1:3 에서 나온다.
+
+    Args:
+        entry: 손절/목표의 기준가(체결가 또는 진입 예정가).
+        ohlcv / atr_value: ATR 소스. atr_value 가 있으면 그걸 쓰고, 없으면 ohlcv 로 계산한다.
+                           둘 다 없거나 ATR=0 이면 init_stop_price 가 고정 stop_pct 로 폴백한다.
+        stop_ref: 손절 계산만 다른 가격으로 하고 싶을 때(예: 계좌 보유분 편입 — 손절은 '현재가'
+                  기준 트레일로 새로 잡고 목표는 '평단' 기준 1:3 을 유지). 기본 None=entry 동일.
+    Returns:
+        (stop, target) — 소수 2자리 반올림.
+    """
+    a = atr_value if atr_value is not None else atr(ohlcv or [], cfg.atr_period)
+    stop = init_stop_price(stop_ref if stop_ref is not None else entry, a, cfg.atr_k, -cfg.stop_pct)
+    tgt_stop = init_stop_price(entry, a, cfg.atr_k, -cfg.stop_pct)
+    return round(stop, 2), round(entry + cfg.rr * (entry - tgt_stop), 2)
 
 
 def entry_signal(
@@ -191,7 +208,7 @@ def entry_signal(
 
     passed = all(gates.values())
     score, bd = _composite_score(ohlcv, foreign_net, inst_net)
-    stop, target = _levels(price, ohlcv, cfg)
+    stop, target = levels(price, cfg, ohlcv=ohlcv)
     reason = "진입가능" if passed else "게이트 미충족: " + ",".join(k for k, v in gates.items() if not v)
     return TrendSignal(passed, score, stop, target, reason, gates, bd)
 

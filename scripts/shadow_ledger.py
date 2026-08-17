@@ -353,8 +353,7 @@ def backfill_from_events() -> int:
     손절/목표는 그날까지의 일봉으로 ATR 을 재산출해 **라이브와 동일한 공식**으로 복원한다.
     실제 진입분은 event payload 의 진짜 stop/target 을 그대로 쓴다(대조군).
     """
-    from src.mcp_servers.trend_mcp.signals import atr as _atr
-    from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price as _istop
+    from src.mcp_servers.trend_mcp.signals import atr as _atr, levels as _levels
     from trend_config import CFG
 
     recs = _load()
@@ -395,9 +394,9 @@ def backfill_from_events() -> int:
                 a = _atr(bars[:idx + 1], CFG.atr_period)
                 if not entry or not a:
                     continue
-                stop = round(_istop(entry, a, CFG.atr_k, -CFG.stop_pct), 2)
+                stop, target = _levels(entry, CFG, atr_value=a)   # 라이브와 동일 공식(단일 정본)
                 rec = {"reason": "hist_blocked", "ref_price": entry, "stop": stop,
-                       "target": round(entry + CFG.rr * (entry - stop), 2), "atr": round(a, 2)}
+                       "target": target, "atr": round(a, 2)}
             seen.add((date, sym))
             added.append({"date": date, "ts": f"{date} 00:00:00", "symbol": sym,
                           "name": _ticker_name(sym), "score": None, "sector": None,

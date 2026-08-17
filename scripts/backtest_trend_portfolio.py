@@ -43,9 +43,9 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs                       # noqa: E402
-from src.mcp_servers.closing_bet_mcp.exit_rules import init_stop_price, ratchet_stop  # noqa: E402
+from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    TrendConfig, atr, entry_signal, moving_average,
+    TrendConfig, atr, entry_signal, levels, moving_average,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억 (backtest_trend 과 동일)
@@ -220,14 +220,14 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                     res.n_rejected_sector += 1
                     continue
                 entry = b["open"] * buy_f
-                stop = init_stop_price(entry, c["atr"], cfg.atr_k, -cfg.stop_pct)
+                stop, target = levels(entry, cfg, atr_value=c["atr"])   # 라이브와 동일 공식(단일 정본)
                 shares = _target_shares(sz, eq_now, cash, entry, stop)
                 if shares < 1:
                     continue
                 cash -= shares * entry
                 positions.append(Position(
                     code=c["code"], sector=sec, entry_idx=di, entry=entry, shares=shares,
-                    stop=stop, peak=entry, target=entry + cfg.rr * (entry - stop), atr0=c["atr"]))
+                    stop=stop, peak=entry, target=target, atr0=c["atr"]))
                 sec_count[sec] = sec_count.get(sec, 0) + 1
                 res.n_entries += 1
         pending = []

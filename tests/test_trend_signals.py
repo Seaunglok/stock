@@ -1,7 +1,11 @@
 """trend_mcp.signals 순수함수 회귀 테스트."""
+import pytest
+
 from src.mcp_servers.trend_mcp.signals import (
     TrendConfig,
+    atr,
     classify_zone,
+    levels,
     entry_signal,
     exit_decision,
     foreign_net_signal,
@@ -397,3 +401,42 @@ def test_foreign_exit_trend_label_reflected():
 def test_foreign_net_positive_never_exits():
     # 순매수면 추세 무관하게 청산 안 함
     assert _ex(cur=90.0, ma_trend=95.0, foreign_net=5000.0)[0] is None
+
+
+# ─── levels(): 손절/목표 단일 정본 (2026-08-17 — 8곳 복제 통합) ──────────────
+def test_levels_keeps_rr_ratio():
+    """손익비 1:rr 은 이 전략 기대값의 전부다 — 어떤 경로로 계산해도 유지돼야 한다."""
+    cfg = TrendConfig(rr=3.0, atr_k=2.0, stop_pct=7.0)
+    stop, target = levels(10000, cfg, atr_value=200)
+    assert (target - 10000) / (10000 - stop) == pytest.approx(3.0)
+
+
+def test_levels_atr_value_and_ohlcv_agree():
+    """ATR 을 직접 넘기든 ohlcv 로 계산하든 같은 결과여야 한다(호출부마다 입력 형태가 다르다)."""
+    cfg = TrendConfig()
+    bars = _rising(40, 100.0, 120.0)
+    a = atr(bars, cfg.atr_period)
+    assert levels(120, cfg, ohlcv=bars) == levels(120, cfg, atr_value=a)
+
+
+def test_levels_stop_ref_splits_stop_and_target():
+    """계좌 보유분 편입: 손절은 현재가 기준 트레일, 목표는 평단 기준 1:3."""
+    cfg = TrendConfig(rr=3.0)
+    entry, cur = 10000, 12000
+    stop, target = levels(entry, cfg, atr_value=200, stop_ref=cur)
+    base_stop, base_target = levels(entry, cfg, atr_value=200)
+    assert stop > base_stop, "손절이 현재가 기준으로 올라와야 편입 즉시 손절을 피한다"
+    assert target == base_target, "목표는 평단 기준 1:3 을 유지해야 한다"
+
+
+def test_levels_falls_back_to_stop_pct_without_atr():
+    """ATR=0(데이터 부족)이면 고정 stop_pct 로 폴백 — 손절 없는 포지션이 생기면 안 된다."""
+    cfg = TrendConfig(stop_pct=7.0)
+    stop, _ = levels(10000, cfg, atr_value=0)
+    assert stop == pytest.approx(9300.0)
+
+
+def test_levels_target_above_entry():
+    cfg = TrendConfig()
+    stop, target = levels(50000, cfg, atr_value=1500)
+    assert stop < 50000 < target

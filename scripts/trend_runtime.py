@@ -53,20 +53,71 @@ async def notify(msg: str, critical: bool = False) -> None:
 
 
 # ─── 상태 영속화 ────────────────────────────────────────────────────────────
+STATE_BAK = STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak")
+STATE_TMP = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+
+
+class StateCorrupted(RuntimeError):
+    """state.json 과 .bak 이 모두 읽히지 않음 — 보유 포지션을 알 수 없는 상태.
+
+    **빈 dict 로 대체하면 안 된다.** 데몬이 '보유 0' 으로 착각하면 실제 보유분에 손절·트레일이
+    영영 안 걸리고, 다음 save_state 가 그 빈 dict 를 덮어써 손실이 확정된다.
+    예외를 올려 phase 를 중단시키고 watchdog 재기동/운영자 개입으로 넘긴다.
+    """
+
+
+def _read_json(path) -> dict | None:
+    """JSON 파일 읽기 — 없거나 깨졌으면 None(구분 불필요, 호출자가 폴백 판단)."""
+    try:
+        if not path.exists():
+            return None
+        txt = path.read_text(encoding="utf-8")
+        if not txt.strip():
+            return None                     # 잘린 쓰기의 전형 — 빈 파일
+        d = json.loads(txt)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    """상태 로드. 본파일이 깨졌으면 .bak 폴백, 둘 다 실패면 StateCorrupted.
+
+    2026-08-17: 과거엔 파싱 실패 시 조용히 {} 를 돌려줬다. watchdog 이 hung 데몬을
+    `taskkill /F /T` 로 죽이는데 save_state 는 청산 루프 안에서 매 매도마다 호출되므로,
+    강제종료와 쓰기가 겹치면 파일이 잘린다 → 보유 0 착각 → 무방비 방치. 원자적 쓰기(save_state)
+    로 발생 자체를 막고, 그래도 깨졌다면 여기서 소리내어 실패한다.
+    """
+    d = _read_json(STATE_FILE)
+    if d is not None:
+        return d
+    if not STATE_FILE.exists() and not STATE_BAK.exists():
+        return {}                           # 최초 기동 — 정상
+    d = _read_json(STATE_BAK)
+    if d is not None:
+        logger.error("[STATE] %s 손상 — .bak 으로 복구(직전 저장 시점)", STATE_FILE.name)
+        return d
+    raise StateCorrupted(f"{STATE_FILE} 와 {STATE_BAK.name} 모두 읽기 실패 — 보유 포지션 불명. "
+                         "HTS 로 실보유분 확인 후 state.json 복구 필요")
 
 
 def save_state(key: str, content: Any) -> None:
+    """상태 저장 — tmp 쓰기 → 원자적 치환. 손상된 state 위에는 덮어쓰지 않는다.
+
+    load_state() 로 시작하므로 본파일·.bak 이 모두 깨졌으면 StateCorrupted 가 올라가
+    **손상 파일을 덮어쓰지 않고** 멈춘다(과거엔 {} 를 덮어써 손실을 확정시켰다).
+    """
     st = load_state()
     st[key] = content
     st["last_updated"] = datetime.now().isoformat()
-    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(st, ensure_ascii=False, indent=2)
+    STATE_TMP.write_text(payload, encoding="utf-8")
+    if STATE_FILE.exists():
+        try:
+            os.replace(STATE_FILE, STATE_BAK)   # 직전 정상본 보존
+        except Exception as e:
+            logger.warning("[STATE] .bak 갱신 실패(무시): %s", e)
+    os.replace(STATE_TMP, STATE_FILE)           # 동일 볼륨 원자적 치환
 
 
 def get_state(key: str, default=None) -> Any:

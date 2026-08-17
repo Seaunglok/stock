@@ -36,8 +36,8 @@ from trend_kiwoom_io import (               # noqa: E402
 from shadow_ledger import record as shadow_record  # noqa: E402  차단 후보 사후추적(원장 기록)
 from trend_journal import write_daily_journal      # noqa: E402  일별 매매일지 md(보고 계층)
 from trend_runtime import (                        # noqa: E402  알림·상태·락·이벤트(인프라 계층)
-    acquire_lock, get_state, journal_append, journal_note, load_state, log_event,
-    notify, release_lock, save_state,
+    StateCorrupted, acquire_lock, get_state, journal_append, journal_note, load_state,
+    log_event, notify, release_lock, save_state,
 )
 from src.mcp_servers.trend_mcp.market_data import get_ohlcv  # noqa: E402
 
@@ -1105,6 +1105,11 @@ async def scheduler_daemon() -> None:
         if _is_weekday(datetime.now()):
             try:
                 await funcs[phase]()
+            except StateCorrupted as e:
+                # 보유 포지션을 알 수 없다 — 추측으로 거래를 이어가면 안 된다(무방비 방치/이중매도).
+                logger.critical("[DAEMON] state 손상 — %s", e, exc_info=True)
+                await notify(f"🚨 <b>state.json 손상</b> — 보유 포지션 불명으로 {phase} 중단\n"
+                             f"{e}\n→ HTS 로 실보유분 확인 후 state 복구 필요", critical=True)
             except Exception as e:
                 logger.error("[DAEMON] %s %s", phase, e, exc_info=True)
                 await notify(f"❌ {phase} 오류: {e}")

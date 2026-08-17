@@ -41,6 +41,8 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 WD_LOG = LOG_DIR / "watchdog.log"
 DAEMON_OUT = LOG_DIR / "daemon_stdout.log"
 
+# 기본값은 trend_config.UNIVERSE_MODE 와 반드시 일치시킬 것 — watchdog 은 .env 를 읽지 않고
+# 재기동 데몬에 env 를 주입하므로, 두 기본값이 갈리면 수동 기동과 자동 기동이 다른 유니버스로 돈다.
 UNIVERSE = os.environ.get("TREND_UNIVERSE", "largecap")
 # 데몬이 실제로 쓰는 필수 MCP 포트(주문/시세/정보/투자자/포트폴리오)
 ESSENTIAL_PORTS = [8030, 8031, 8032, 8033, 8034]

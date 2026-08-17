@@ -27,10 +27,21 @@ except Exception:
 from src.mcp_servers.trend_mcp.signals import TrendConfig  # noqa: E402
 
 
+ENV_LOADED = False   # .env 를 실제로 읽었는가 — LIVE-GUARD 가 최우선으로 확인한다
+
+
 def _load_env() -> None:
-    env = _ROOT / ".env"
+    """.env 로드. TREND_ENV_FILE 로 경로를 바꿀 수 있다(테스트/다중 구성용).
+
+    테스트가 '설정 파일 없음' 상태를 재현할 때 실제 .env 를 rename 하면, pytest 가 중간에 죽는
+    순간 .env 가 사라진 채 남는다 — 다음 기동이 전부 코드 기본값으로 도는, 이 테스트가 막으려는
+    바로 그 사고다. 그래서 파일을 건드리지 않고 경로만 돌릴 수 있게 한다.
+    """
+    global ENV_LOADED
+    env = Path(os.environ["TREND_ENV_FILE"]) if os.environ.get("TREND_ENV_FILE") else _ROOT / ".env"
     if not env.exists():
-        return
+        return                    # ENV_LOADED=False 유지 → 기동 시 경고(아래 LIVE-GUARD)
+    ENV_LOADED = True
     for line in env.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -65,7 +76,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Critical 알림 별도 채팅(미설정 시 기본 채팅 사용). 매도거부/누적실패/긴급 등에만 전송.
 TELEGRAM_CRITICAL_CHAT_ID = os.getenv("TELEGRAM_CRITICAL_CHAT_ID", "") or TELEGRAM_CHAT_ID
 
-UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "watchlist")   # 기본 watchlist (검증 최고)
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ 기본값 = **현재 채택된 운용값**. .env 는 override 전용이다.
+#   2026-08-17 이전엔 A/B 검증 '이전' 값이 기본값이고 채택값은 .env 에만 있었다 → .env 유실 시
+#   하드손절·서킷·breadth 게이트가 전부 꺼지고 ADOPT_MODE=all 로 HTS 수동매수분까지 청산되는
+#   구성으로 조용히 돌아갔다. 더 나쁘게는 PRODUCTION_MODE 도 .env 에서 오므로 LIVE-GUARD 자체가
+#   건너뛰어져, 주문은 실제로 나가면서 알림 라벨만 MOCK 이 된다.
+#   → 기본값을 채택값으로 승격해 "설정 파일이 없으면 검증된 전략이 돈다" 를 보장한다.
+#   기본값 변경 시 tests/test_trend_config.py 스냅샷도 함께 갱신할 것.
+# ─────────────────────────────────────────────────────────────────────────────
+UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "largecap")    # 채택: largecap (watchdog 과 동일 기본값)
 WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").split(",") if c.strip()]
 TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 100))
 MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
@@ -73,8 +93,8 @@ MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 # 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
 #   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.
-SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
-POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "8"))
+SIZING_MODE = os.getenv("TREND_SIZING_MODE", "risk")        # 채택(2026-07-13 포트폴리오 A/B)
+POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "15"))  # risk 폴백용 notional %
 # risk 모드: 종목당 감수 리스크(예탁 대비 %). 1.0=보수(MDD~7%)·1.5=현 15% notional 노출 근사(MDD~11%).
 RISK_PCT = float(os.getenv("TREND_RISK_PCT", "1.5"))
 # risk 모드 notional 상한(예탁 대비 %) — 손절폭 극소 종목이 과대편입되는 것 방지.
@@ -100,10 +120,10 @@ INTRADAY_POLL_MIN = int(os.getenv("TREND_INTRADAY_POLL_MIN", "10"))
 PREMARKET_GAPDOWN_VETO = float(os.getenv("TREND_PREMARKET_GAPDOWN_VETO", "0") or 0)
 # 09:30 진입 시 하락 중(현재가<시가)인 후보는 보류 → 장중 반등(시가 회복) 시 진입, 끝까지 안 돌면 그날 스킵.
 ENTRY_WAIT_FALLING = os.getenv("TREND_ENTRY_WAIT_FALLING", "true").lower() == "true"
-# 신규 진입 허용 마감 시각(PDF: 09:30~10:30만 진입). 이후 보류분은 그날 스킵. "HH:MM".
-ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "10:30")
+# 신규 진입 허용 마감 시각. 이후 보류분은 그날 스킵. "HH:MM". 진입시각(11:00)보다 뒤여야 한다.
+ENTRY_CUTOFF = os.getenv("TREND_ENTRY_CUTOFF", "14:00")
 # 하드 손절(PDF 절대원칙): 진입가 대비 손실이 이 %p 초과 시 ATR 트레일과 무관하게 즉시 시장가 청산. 0=off.
-HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "0") or 0)
+HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "10") or 0)
 # 청산 이평선(하방돌파 시 청산). A/B 검증(2026-06-12): MA120 >> MA50(기대값·누적 2~4배, 추세 끝까지 탑승).
 EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
 # 최대 보유 영업일(시간청산, 0=off). 백테스트가 cfg.max_hold=60 강제 마감으로 기대값을 산출했으므로
@@ -127,7 +147,7 @@ SLIPPAGE_BPS = float(os.getenv("CLOSING_BET_SLIPPAGE_BPS", "10.0"))
 ROUNDTRIP_COST_PCT = (TAX_BPS + 2 * FEE_BPS + 2 * SLIPPAGE_BPS) / 100.0  # 매도세 + 2×수수료 + 2×슬리피지
 FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
 # 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
-DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "0") or 0)
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "2") or 0)
 # 피라미딩(승자 불타기, 검증=backtest equity게이트): 보유 종목이 진입+ k×STEP_R×R 도달 시 1유닛 추가.
 # equity-curve 게이트(최근 LOOKBACK 청산 net 평균>MIN_NET 일 때만)로 횡보장 증폭손실 차단. 0=off(기본).
 PYRAMID_ADDS = int(os.getenv("TREND_PYRAMID_ADDS", "0") or 0)          # 종목당 최대 추가 유닛 수(0=off)
@@ -139,10 +159,10 @@ PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이�
 PYRAMID_BYPASS_GATE = os.getenv("TREND_PYRAMID_BYPASS_GATE", "false").lower() == "true"
 # 시장 breadth 게이트(2026-06-24): KOSPI 업종지수 universe 양봉비율 < 이 값 일 때 신규진입 차단.
 # 06-23 사고(9종 동시 hard stop) 재발 방지. 백테스트(largecap): 0.4=P10-7.99%·PF1.52, 0.5=P10-7.07%·PF1.65. 0=off.
-BREADTH_MIN_PCT = float(os.getenv("TREND_BREADTH_MIN_PCT", "0") or 0)
-# Reconcile(어댑트) 모드: all=모든 broker 보유분 편입(기본·기존 동작), watchlist=WATCHLIST 종목만, off=어댑트 안 함.
-# 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되는 위험 차단용.
-ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "all").lower()
+BREADTH_MIN_PCT = float(os.getenv("TREND_BREADTH_MIN_PCT", "0.4") or 0)
+# Reconcile(어댑트) 모드: all=모든 broker 보유분 편입, watchlist=WATCHLIST 종목만, off=어댑트 안 함.
+# 기본 off — 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되면 되돌릴 수 없다.
+ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "off").lower()
 
 CFG = TrendConfig(
     mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),
@@ -150,9 +170,9 @@ CFG = TrendConfig(
     atr_k=float(os.getenv("TREND_ATR_K", "2.0")),
     rr=float(os.getenv("TREND_RR", "3.0")),
     partial_pct=float(os.getenv("TREND_PARTIAL_PCT", "30")),
-    # 눌림목 게이트 폭(현재가 ≤ MA20×(1+X%)). 기본 3 → A/B 검증(2026-06-26)으로 12 채택.
+    # 눌림목 게이트 폭(현재가 ≤ MA20×(1+X%)). A/B 검증(2026-06-26)으로 12 채택.
     # 양극화/멜트업 장에서 3%는 과도하게 좁아 후보 0 빈발 → 12%가 largecap +2.61%/watchlist +8.90% 기대값 정점.
-    pullback_pct=float(os.getenv("TREND_PULLBACK_PCT", "3")),
+    pullback_pct=float(os.getenv("TREND_PULLBACK_PCT", "12")),
 )
 
 DATA_DIR = _ROOT / "data" / "trend_follow"

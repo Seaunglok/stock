@@ -1035,37 +1035,47 @@ async def scheduler_daemon() -> None:
     logger.info("=" * 56)
     if PRODUCTION_MODE:
         logger.warning("[DAEMON] ⚠️ PRODUCTION MODE — 실거래 API 사용. 주문은 실제 체결됩니다.")
-        _size_desc = f"risk {RISK_PCT}%÷손절폭(상한{MAX_NOTIONAL_PCT:g}%)" if SIZING_MODE == "risk" else f"{SIZING_MODE} {POSITION_PCT}%"
-        logger.warning("[DAEMON] 계좌=%s · 사이징=%s · 최대슬롯=%d · HardStop=%s%% · 일일손실서킷=%s%%",
-                       (ACCOUNT_NO[:4] + "****") if ACCOUNT_NO else "없음",
-                       _size_desc, MAX_POS, HARD_STOP_PCT, DAILY_LOSS_LIMIT_PCT)
-        # 실전 안전 기본값 가드: 첫주 권장 ≤3% 균등·≤5슬롯·하드손절 ON·일일손실서킷 ON
-        warns: list[str] = []
-        if SIZING_MODE == "pct_equity" and POSITION_PCT > 3:
-            warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
-        if SIZING_MODE == "risk" and RISK_PCT > 2:
-            warns.append(f"RISK_PCT={RISK_PCT}% > 권장 ≤1.5% (거래별 리스크 과대 — MDD 급증)")
-        if MAX_POS > 5:
-            warns.append(f"MAX_POS={MAX_POS} > 권장 5 (실전 첫주 슬롯 과다)")
-        if HARD_STOP_PCT <= 0:
-            warns.append("HARD_STOP_PCT=0 — 하드손절 비활성 (실전엔 7% 권장)")
-        if DAILY_LOSS_LIMIT_PCT <= 0:
-            warns.append("DAILY_LOSS_LIMIT_PCT=0 — 일일손실 서킷 비활성 (실전엔 2% 권장)")
-        if PYRAMID_ADDS > 0:
-            warns.append(f"PYRAMID_ADDS={PYRAMID_ADDS} — 피라미딩 ON (실전 첫달 보류 권장)")
-        if PYRAMID_BYPASS_GATE:
-            warns.append("PYRAMID_BYPASS_GATE=true — equity-curve 안전게이트 비활성 (횡보장 증폭위험)")
-        if ADOPT_MODE == "all":
-            warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
-        if BREADTH_MIN_PCT <= 0:
-            warns.append("BREADTH_MIN_PCT=0 — 시장 breadth 게이트 비활성 (06-23 같은 광범위 약세장 무방어). 0.4 권장")
-        for w in warns:
-            logger.warning("[DAEMON][LIVE-GUARD] ⚠️ %s", w)
-        if warns:
-            await notify("⚠️ 실전 가드 경고 " + str(len(warns)) + "건: " + "; ".join(warns),
-                         critical=True)
     else:
         logger.info("[DAEMON] 🧪 MOCK MODE — 모의투자 API. KIWOOM_PRODUCTION_MODE=true 로 실전 전환.")
+    _size_desc = f"risk {RISK_PCT}%÷손절폭(상한{MAX_NOTIONAL_PCT:g}%)" if SIZING_MODE == "risk" else f"{SIZING_MODE} {POSITION_PCT}%"
+    logger.warning("[DAEMON] 계좌=%s · 사이징=%s · 최대슬롯=%d · HardStop=%s%% · 일일손실서킷=%s%%",
+                   (ACCOUNT_NO[:4] + "****") if ACCOUNT_NO else "없음",
+                   _size_desc, MAX_POS, HARD_STOP_PCT, DAILY_LOSS_LIMIT_PCT)
+    # LIVE-GUARD 는 **PRODUCTION_MODE 와 무관하게 항상** 평가한다.
+    # 2026-08-17: 과거엔 이 블록이 `if PRODUCTION_MODE:` 안에 있었다. 그런데 PRODUCTION_MODE 자체가
+    # .env 의 KIWOOM_PRODUCTION_MODE 에서 오므로, .env 로드가 실패하면 가드 전체가 건너뛰어진다 —
+    # 정작 안전장치가 전부 꺼진 그 순간에. MCP 서버는 여전히 실거래라 주문은 실제로 나가면서
+    # 라벨만 MOCK 이 된다(6월에 없앤 '라벨↔주문경로 불일치' footgun 의 재발). 가드가 자기
+    # 전제조건에 의존하면 안 된다.
+    warns: list[str] = []
+    if not ENV_LOADED:
+        warns.append(f"⚠️ .env 를 찾지 못했습니다({_ROOT / '.env'}) — 모든 설정이 코드 기본값입니다. "
+                     "PRODUCTION_MODE 판정도 신뢰할 수 없으니 주문 경로를 직접 확인하세요")
+    if SIZING_MODE == "pct_equity" and POSITION_PCT > 3:
+        warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
+    if SIZING_MODE == "risk" and RISK_PCT > 2:
+        warns.append(f"RISK_PCT={RISK_PCT}% > 권장 ≤1.5% (거래별 리스크 과대 — MDD 급증)")
+    if MAX_POS > 5:
+        warns.append(f"MAX_POS={MAX_POS} > 권장 5 (실전 첫주 슬롯 과다)")
+    if HARD_STOP_PCT <= 0:
+        warns.append("HARD_STOP_PCT=0 — 하드손절 비활성 (권장 10%)")
+    if DAILY_LOSS_LIMIT_PCT <= 0:
+        warns.append("DAILY_LOSS_LIMIT_PCT=0 — 일일손실 서킷 비활성 (권장 2%)")
+    if PYRAMID_ADDS > 0:
+        warns.append(f"PYRAMID_ADDS={PYRAMID_ADDS} — 피라미딩 ON (실전 첫달 보류 권장)")
+    if PYRAMID_BYPASS_GATE:
+        warns.append("PYRAMID_BYPASS_GATE=true — equity-curve 안전게이트 비활성 (횡보장 증폭위험)")
+    if ADOPT_MODE == "all":
+        warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
+    if BREADTH_MIN_PCT <= 0:
+        warns.append("BREADTH_MIN_PCT=0 — 시장 breadth 게이트 비활성 (06-23 같은 광범위 약세장 무방어). 0.4 권장")
+    if REGIME_MA <= 0:
+        warns.append("REGIME_MA=0 — 시장 레짐 게이트 비활성 (하락장 신규진입 무방어). 60 권장")
+    for w in warns:
+        logger.warning("[DAEMON][LIVE-GUARD] ⚠️ %s", w)
+    if warns:
+        await notify(f"⚠️ 가드 경고 {len(warns)}건 ({'💰REAL' if PRODUCTION_MODE else '🧪MOCK'}): "
+                     + "; ".join(warns), critical=True)
     logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/%s 진입(보류마감 %s)/장중 트레일/15:20 청산",
                 UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF)
     if not acquire_lock():

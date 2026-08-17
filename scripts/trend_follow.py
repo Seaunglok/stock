@@ -30,7 +30,7 @@ from trend_config import *                  # noqa: F401,F403  env·상수·logg
 from trend_config import _ROOT, logger      # noqa: E402  (* 는 _밑줄 이름 미포함)
 from trend_kiwoom_io import (               # noqa: E402
     _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d,
-    _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
+    _is_unknown, _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
     get_universe, kospi_closes as _kospi_closes,
 )
 from shadow_ledger import record as shadow_record  # noqa: E402  차단 후보 사후추적(원장 기록)
@@ -426,6 +426,29 @@ async def _verify_buy_fills(bought: list[dict], positions: list[dict]) -> tuple[
     return fixed_bought, positions
 
 
+async def _confirm_unknown_buy(sym: str, want_qty: int) -> tuple[float, float]:
+    """응답 불명 매수의 실제 체결 여부를 broker 잔고로 확인 → (체결수량, 평단).
+
+    재전송 대신 쓰는 회수 경로다. 물타기 금지(1종목 1진입)라 이 종목의 broker 보유분은
+    이번 주문 말고 나올 데가 없다 — 이미 state 에 있으면 애초에 여기 오지 않는다.
+    조회 실패 시 (0,0) = 미체결로 간주(보수적: 유령 포지션을 만들지 않는다).
+    """
+    await asyncio.sleep(2.0)          # 체결 반영 대기
+    for attempt in range(2):
+        try:
+            for h in await _broker_holdings():
+                if h["symbol"] == sym and h["qty"] > 0:
+                    return float(min(h["qty"], want_qty)), float(h.get("avg") or 0)
+            return 0.0, 0.0
+        except Exception as e:
+            logger.warning("[ORDER] %s 잔고 확인 실패 %d/2: %s", sym, attempt + 1, e)
+            await asyncio.sleep(2.0)
+    log_event("fill_unverified", {"symbol": sym, "qty": want_qty})
+    await notify(f"🚨 <b>체결 확인 불가</b> {sym} {want_qty}주 — 주문 응답도 잔고 조회도 실패\n"
+                 f"→ HTS 로 보유 여부 직접 확인 필요(미추적 보유 가능성)", critical=True)
+    return 0.0, 0.0
+
+
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
@@ -444,15 +467,29 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         return None
     resp = await _place(mcp, "buy", sym, qty)
     ok, why = _order_accepted(resp)
+    adopted_qty = adopted_entry = 0.0
+    if not ok and _is_unknown(resp):
+        # 접수 여부 불명 — 재전송하면 이중 체결이므로, **잔고로 사실을 확인**한다.
+        # 체결됐는데 state 에 없으면 손절·트레일이 안 걸리는 미추적 보유가 된다(ADOPT_MODE=off 면
+        # reconcile 도 안 줍는다). 여기서 확인해 편입하는 게 유일한 회수 경로다.
+        adopted_qty, adopted_entry = await _confirm_unknown_buy(sym, qty)
+        if adopted_qty > 0:
+            ok, qty, price = True, int(adopted_qty), adopted_entry or price
+            logger.warning("[ORDER] %s 응답 불명이었으나 잔고 확인 결과 %d주 체결 — 편입", sym, qty)
+        else:
+            logger.error("[ORDER] %s 응답 불명 + 잔고 미확인 — 미체결로 간주", sym)
     if not ok:
-        logger.error("[REJECT] entry %s — %s", sym, why)
-        log_event("order_reject", {"phase": "entry", "symbol": sym, "why": why, "raw": resp})
+        tag = "불명" if _is_unknown(resp) else "거부"
+        logger.error("[REJECT] entry %s — %s (%s)", sym, why, tag)
+        log_event("order_reject", {"phase": "entry", "symbol": sym, "why": why,
+                                   "unknown": _is_unknown(resp), "raw": resp})
         shadow_record("order_reject", [c], {"why": why})
-        await notify(f"❌ 진입 거부 {c['name']}({sym}) — {why}")
+        await notify(f"❌ 진입 {tag} {c['name']}({sym}) — {why}",
+                     critical=_is_unknown(resp))
         return None
     d = resp.get("data", {}) if isinstance(resp, dict) else {}
     fill = d.get("cntr_pric") or d.get("체결가")
-    entry = float(str(fill).lstrip("+-").replace(",", "")) if fill else price
+    entry = adopted_entry or (float(str(fill).lstrip("+-").replace(",", "")) if fill else price)
     # 손절/목표는 '실제 체결가' 기준 재계산 — 손익비 1:3 보존(백테스트와 동일).
     stop = round(init_stop_price(entry, float(c["atr"]), CFG.atr_k, -CFG.stop_pct), 2)
     target = round(entry + CFG.rr * (entry - stop), 2)
@@ -781,7 +818,14 @@ async def _pyramid_adds(when: str) -> None:
                 ok, why = _order_accepted(resp)
                 if not ok:
                     logger.error("[REJECT] pyramid %s — %s", pos["symbol"], why)
-                    log_event("order_reject", {"phase": "pyramid", "symbol": pos["symbol"], "why": why, "raw": resp})
+                    log_event("order_reject", {"phase": "pyramid", "symbol": pos["symbol"], "why": why,
+                                               "unknown": _is_unknown(resp), "raw": resp})
+                    if _is_unknown(resp):
+                        # 이미 보유 중인 종목이라 잔고 대조로 추가분을 분리할 수 없다(합산 평단만 보임).
+                        # 재전송은 금물 — 알리고 다음 cycle 에 맡긴다(트리거가 유지되면 재평가된다).
+                        await notify(f"🚨 <b>불타기 응답 불명</b> {pos['name']}({pos['symbol']}) "
+                                     f"{add_qty}주 — 재전송 안 함\n→ HTS 로 보유수량 확인 필요",
+                                     critical=True)
                     continue
                 d = resp.get("data", {}) if isinstance(resp, dict) else {}
                 fill = d.get("cntr_pric") or d.get("체결가")
@@ -858,15 +902,22 @@ async def _manage_alerts(when: str, closed: list[dict], sell_failures: list[dict
 
 
 async def _sell_with_retry(mcp, when: str, sym: str, qty: int) -> tuple[Any, bool, str]:
-    """매도 1회 + 실패 시 2초 후 1회 재시도 → (raw응답, 수락여부, 사유).
+    """매도 1회 + **명시적 거부일 때만** 2초 후 1회 재시도 → (raw응답, 수락여부, 사유).
 
-    클라이언트 단에 8005 토큰 자동복구가 이미 1회 있으므로 여기 재시도는 그 위의 방어층이다.
+    재시도 조건이 핵심이다:
+      - 거부(return_code != 0) → 접수 안 됨이 확실 → 재시도 안전. 8005 토큰만료 등이 여기.
+      - 불명(타임아웃/통신실패) → 접수 여부 모름 → **재시도 금지**. 브로커가 이미 받았다면
+        재전송은 이중 매도가 된다(보유보다 많이 팔면 결제 사고). 다음 cycle 이 현재가 기준으로
+        다시 판정하므로, 여기선 알리고 넘기는 편이 안전하다.
     """
     resp = await _place(mcp, "sell", sym, qty)
     ok, why = _order_accepted(resp)
     if ok:
         return resp, True, why
-    logger.warning("[RETRY] %s %s 매도 첫 시도 실패 (%s) — 2초 후 재시도", when, sym, why)
+    if _is_unknown(resp):
+        logger.error("[ORDER] %s %s 매도 응답 불명 — 재전송 안 함(이중매도 방지). 다음 cycle 재판정", when, sym)
+        return resp, False, f"{why} (접수 여부 불명 — 재전송 안 함)"
+    logger.warning("[RETRY] %s %s 매도 거부 (%s) — 2초 후 재시도", when, sym, why)
     await asyncio.sleep(2.0)
     resp = await _place(mcp, "sell", sym, qty)
     ok, why = _order_accepted(resp)

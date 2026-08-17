@@ -148,23 +148,34 @@ async def _account_equity() -> tuple[float, float]:
     return equity, cash
 
 
-async def _place(mcp, side: str, symbol: str, qty: int, *, timeout: float = 10.0, retries: int = 1) -> Any:
-    """시장가 주문(order_type 03) — 타임아웃 + 재시도. mcp = 열려있는 trading-domain MCPManager.
+def _is_unknown(resp: Any) -> bool:
+    """주문 접수 여부가 **불명**인가(타임아웃/통신실패). True 면 재전송 금지 — 잔고로 대조할 것."""
+    return isinstance(resp, dict) and bool(resp.get("unknown"))
 
-    호출 자체 실패(타임아웃/예외)는 {"success": False} 반환 → _order_accepted 가 거부로 판정(유령 방지).
+
+async def _place(mcp, side: str, symbol: str, qty: int, *, timeout: float = 10.0) -> Any:
+    """시장가 주문(order_type 03) 1회 전송. mcp = 열려있는 trading-domain MCPManager.
+
+    **재전송하지 않는다.** 2026-08-17 이전엔 retries=1 로 타임아웃 시 같은 시장가 주문을 다시
+    보냈다 — 브로커가 이미 접수했는데 응답만 늦은 경우 그대로 이중 체결이다(멱등키·주문번호
+    대조 없음). 매도는 _sell_with_retry 가 _place 를 두 번 부르므로 최대 4회까지 나갈 수 있었다.
+
+    핵심은 **거부와 불명의 구분**이다:
+      - return_code != 0 (거부)  → 접수 안 됨이 확실 → 재시도 안전 (_sell_with_retry 가 담당)
+      - 타임아웃/예외 (불명)     → 접수 여부 모름 → 재전송 금지, {"unknown": True} 로 표시.
+        매수는 _verify_buy_fills 의 잔고 대조에, 매도는 critical 알림 + 다음 cycle 에 맡긴다.
     """
     tool = "place_buy_order" if side == "buy" else "place_sell_order"
     args = {"stock_code": symbol, "quantity": qty, "price": None,
             "order_type": "03", "account_no": ACCOUNT_NO}
-    last = None
-    for attempt in range(retries + 1):
-        try:
-            raw = await asyncio.wait_for(mcp.call_tool(tool, args), timeout=timeout)
-            return json.loads(raw) if isinstance(raw, str) else raw
-        except Exception as e:
-            last = e
-            logger.warning("[ORDER] %s %s 시도%d/%d 실패: %s", side, symbol, attempt + 1, retries + 1, e)
-    return {"success": False, "error": f"주문 호출 실패: {last}"}
+    try:
+        raw = await asyncio.wait_for(mcp.call_tool(tool, args), timeout=timeout)
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as e:
+        logger.error("[ORDER] %s %s %d주 응답 불명(재전송 안 함 — 중복체결 방지): %s",
+                     side, symbol, qty, e)
+        return {"success": False, "unknown": True,
+                "error": f"주문 응답 불명(접수 여부 미확인): {e}"}
 
 
 async def _sector_index_rows() -> list[dict] | None:

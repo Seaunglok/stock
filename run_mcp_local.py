@@ -50,12 +50,45 @@ def save_pids(pids: dict):
     PID_FILE.write_text(json.dumps(pids))
 
 
-def is_running(pid: int) -> bool:
+def _proc_info(pid: int):
+    """(create_time, cmdline) — 조회 불가면 (None, "")."""
     try:
-        os.kill(pid, 0)
+        import psutil
+        p = psutil.Process(pid)
+        try:
+            cmd = " ".join(p.cmdline() or [])
+        except Exception:          # 권한 부족해도 존재/기동시각은 대개 읽힌다
+            cmd = ""
+        return p.create_time(), cmd
+    except Exception:
+        return None, ""
+
+
+def is_running(pid: int, module: str = "") -> bool:
+    """PID 생존 여부.
+
+    ⚠️ `os.kill(pid, 0)` 을 쓰면 안 된다 — Windows 의 os.kill 은 POSIX 와 달리
+    `OpenProcess(PROCESS_ALL_ACCESS)` 를 요구한다. 작업스케줄러(watchdog)가 띄운 서버는
+    호출자 토큰으로 그 권한을 못 얻어 PermissionError → **살아있는데 '종료됨'으로 오판**했다.
+    그 결과 stop 이 좀비를 안 죽이고(포트 점유 잔존), start 는 중복 세트를 또 띄웠다.
+    psutil 은 가벼운 질의(PROCESS_QUERY_LIMITED_INFORMATION)라 이 문제가 없다.
+
+    module 을 주면 커맨드라인까지 대조해 **PID 재사용**을 걸러낸다(읽을 수 있을 때만).
+    """
+    try:
+        import psutil
+        if not psutil.pid_exists(pid):
+            return False
+    except ImportError:            # psutil 없음 → 존재 여부만이라도(구동작 폴백)
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    if not module:
         return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
+    _created, cmd = _proc_info(pid)
+    return module in cmd if cmd else True   # 커맨드라인 조회 불가 시 생존만으로 인정
 
 
 def start_servers():
@@ -64,7 +97,7 @@ def start_servers():
 
     for name, module in SERVERS:
         pid = pids.get(name)
-        if pid and is_running(pid):
+        if pid and is_running(pid, module):
             print(f"[SKIP] {name} 이미 실행 중 (PID={pid})")
             continue
 
@@ -104,12 +137,18 @@ def start_servers():
 
 def stop_servers():
     pids = load_pids()
-    for name, _ in SERVERS:
+    for name, module in SERVERS:
         pid = pids.get(name)
         if not pid:
             print(f"[SKIP] {name} - PID 없음")
             continue
-        if is_running(pid):
+        # PID 재사용 방어: 그 PID 가 정말 이 서버인지 커맨드라인으로 확인한 뒤에만 죽인다.
+        # taskkill /T 는 트리째 죽이므로, 남의 PID 를 잡으면 피해가 크다(2026-08-11 데몬 락 사고와 동종).
+        _created, cmd = _proc_info(pid)
+        if cmd and module not in cmd:
+            print(f"[SKIP] {name} (PID={pid}) — 다른 프로세스가 이 PID 사용 중, kill 생략")
+            continue
+        if is_running(pid, module):
             try:
                 if sys.platform == "win32":
                     # /T: 자식 프로세스(uvicorn 등)까지 트리 전체 종료 — 없으면 포트 점유 좀비 잔존
@@ -127,9 +166,9 @@ def stop_servers():
 
 def check_status():
     pids = load_pids()
-    for name, _ in SERVERS:
+    for name, module in SERVERS:
         pid = pids.get(name)
-        if pid and is_running(pid):
+        if pid and is_running(pid, module):
             print(f"[UP]   {name} (PID={pid})")
         elif pid:
             print(f"[DOWN] {name} (PID={pid}, 종료됨)")

@@ -17,7 +17,7 @@
 | **차트** | 현재가>MA200 & 기울기↑; 횡보 후 첫 장대양봉(몸통≥4% & 위꼬리≤0.3) | `scorer.score_consolidation/score_candle_shape` + 신규 MA200·장대양봉 |
 | **수급** | 외인5일·기관5일 순매수>0 | `scorer.score_institutional`, investor-domain MCP |
 | **재료** | DART 공시 호재 + 뉴스 테마 | `catalyst.match_trends`, 정보레이어 (라이브 가점) |
-| **시황** | 당일 주도섹터 집단상승 | ✅ `leading_sectors`(순수함수) + 09:30 장중 등락 스냅샷 — 가점(기본)/게이트(opt-in) |
+| **시황** | 당일 주도섹터 집단상승 | ✅ `leading_sectors`(순수함수) + entry 시각 장중 등락 스냅샷 — 가점(기본)/게이트(opt-in) |
 | **실적** | 매출/영업이익 YoY↑·어닝서프라이즈 | ✅ `fundamentals_bonus`(순수함수) + DART finstate 당기/전기 YoY — 가점 |
 
 거래량 폭발(2배+)은 `scorer.score_volume_surge` 재사용. **백테스트는 차트+거래량+수급+RS 코어만**
@@ -32,14 +32,38 @@
 - **`gainers`** (모멘텀/돌파, **v2 보류**): 당일 등락률 상위 N(30). 게이트 = 현재가>MA200 & 우상향 +
   횡보 후 첫 장대양봉 + 거래량≥20일평균×2.0 + MA50 지지권.
 
-## 백테스트 결과 (2025-01-01 ~ 2026-05-31, 비용 차감 후)
-| 모드 | 진입 | 승률 | 기대값(net) | 손익비(payoff) | 누적 | 판정 |
-|------|------|------|------------|---------------|------|------|
-| **watchlist**(삼성·하이닉스) | 27 | 33.3% | **+4.29%** | **4.38** | +116% | ✅ 최고 (사용자 직관 검증) |
-| **largecap** | 282 | 37.6% | **+2.00%** | 2.61 | +564% | ✅ 검증됨 |
-| gainers | 25 | — | −1.82% | — | — | ⛔ v2 보류 |
+## 백테스트 결과 (2025-01-01 ~ 2026-05-31, 왕복비용 0.43% 차감 후)
 
-비교: closing-bet `atr2_h3` OOS 기대값 +1.15%(동일 구간 0거래) / 진입규칙 고정(파라미터 피팅 없음 → 과최적화 낮음).
+> **2026-08-17 재산출.** 그 전까지의 표는 **라이브와 다른 설정**의 숫자였다 — 백테스트 A/B
+> 노브(`V_*`)가 전부 off 기본값이라 무플래그 실행이 *MA50 청산 · 하드손절 없음 · 눌림 3% ·
+> breadth/레짐 게이트 없음 · 거래세 18bps* 로 돌았다. 실제 라이브는 *MA120 · 하드손절 10% ·
+> 눌림 12% · breadth 0.4 · 레짐 MA60 · 20bps* 다. 이제 무플래그 실행이 라이브 설정을
+> 미러한다(`apply_live_mirror`). 구 수치는 `--legacy-defaults --tax-bps 18` 로 재현 가능.
+
+| 모드 | 진입 | 승률 | 기대값(net) | 손익비(payoff) | PF | 누적 | 판정 |
+|------|------|------|------------|---------------|-----|------|------|
+| **largecap** | 516 | 50.2% | **+3.38%** | 2.04 | 2.06 | +1742% | ✅ 검증됨 (주력) |
+| watchlist(삼성·하이닉스) | 45 | 80.0% | +11.10% | 2.61 | 10.42 | +500% | ⚠️ 표본 2종목 — 참고용 |
+| gainers | 25 | — | −1.82% | — | — | — | ⛔ v2 보류 (구 설정 기준) |
+
+<details><summary>구 설정(라이브 미러 이전) 수치 — 문서 대조용</summary>
+
+| 모드 | 진입 | 승률 | 기대값 | payoff | 누적 |
+|------|------|------|--------|--------|------|
+| watchlist | 27 | 33.3% | +4.29% | 4.38 | +116% |
+| largecap | 282 | 37.6% | +2.00% | 2.61 | +564% |
+</details>
+
+**해석 주의**
+- largecap 이 기준이다. watchlist 는 **종목 2개·45거래**라 승률 80%가 종목 선택(삼성·하이닉스가
+  이 구간에 강했다)의 결과인지 전략의 결과인지 분리되지 않는다. 기대값 비교에 쓰지 말 것.
+- 검증 구간(2025-01~2026-05)은 **상승장**이다. 실전 구간(2026-07~08)은 하락장이었고, 이 레짐
+  불일치가 실전 6전6패의 주원인이었다([2026-08-03 회고](2026-08-03-live-first-month-review.md)).
+  레짐 게이트가 이제 기본 ON 이지만, 위 숫자를 하락장 기대값으로 읽으면 안 된다.
+- 외인 청산룰은 ka10008 이력이 ~50영업일뿐이라 이 구간 전체 미러가 불가하다 → 미반영
+  (`--foreignexit` 로 별도 검증).
+
+비교: closing-bet `atr2_h3` OOS 기대값 +1.15%(동일 구간 0거래) / 진입규칙 고정(파라미터 피팅 없음).
 블로그 철학 "승률 낮아도 손익비만 맞추면 수익" 확인. 동일 구간 closing-bet 0거래 → **검증불가 문제 해소**.
 
 ## 라이브 (**실거래 운영 중**, 2026-06-29 전환) — `scripts/trend_follow.py`
@@ -52,7 +76,7 @@
 |------|-------|------|
 | 08:50 | `screen` | 모드별 유니버스 스캔(완성봉) → entry_signal 게이트·점수 → 후보. 프리장 예상가·JH ZONE·실적 YoY 가점 표시 |
 | **11:00** (`TREND_ENTRY_TIME`) | `entry` | 리스크 균등 사이징 매수(최대 `TREND_MAX_POS`=5). **시장 레짐 게이트**(KOSPI<MA60 차단) → 서킷 → breadth → 주도섹터 가점 재정렬. **하락 중 후보 보류→장중 반등 시 진입(`TREND_ENTRY_CUTOFF` 14:00 후 스킵)**. return_code 게이트(유령 방지) |
-| (장중) | `intraday` | `TREND_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 + 하드손절(`TREND_HARD_STOP_PCT`=10) + 보류분 반등 점검 |
+| (장중) | `intraday` | `TREND_INTRADAY_POLL_MIN` 주기 트레일 갱신 + 첫목표 30% 부분익절 + 하드손절(`TREND_HARD_STOP_PCT`=10) + 보류분 반등 점검 |
 | 15:20 | `exit` | 계좌 보유분 편입(reconcile) → **MA120 이탈**(`TREND_EXIT_MA`) / 외인 5일 순매도전환(규모임계+MA60 추세확인) / 트레일 이탈 / 시간청산(`TREND_MAX_HOLD`=60영업일) → 매매일지 → 분봉 수집 → 그림자 원장 갱신 |
 
 > 진입 시각은 2026-08 에 09:30 → **11:00** 으로 변경(09~10시 최대 변동성 회피).
@@ -137,14 +161,17 @@ TREND_PYRAMID_ADDS=0             # 피라미딩 종목당 최대 추가유닛(0=
 TREND_PYRAMID_STEP_R=1.0         # 추가 트리거 간격(R배수)  TREND_PYRAMID_LOOKBACK=20  # equity게이트 청산표본
 TREND_PYRAMID_MIN_NET=0          # equity게이트: 최근 LOOKBACK 청산 net 평균>이 값 일 때만 불타기(검증 채택)
 
-# ── 지표 / 가점 ────────────────────────────────────────────────────
-TREND_MA_FAST=60 TREND_MA_SLOW=120 TREND_MA_PULLBACK=20 TREND_RS_DAYS=60
-TREND_MA_TREND=200 TREND_MA_SUPPORT=50 TREND_VOL_MULT=2.0 TREND_BODY_PCT=4 TREND_WICK_MAX=0.3   # gainers
+# ── 가점 ───────────────────────────────────────────────────────────
 TREND_FUND_BONUS=5               # 실적 가점: 매출·영업이익 YoY 동반↑ +5점(영업이익만 +2.5) — 순위만, 0=off
 TREND_SECTOR_BONUS=5             # 주도섹터 가점: 집단상승 섹터 소속 후보 +5점 — 0=off
 TREND_SECTOR_GATE=false          # true 면 주도섹터 소속 후보만 진입(하드 게이트) — 기본 가점만
 TREND_SECTOR_MIN_AVG=1.0 TREND_SECTOR_BREADTH=0.6 TREND_SECTOR_TOP_K=3  # 주도 판정: 평균등락/상승비율/상위K
 ```
+
+> **지표 상수는 env 가 아니다** — `ma_fast/ma_slow/ma_pullback/rs_days/ma_trend/ma_support/
+> vol_mult/body_pct/wick_max` 는 `TrendConfig` 데이터클래스 기본값
+> ([signals.py](../src/mcp_servers/trend_mcp/signals.py))이다. 과거 이 문서가 `TREND_MA_FAST` 등을
+> env 로 안내했으나 코드는 그런 변수를 읽지 않는다(2026-08-17 수정).
 
 > `MOCK_MODE` env 는 2026-06-29 **제거**됐다 — 라벨↔주문경로 불일치 footgun 때문에
 > `KIWOOM_PRODUCTION_MODE` 단일 소스로 통일.
@@ -204,7 +231,7 @@ python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 
 | 정배열 Price>MA60·MA120 | 게이트 | gates price>MA60·MA120 | ✅ |
 | 상대강도 RS(60일) | 상위 20% | RS>0 (코스피 대비) | ⚠️ 우리가 더 느슨(>0) |
 | 거래량/유동성 floor | 잡주 배제 | MIN_VALUE_KRW 1,000억 | ✅ |
-| 진입 09:30~10:30 | 타임프레임 제한 | 09:30 + 보류 반등(≤10:30 컷오프) | ✅ 보강 |
+| 진입 시간대 제한 | 타임프레임 제한 | 11:00 진입 + 보류 반등(≤14:00 컷오프) | ✅ 보강 |
 | 첫목표 30% 부분익절 | **1:1 지점** | **1:3 지점(target)** | ⚠️ 차이(검증대기) |
 | 트레일 청산 | 고점대비 고정 7% | ATR 트레일(atr_k×ATR) | ⚠️ 우리가 변동성적응 |
 | 하드 손절 | **진입가 -5% 즉시** | ATR init_stop(−7% floor) + 옵션 HARD_STOP_PCT | ⚠️ 옵션화(기본 off) |
@@ -221,7 +248,7 @@ python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 
 **A/B 검증 완료(2026-06-12, `backtest_trend.py --abtest`)**:
 | 변형 | largecap 기대값/누적 | watchlist 기대값/누적 | 결정 |
 |------|------|------|------|
-| 기준(1:3·MA50·ATR) | +2.00% / +564% | +4.29% / +116% | — |
+| 기준(1:3·MA50·ATR, 구 설정) | +2.00% / +564% | +4.29% / +116% | — |
 | **청산선 MA120** | **+5.19% / +1465%** | **+17.54% / +474%** | ✅ **채택**(`TREND_EXIT_MA=120`) |
 | 첫익절 1:1 | +1.76% / +496% | +3.37% / +91% | ❌ 1:3 유지 |
 | 하드손절 −5% | +0.48% / +135% | +1.77% / +48% | ❌ off 유지(ATR 트레일 우월) |
@@ -234,7 +261,7 @@ python -m pytest tests/test_trend_signals.py -q   # 46 케이스 (tests/ 전체 
 - **실적 자동 가점** (`fundamentals_bonus` 순수함수): 08:50 screen 에서 후보 한정 DART `finstate` 당기/전기 비교 →
   매출·영업이익 YoY 동반 증가 +5점, 영업이익만 +2.5점. 30일 디스크 캐시(`docs_cache/dart_fin/`).
   `DART_API_KEY` 없음/조회 실패 시 가점 생략(veto 아님). Telegram·journal 에 YoY 표시.
-- **주도섹터 집단상승** (`leading_sectors` 순수함수): 09:30 entry 직전 키움 **업종지수 스냅샷**(ka20001,
+- **주도섹터 집단상승** (`leading_sectors` 순수함수): entry 직전 키움 **업종지수 스냅샷**(ka20001,
   info-domain :8032 — KOSPI 27개 업종의 등락률+상승/하락/보합 종목수) → 등락률 ≥1.0% AND 상승비율 ≥60%
   AND 구성 ≥3 인 상위 3개 섹터를 주도섹터로 판정. 소속 후보 +5점 재정렬(기본). `TREND_SECTOR_GATE=true` 면
   주도섹터 소속만 진입(하드 게이트, opt-in). 업종지수 미확보(서버 다운) 시 **fail-open**(판정 생략, 게이트도

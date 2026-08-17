@@ -43,7 +43,8 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-asyncio_mode = "strict"
+# asyncio_mode: pytest-asyncio 미설치 — async 테스트는 asyncio.run() 으로 직접 구동한다.
+#   (pytest.ini 의 asyncio_mode=auto 도 같은 이유로 무효. 플러그인 도입 시 양쪽 통일할 것)
 
 [tool.black]
 line-length = 88
@@ -52,7 +53,7 @@ target-version = ["py312"]
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-include = ["src/**/*.py"]
+include = ["src/**/*.py", "scripts/**/*.py"]  # 실거래 데몬이 scripts/ 에 산다
 
 [tool.ruff.lint]
 select = [
@@ -69,7 +70,7 @@ extend-ignore = [
 ]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["src", "scripts"]  # 실거래 데몬이 scripts/ 에 산다
 omit = ["*/tests/*", "*/test_*"]
 
 [dependency-groups]

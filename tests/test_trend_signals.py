@@ -446,3 +446,70 @@ def test_levels_target_above_entry():
     cfg = TrendConfig()
     stop, target = levels(50000, cfg, atr_value=1500)
     assert stop < 50000 < target
+
+
+# ─── 복합점수 재정규화 (2026-08-21 — 죽은 20% 가중치) ────────────────────────
+def test_composite_renormalizes_when_flows_missing():
+    """수급 데이터가 없으면 그 가중치를 빼고 재정규화한다.
+
+    과거엔 score_institutional 이 0점으로 들어가 만점이 80 이 됐다. 라이브는 screen 시점에
+    수급을 조회하지 않으므로(trend_follow.py) 이 20% 가 상시 죽어 있었고, "데이터 없음"과
+    "수급 나쁨"이 구분되지 않았다.
+    """
+    from src.mcp_servers.trend_mcp.signals import _composite_score
+    bars = _rising(130, 100.0, 130.0)
+    no_flow, _ = _composite_score(bars, None, None)
+    # 같은 봉에 '수급 최상'(외인·기관 동반 순매수 → 100점)을 주면 점수가 올라가야 한다
+    both_buy, _ = _composite_score(bars, 1000.0, 1000.0)
+    both_sell, _ = _composite_score(bars, -1000.0, -1000.0)
+    assert both_sell < no_flow < both_buy, (no_flow, both_buy, both_sell)
+
+
+def test_composite_stays_on_0_100_scale():
+    """결측이 있어도 스케일이 0~100 을 벗어나지 않는다(랭킹 비교 가능성 유지)."""
+    from src.mcp_servers.trend_mcp.signals import _composite_score
+    for bars in (_rising(130, 100.0, 130.0), _rising(130, 130.0, 100.0)):
+        for flows in ((None, None), (1.0, 1.0), (-1.0, None)):
+            s, _ = _composite_score(bars, *flows)
+            assert 0.0 <= s <= 100.0, (s, flows)
+
+
+# ─── 우선주 제외 (2026-08-21 — 보통주와 슬롯 중복) ───────────────────────────
+@pytest.mark.parametrize("code,name,expected", [
+    ("005930", "삼성전자", False),
+    ("000660", "SK하이닉스", False),
+    ("005935", "삼성전자우", True),      # 실제 상위150 3위였다
+    ("005385", "현대차우", True),
+    ("005387", "현대차2우B", True),
+    ("00081K", "신형우선주", True),      # 끝자리 K/L/M 도 우선주
+])
+def test_is_preferred(code, name, expected):
+    """보통주와 우선주가 동시에 후보가 되면 사실상 한 종목 2배 베팅이다."""
+    from src.mcp_servers.trend_mcp.market_data import _is_preferred
+    assert _is_preferred(code, name) is expected
+
+
+def test_preferred_detected_by_name_when_code_ambiguous():
+    from src.mcp_servers.trend_mcp.market_data import _is_preferred
+    assert _is_preferred("123450", "테스트우") is True
+    assert _is_preferred("123450", "테스트") is False
+
+
+# ─── 발행사 중복 (보통주/우선주 동시 보유 차단) ───────────────────────────────
+@pytest.mark.parametrize("a,b,expected", [
+    ("005930", "005935", True),    # 삼성전자 / 삼성전자우
+    ("005380", "005385", True),    # 현대차 / 현대차우
+    ("005380", "005387", True),    # 현대차 / 현대차2우B
+    ("005385", "005387", True),    # 우선주끼리도 같은 발행사
+    ("005930", "000660", False),   # 삼성전자 / SK하이닉스
+    ("005930", "005930", False),   # 동일 종목은 '중복'이 아니라 물타기 가드가 처리
+])
+def test_same_issuer(a, b, expected):
+    """우선주를 유니버스에서 빼는 대신, 동시 보유만 막는다.
+
+    2026-08-21: 우선주 전체 제외를 먼저 시도했으나 백테스트 기대값이 +3.38→+3.31% 로
+    떨어졌다(진입 516→479). 실제 위험은 '한 회사 2배 노출'이고 그건 진입 시점에만
+    발생하므로, 후보는 살리고 발생 시점에 막는 쪽이 정확하다.
+    """
+    from src.mcp_servers.trend_mcp.market_data import same_issuer
+    assert same_issuer(a, b) is expected

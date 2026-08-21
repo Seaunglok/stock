@@ -52,7 +52,7 @@ from trend_runtime import (                        # noqa: E402  알림·상태�
     StateCorrupted, acquire_lock, get_state, journal_append, journal_note, load_state,
     log_event, notify, release_lock, save_state,
 )
-from src.mcp_servers.trend_mcp.market_data import get_ohlcv  # noqa: E402
+from src.mcp_servers.trend_mcp.market_data import get_ohlcv, same_issuer  # noqa: E402
 
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
@@ -99,6 +99,10 @@ async def phase_reconcile() -> None:
         a = round(atr(ohlcv, CFG.atr_period), 2) if ohlcv else round(cur * 0.02, 2)
         # 손절은 '현재가' 기준(편입 즉시 손절 방지 — 편입 시점부터 추적), 목표는 '평단' 기준 1:3.
         stop, target = levels(entry, CFG, atr_value=a, stop_ref=cur)
+        # 불타기 추적용 1R 은 '평단' 기준이어야 한다(현재가 기준 stop 과 다름).
+        # 2026-08-21: 9763f78(levels 통합) 때 이 계산을 지웠는데 아래 _pyramid_init 호출부가
+        # 남아 NameError 였다. ADOPT_MODE=off 라 도달하지 않아 잠복했다(테스트도 없었다).
+        e_stop, _ = levels(entry, CFG, atr_value=a)
         jid = uuid.uuid4().hex[:8]
         # 이미 목표가(평단 기준 3R) 위에서 편입되는 장기보유 승자는 partial_done=True —
         # 편입 직후 30% 즉시 매도 방지(편입 취지는 트레일 관리, 신규 진입이 아님).
@@ -233,14 +237,23 @@ async def phase_screen() -> list[dict]:
     universe = get_universe()
     held = {p["symbol"] for p in get_state("positions", [])}
     cands: list[dict] = []
+    illiquid = 0
     for code, name in universe:
         if code in held:
             continue
         ohlcv = get_ohlcv(code)
         if not ohlcv:
             continue
-        foreign, inst = None, None
-        sig = entry_signal(ohlcv, kospi, CFG, foreign, inst)
+        # 유동성 하한 — 백테스트는 매일 적용하는데(backtest_trend.py) 라이브 largecap 경로엔
+        # 없었다. MIN_VALUE_KRW 가 get_universe 로 전달되지만 pykrx 폴백 분기에서만 소비된다.
+        # 라이브가 검증본보다 느슨한 상태였다(2026-08-21 정합).
+        if MIN_VALUE_KRW > 0 and ohlcv[-1].get("value", 0) < MIN_VALUE_KRW:
+            illiquid += 1
+            continue
+        # foreign/inst 는 screen 시점에 조회하지 않는다 → score_institutional 이 항상 0 점이라
+        # 복합점수의 20% 가중치가 죽어 있었다. _composite_score 가 이제 결측 컴포넌트를 빼고
+        # 재정규화하므로 만점이 100 으로 유지된다(signals.py). 실제 수급 반영은 A/B 후 결정.
+        sig = entry_signal(ohlcv, kospi, CFG)
         if sig.passed:
             cl = [b["close"] for b in ohlcv]
             zone = classify_zone(cl[-1], moving_average(cl, 60), moving_average(cl, 120))
@@ -477,10 +490,18 @@ async def _confirm_unknown_buy(sym: str, want_qty: int) -> tuple[float, float]:
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     """후보 1종 매수 → return_code 게이트 → pos/journal/log. 성공 시 pos, 거부/실패 시 None."""
     sym = c["symbol"]
+    held = get_state("positions", [])
     # 물타기 금지(PDF 절대원칙 #1) — 이미 보유 종목엔 재진입 안 함(1종목 1진입)
-    if any(p["symbol"] == sym for p in get_state("positions", [])):
+    if any(p["symbol"] == sym for p in held):
         logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
         shadow_record("already_held", [c])
+        return None
+    # 발행사 중복 금지 — 보통주/우선주를 동시에 들면 한 회사에 2배 노출이다(슬롯 5개 중 2개).
+    # 상위 150 에 삼성전자/삼성전자우, 현대차/현대차우/현대차2우B 쌍이 있다.
+    dup = next((p for p in held if same_issuer(p["symbol"], sym)), None)
+    if dup:
+        logger.warning("[ENTRY] %s 발행사 중복(%s %s 보유 중) — 스킵", sym, dup["symbol"], dup["name"])
+        shadow_record("same_issuer", [c], {"held": dup["symbol"]})
         return None
     # 시세를 못 구하면 **사지 않는다**. 과거엔 `or c["price"]`(전일 종가)로 폴백했는데,
     # 갭업한 날이면 낡은 저가로 수량을 계산해 notional 상한을 넘겨 과대 편입된다.

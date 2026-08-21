@@ -133,12 +133,26 @@ class TrendSignal:
 
 
 def _composite_score(ohlcv: list[dict], foreign_net: float | None, inst_net: float | None) -> tuple[float, dict]:
-    """차수재시실 점수 — closing_bet scorer 컴포넌트 재사용 (순위용)."""
+    """차수재시실 점수 — closing_bet scorer 컴포넌트 재사용 (순위용).
+
+    **결측 컴포넌트는 가중치에서 빼고 재정규화한다.** 2026-08-21 이전엔 수급(0.20)이 데이터
+    없으면 0점으로 들어가 만점이 80 이 됐다. 라이브는 screen 시점에 수급을 조회하지 않으므로
+    이 20% 가 상시 죽어 있었고, "수급 데이터 없음"이 "수급 나쁨"과 구분되지 않았다.
+    재정규화하면 있는 정보만으로 0~100 스케일이 유지된다.
+
+    ※ 이 점수는 **게이트가 아니라 슬롯 배분 순위용**이다(후보 > 슬롯일 때만 작동).
+      구성요소 3/4 가 종가매매(1~3일 보유)용으로 튜닝된 것이라 추세추종 시계와 안 맞는다 —
+      문헌 기반 대안(Clenow 추세품질·52주 근접)과의 A/B 가 예정돼 있다.
+    """
     vs, vb = score_volume_surge(ohlcv)
     cs, cb = score_candle_shape(ohlcv)          # 위꼬리 작을수록 高
     co, ob = score_consolidation(ohlcv)
     inn, ib = score_institutional(foreign_net, inst_net)
-    score = vs * 0.30 + cs * 0.20 + co * 0.30 + inn * 0.20
+    parts = [(vs, 0.30), (cs, 0.20), (co, 0.30)]
+    if foreign_net is not None or inst_net is not None:   # 수급은 데이터 있을 때만 참여
+        parts.append((inn, 0.20))
+    wsum = sum(w for _, w in parts)
+    score = sum(v * w for v, w in parts) / wsum if wsum > 0 else 0.0
     return round(score, 1), {"volume": vb, "candle": cb, "consolidation": ob, "institutional": ib}
 
 

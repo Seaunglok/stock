@@ -129,36 +129,97 @@ def _name(code: str) -> str:
 
 _BROAD_CACHE = _ROOT / "docs_cache" / "broad_universe.json"
 _BROAD_LIMIT = 150
+_BROAD_VERSION = 2          # 올리면 기존 캐시를 무효화하고 재생성한다(필터 규칙 변경 시)
+_STALE_DAYS = 45            # 스냅샷이 이보다 오래되면 경고 — 시총 상위 구성은 분기마다 바뀐다
+
+
+def _is_preferred(code: str, name: str = "") -> bool:
+    """우선주 판정. KRX 코드 끝자리: 0=보통주, 5/7/9(및 K/L/M)=우선주. 종목명 접미도 병행 확인."""
+    c = str(code).zfill(6)
+    if c[-1] not in "0":
+        return True
+    n = (name or "").strip()
+    return n.endswith("우") or n.endswith("우B")
+
+
+def same_issuer(a: str, b: str) -> bool:
+    """같은 발행사인가 — 보통주/우선주 동시 보유 차단용.
+
+    KRX 6자리 코드는 발행사별로 앞 5자리를 공유하고 끝자리만 다르다:
+      005930 삼성전자 / 005935 삼성전자우
+      005380 현대차   / 005385 현대차우 / 005387 현대차2우B
+    둘 다 사면 한 회사에 2배 노출이라 슬롯 5개 중 2개를 같은 리스크에 쓴다.
+    2026-08-21 기준 상위 150 에 이런 쌍이 3건 있다.
+    """
+    a, b = str(a).zfill(6), str(b).zfill(6)
+    return a != b and a[:5] == b[:5]
 
 
 def _broad_codes() -> list[str]:
-    """KOSPI 시총상위 ~150 (docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스.
+    """KOSPI 시총상위 ~150 보통주 (docs_cache/universe_kiwoom_*.json) — 무네트워크·안정 소스.
 
     2026-08-17: 과거엔 sys.path 에 scripts/ 를 끼워넣고 `backtest_dynamic.get_broad_universe`
     를 import 했다. 순수 도메인이 스크립트를 의존하는 역방향 참조이자, 데몬의 유니버스 경로가
     backtest_dynamic 을 통해 pykrx·FDR·closing_bet scorer 를 전이 import 하는 원인이었다
     (이 파일 docstring 의 "외부 의존 없음" 이 사실이 아니게 된 지점). 구현을 여기로 가져오고
     backtest_dynamic 이 이걸 쓰도록 방향을 뒤집었다.
+
+    ⚠️ 이 목록은 **스냅샷 시점의 시총 순위**다(point-in-time 아님). 라이브에선 그 시점 이후
+    상위로 올라온 종목이 후보가 못 되고, 백테스트에 소급 적용하면 생존편향·look-ahead 가 된다.
+    스냅샷이 오래되면 기동 시 경고한다 — `scripts/_universe_kiwoom.py` 로 갱신할 것.
     """
-    if _BROAD_CACHE.exists():
-        try:
-            codes = json.loads(_BROAD_CACHE.read_text(encoding="utf-8"))
-            if codes:
-                return codes
-        except Exception as e:
-            logger.warning("[UNIVERSE] broad 캐시 판독 실패(재생성): %s", e)
+    cached = _read_broad_cache()
+    if cached:
+        return cached
     snaps = sorted((_ROOT / "docs_cache").glob("universe_kiwoom_*.json"), reverse=True)
     if not snaps:
         raise RuntimeError("docs_cache/universe_kiwoom_*.json 없음 — scripts/_universe_kiwoom.py 로 생성")
     raw = json.loads(snaps[0].read_text(encoding="utf-8"))
     kospi = [s for s in raw if s.get("market") in ("거래소", "KOSPI") and s.get("market_cap", 0) > 0]
     kospi.sort(key=lambda s: -s["market_cap"])
-    codes = [str(s["code"]).zfill(6) for s in kospi[:_BROAD_LIMIT]]
+    # 우선주도 유니버스에 남긴다 — 백테스트상 기여가 (-)가 아니었고(제외 시 기대값 3.38→3.31%),
+    # 실제 위험은 '보통주+우선주 동시 보유'뿐이다. 그건 진입 시 발행사 중복 가드로 막는다
+    # (trend_follow._buy_one). 후보를 영구히 버리는 것보다 발생 시점에 막는 쪽이 정확하다.
+    kept = [str(s["code"]).zfill(6) for s in kospi[:_BROAD_LIMIT]]
+    snap_date = snaps[0].stem.replace("universe_kiwoom_", "")
     try:
-        _BROAD_CACHE.write_text(json.dumps(codes, ensure_ascii=False), encoding="utf-8")
+        _BROAD_CACHE.write_text(json.dumps(
+            {"version": _BROAD_VERSION, "snapshot": snap_date, "codes": kept},
+            ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         logger.warning("[UNIVERSE] broad 캐시 기록 실패(무시): %s", e)
-    return codes
+    _warn_if_stale(snap_date)
+    return kept
+
+
+def _read_broad_cache() -> list[str] | None:
+    """캐시 판독 — 버전이 낮거나 형식이 구형(list)이면 None 을 돌려 재생성시킨다."""
+    if not _BROAD_CACHE.exists():
+        return None
+    try:
+        d = json.loads(_BROAD_CACHE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("[UNIVERSE] broad 캐시 판독 실패(재생성): %s", e)
+        return None
+    if not isinstance(d, dict) or d.get("version") != _BROAD_VERSION:
+        logger.info("[UNIVERSE] broad 캐시 구버전 — 재생성(우선주 제외 규칙 반영)")
+        return None
+    codes = d.get("codes") or []
+    if codes:
+        _warn_if_stale(str(d.get("snapshot", "")))
+    return codes or None
+
+
+def _warn_if_stale(snap_date: str) -> None:
+    """스냅샷이 오래됐으면 경고 — 조용히 낡은 유니버스로 도는 것을 막는다."""
+    try:
+        age = (datetime.now() - datetime.strptime(snap_date, "%Y%m%d")).days
+    except Exception:
+        return
+    if age > _STALE_DAYS:
+        logger.warning("[UNIVERSE] ⚠️ 유니버스 스냅샷이 %d일 경과(%s) — 그 이후 시총 상위로 올라온 "
+                       "종목은 후보가 되지 못합니다. `python scripts/_universe_kiwoom.py` 로 갱신 권장",
+                       age, snap_date)
 
 
 def get_universe(mode: str, top_n: int, watchlist: list[str],

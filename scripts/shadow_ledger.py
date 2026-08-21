@@ -63,6 +63,7 @@ REASONS = {
     "no_rebound": "장중 미반등",
     "already_held": "이미 보유(물타기 금지)",
     "order_reject": "주문 거부",
+    "price_fail": "시세조회 실패(사이징 불가)",
     "hist_blocked": "과거 미진입(소급·사유미상)",
 }
 

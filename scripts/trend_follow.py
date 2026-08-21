@@ -482,7 +482,15 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         logger.warning("[ENTRY] %s 이미 보유 — 물타기 금지(1종목 1진입) 스킵", sym)
         shadow_record("already_held", [c])
         return None
-    price = await _realtime_price(sym) or c["price"]
+    # 시세를 못 구하면 **사지 않는다**. 과거엔 `or c["price"]`(전일 종가)로 폴백했는데,
+    # 갭업한 날이면 낡은 저가로 수량을 계산해 notional 상한을 넘겨 과대 편입된다.
+    # 2026-08-21 GS 사고(매도 측 entry 폴백)와 같은 계열 — 없는 가격을 지어내지 않는다.
+    price = await _realtime_price(sym) or await _realtime_price(sym)
+    if not price:
+        logger.error("[ENTRY] %s 시세조회 실패 — 진입 스킵(낡은 가격으로 사이징하지 않음)", sym)
+        shadow_record("price_fail", [c])
+        await notify(f"⚠️ 진입 스킵 {c['name']}({sym}) — 시세조회 실패로 사이징 불가")
+        return None
     # risk 사이징용 손절가는 사이징 시점 가격 기준으로 추정(체결 후 entry 기준 재계산은 아래에서).
     size_stop, _ = levels(price, CFG, atr_value=float(c["atr"]))
     qty = await _size_qty(price, size_stop)

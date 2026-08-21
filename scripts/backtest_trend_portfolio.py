@@ -47,6 +47,7 @@ from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E40
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig, atr, entry_signal, levels, moving_average,
+    pct_of_52w_high, trend_quality,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억 (backtest_trend 과 동일)
@@ -165,8 +166,18 @@ def _bisect(date_list, date_str):
 
 
 # 신호 메모(변형 간 재사용) — entry_signal 은 사이징/슬롯/섹터와 무관하게 (code,date)에 결정적.
-# report() 1회당 clear. 값: (passed, score, atr) 또는 None(게이트 미통과/데이터부족).
+# report() 1회당 clear. 값: (composite, atr, tq, hi) 또는 None(게이트 미통과/데이터부족).
 _SIG_MEMO: dict = {}
+
+# 랭킹 모드 — **후보 > 슬롯일 때 누구를 사는지**만 바꾼다(게이트·진입건수 불변).
+# 현행 composite 는 종가매매(1~3일 보유)용 스코어러 재사용이라 추세추종 시계와 안 맞는다.
+#   composite : 0.30 당일거래량 + 0.20 당일윗꼬리 + 0.30 90일눌림회복 (결측 재정규화)
+#   tq        : Clenow 연율화 지수회귀 기울기 × R² (90봉) — 추세의 강도×신뢰도
+#   high_prox : 120일 고가 근접도 — George-Hwang 52주 신고가 효과의 **단축판**
+#               ※ 논문은 252봉이나 현재 캐시가 종목당 320봉이라 warmup 을 253 으로 올리면
+#                 평가구간이 199일→67일로 붕괴한다. 120 은 need(121) 안이라 구간 손실 0.
+#   blend     : tq 와 high_prox 의 순위 평균(둘 다 정규화 없이 rank 로 합산)
+RANK_MODES = ("composite", "tq", "high_prox", "blend")
 
 
 def _signal(code, date_str, full, kospi_upto, cfg):
@@ -174,15 +185,47 @@ def _signal(code, date_str, full, kospi_upto, cfg):
     if k in _SIG_MEMO:
         return _SIG_MEMO[k]
     sig = entry_signal(full, kospi_upto, cfg)
-    val = (sig.score, atr(full, cfg.atr_period)) if sig.passed else None
+    if not sig.passed:
+        _SIG_MEMO[k] = None
+        return None
+    closes = [b["close"] for b in full]
+    val = (sig.score, atr(full, cfg.atr_period),
+           trend_quality(closes, 90), pct_of_52w_high(full, 120))
     _SIG_MEMO[k] = val
     return val
+
+
+def _rank_key(c: dict, mode: str) -> float:
+    """랭킹 정렬값(클수록 우선). 지표가 None 이면 최하위로 보낸다."""
+    if mode == "tq":
+        return c["tq"] if c["tq"] is not None else -9e9
+    if mode == "high_prox":
+        return c["hi"] if c["hi"] is not None else -9e9
+    if mode == "blend":
+        tq = c["tq"] if c["tq"] is not None else -9e9
+        hi = c["hi"] if c["hi"] is not None else -9e9
+        return tq + hi          # 스케일이 달라 rank 합산은 _sort_cands 에서 처리
+    return c["score"]
+
+
+def _sort_cands(cands: list[dict], mode: str) -> None:
+    """in-place 정렬. blend 는 스케일이 다른 두 지표를 **순위**로 합산한다."""
+    if mode != "blend":
+        cands.sort(key=lambda c: -_rank_key(c, mode))
+        return
+    n = len(cands)
+    rank_tq = {c["code"]: i for i, c in enumerate(
+        sorted(cands, key=lambda c: -(c["tq"] if c["tq"] is not None else -9e9)))}
+    rank_hi = {c["code"]: i for i, c in enumerate(
+        sorted(cands, key=lambda c: -(c["hi"] if c["hi"] is not None else -9e9)))}
+    cands.sort(key=lambda c: rank_tq[c["code"]] + rank_hi[c["code"]])
+    del n
 
 
 # ─── 시뮬레이션 ───────────────────────────────────────────────────────────────
 def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, sz: Sizing,
              max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str],
-             hard_stop_pct: float = 0.0) -> Result:
+             hard_stop_pct: float = 0.0, rank_mode: str = "composite") -> Result:
     """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
 
     hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
@@ -298,8 +341,9 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                 val = _signal(code, date_str, full, kospi_upto, cfg)
                 if val is not None:
                     cands.append({"code": code, "score": val[0], "atr": val[1],
+                                  "tq": val[2], "hi": val[3],
                                   "sector": secmap.get(code, "기타")})
-            cands.sort(key=lambda x: -x["score"])
+            _sort_cands(cands, rank_mode)
             pending = cands
 
         res.equity_curve.append(equity_at(date_str))
@@ -362,9 +406,44 @@ def statistics_pstdev(xs: list[float]) -> float:
 
 
 # ─── 리포트 ──────────────────────────────────────────────────────────────────
+def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
+                max_pos: int, risk_pct: float, hard_stop: float) -> None:
+    """랭킹 A/B — **후보 > 슬롯일 때 누구를 사는가**만 바꿔 비교한다.
+
+    게이트는 전부 동일하므로 '진입 기회'는 같고, 슬롯 경쟁에서의 선택만 달라진다.
+    거래당 하니스(backtest_trend.py)로는 측정 불가 — 거기선 게이트 통과분을 전부 세기 때문에
+    랭킹이 결과에 영향을 주지 않는다. 슬롯 제약이 있는 이 하니스에서만 의미가 있다.
+    """
+    secmap = _sector_map()
+    _SIG_MEMO.clear()
+    dates, *_ = _load(start, end, top_n)
+    dl = len(dates)
+    sizing = Sizing(mode="risk", risk_pct=risk_pct)
+    print()
+    print("=" * 108)
+    print(f"랭킹 A/B — 슬롯 배분 기준 비교 (max_pos={max_pos} · risk {risk_pct}% · 하드손절 {hard_stop:g}%)")
+    print("=" * 108)
+    print(f"  {'랭킹':22} {'최종%':>8} {'CAGR':>7} {'MDD':>7} {'MAR':>6} {'Sharpe':>7} "
+          f"{'청산승률':>7} {'거래':>5} {'평균보유':>7}")
+    print("  " + "-" * 88)
+    for mode in RANK_MODES:
+        res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, 0, True, secmap,
+                       hard_stop_pct=hard_stop, rank_mode=mode)
+        m = pmetrics(res, dl)
+        mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
+        label = mode + (" (현행)" if mode == "composite" else "")
+        print(f"  {label:22} {m['total']:>+7.1f}% {m['cagr']:>+6.1f}% {m['mdd']:>6.1f}% "
+              f"{mar:>6} {m['sharpe']:>7.2f} {m['win']:>6.1f}% {m['entries']:>5} {m['avg_conc']:>7.2f}")
+    print("  " + "-" * 88)
+    print("  composite=현행(종가매매 스코어러 재사용) / tq=Clenow 기울기×R²(90봉)")
+    print("  high_prox=120일 고가 근접(George-Hwang 단축판) / blend=tq·high_prox 순위합")
+    print("  ※ 거래 수가 변형별로 다르면 슬롯 회전율이 달라진 것 — 기대값만 보지 말 것.")
+    print("  ※ 유니버스가 현재 시총 스냅샷 고정이라 생존편향이 있다. **변형 간 상대 비교로만** 읽을 것.")
+
+
 def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
            max_pos: int, base_pct: float, risk_pct: float, sector_cap: int,
-           hard_stop: float = 0.0) -> None:
+           hard_stop: float = 0.0, rank_mode: str = "composite") -> None:
     secmap = _sector_map()
     _SIG_MEMO.clear()
     dates, *_ = _load(start, end, top_n)
@@ -389,7 +468,7 @@ def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
     rows = []
     for label, sizing, cap, partial in variants:
         res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, cap, partial, secmap,
-                       hard_stop_pct=hard_stop)
+                       hard_stop_pct=hard_stop, rank_mode=rank_mode)
         m = pmetrics(res, dl)
         rows.append((label, m))
         mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
@@ -414,6 +493,8 @@ def main():
     p.add_argument("--tax-bps", type=float, default=COSTS.TAX_BPS)      # 라이브와 단일 소스
     p.add_argument("--fee-bps", type=float, default=COSTS.FEE_BPS)
     p.add_argument("--slippage-bps", type=float, default=COSTS.SLIPPAGE_BPS)
+    p.add_argument("--ranktest", action="store_true",
+                   help="랭킹 A/B — 슬롯 배분 기준(composite/tq/high_prox/blend) 비교")
     p.add_argument("--legacy-defaults", action="store_true",
                    help="라이브 미러 없이 구 설정(MA50 청산·하드손절 off·눌림 3%%)으로 실행")
     args = p.parse_args()
@@ -435,6 +516,10 @@ def main():
         hard_stop = HARD_STOP_PCT
         print(f"라이브 미러: 청산MA{cfg.ma_slow} · 하드손절 {hard_stop:g}% · 눌림 {cfg.pullback_pct:g}% · "
               f"보유상한 {cfg.max_hold}일   ※ 외인 청산은 일봉 재현 불가로 미반영")
+    if args.ranktest:
+        report_rank(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
+                    args.risk_pct, hard_stop)
+        return
     report(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
            args.position_pct, args.risk_pct, args.sector_cap, hard_stop=hard_stop)
 

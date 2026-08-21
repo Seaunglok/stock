@@ -77,13 +77,131 @@ def atr(ohlcv: list[dict], period: int = 14) -> float:
     return sum(k) / len(k) if k else 0.0
 
 
-def relative_strength(stock_closes: list[float], kospi_closes: list[float], days: int) -> float:
-    """종목 days 수익률 − KOSPI days 수익률 (%). 데이터 부족 시 0."""
+def relative_strength(stock_closes: list[float], kospi_closes: list[float], days: int,
+                      skip: int = 0) -> float:
+    """종목 days 수익률 − KOSPI days 수익률 (%). 데이터 부족 시 0.
+
+    skip>0 이면 **최근 skip 일을 제외**하고 측정한다(Jegadeesh-Titman 1993 의 12-1 관례).
+    Jegadeesh(1990)가 보인 1개월 단기반전이 모멘텀과 반대로 작용하므로, 형성기간에서 가장
+    최근 구간을 빼면 반전 오염이 줄어든다. skip=0 이 기존 동작(현행 라이브).
+    """
+    end = -skip if skip > 0 else None
+
     def ret(c: list[float]) -> float:
-        if len(c) < days + 1 or c[-days - 1] <= 0:
+        need = days + skip + 1
+        if len(c) < need or c[-need] <= 0:
             return 0.0
-        return (c[-1] - c[-days - 1]) / c[-days - 1] * 100.0
+        return (c[end - 1 if end else -1] - c[-need]) / c[-need] * 100.0
     return ret(stock_closes) - ret(kospi_closes)
+
+
+# ─── 문헌 기반 추세 품질 지표 (2026-08-21 추가 — 랭킹/게이트 A/B 용) ──────────
+# 아직 라이브 선정에 연결돼 있지 않다. backtest_trend.py A/B 로 검증한 뒤에만 채택한다.
+
+def pct_of_52w_high(ohlcv: list[dict], window: int = 252) -> float | None:
+    """현재가 / 52주 최고가 (0~1). George-Hwang(2004).
+
+    52주 신고가 **근접도**가 과거 수익률보다 강한 예측력을 갖고, 장기 반전도 나타나지 않는다는
+    결과(20개국 중 18개국 유효). 1.0 에 가까울수록 신고가 부근.
+    데이터가 window 미만이면 있는 만큼으로 계산하되 60봉 미만이면 None.
+    """
+    if not ohlcv or len(ohlcv) < 60:
+        return None
+    seg = ohlcv[-window:]
+    hi = max(_g(b, "high") for b in seg)
+    cur = _g(ohlcv[-1], "close")
+    if hi <= 0 or cur <= 0:
+        return None
+    return round(min(cur / hi, 1.0), 4)
+
+
+def information_discreteness(closes: list[float], window: int = 252, skip: int = 21) -> float | None:
+    """정보 이산성 ID = sign(누적수익) × (%하락일 − %상승일). Da-Gurun-Warachka(2014).
+
+    "Frog in the Pan" — 정보가 **잦은 소폭**으로 들어온 종목(연속적)은 투자자가 주의를 덜 기울여
+    과소반응이 지속되고, **드문 급등**으로 오른 종목(이산적)은 이미 주목받아 모멘텀이 죽는다.
+    논문 수치: 연속적 +5.94% vs 이산적 −2.07%(형성기간 누적수익률은 동일).
+
+    **낮을수록(음수) 연속적 = 선호**. 상승 종목이 매일 조금씩 오른 경우 %pos 가 커져 ID 가 음수.
+    반대로 며칠 급등으로만 오른 경우 %pos 가 작아 ID 가 양수.
+    """
+    need = window + skip + 1
+    if len(closes) < need:
+        return None
+    seg = closes[-need:len(closes) - skip] if skip > 0 else closes[-window - 1:]
+    if len(seg) < 2 or seg[0] <= 0:
+        return None
+    pret = (seg[-1] - seg[0]) / seg[0]
+    if pret == 0:
+        return None
+    rets = [seg[i] - seg[i - 1] for i in range(1, len(seg))]
+    n = len(rets)
+    pos = sum(1 for r in rets if r > 0) / n
+    neg = sum(1 for r in rets if r < 0) / n
+    return round((1.0 if pret > 0 else -1.0) * (neg - pos), 4)
+
+
+def trend_quality(closes: list[float], window: int = 90) -> float | None:
+    """연율화 지수회귀 기울기 × R². Clenow, *Stocks on the Move*(2015).
+
+    log(가격)에 최소제곱 직선을 적합해 기울기를 연율화하고, 적합도 R² 를 곱해 **변동성으로
+    보정**한다. 같은 상승률이라도 매끄럽게 오른 종목(R²↑)이 높은 점수를 받는다 —
+    "추세가 얼마나 강한가"와 "얼마나 믿을 만한가"를 한 숫자로 합친 것.
+    numpy 없이 순수 파이썬 OLS(표본 90개라 성능 무관).
+    """
+    import math
+    if len(closes) < window or any(c <= 0 for c in closes[-window:]):
+        return None
+    y = [math.log(c) for c in closes[-window:]]
+    n = len(y)
+    xs = list(range(n))
+    mx, my = (n - 1) / 2.0, sum(y) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return None
+    slope = sum((x - mx) * (v - my) for x, v in zip(xs, y)) / sxx
+    intercept = my - slope * mx
+    ss_tot = sum((v - my) ** 2 for v in y)
+    ss_res = sum((v - (intercept + slope * x)) ** 2 for x, v in zip(xs, y))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    annualized = math.exp(slope * 252) - 1.0
+    return round(annualized * r2, 4)
+
+
+def residual_momentum(stock_closes: list[float], kospi_closes: list[float],
+                      window: int = 252, skip: int = 21) -> float | None:
+    """시장 베타를 제거한 잔차 모멘텀. Blitz-Huij-Martens(2011).
+
+    종목 일간수익률을 시장수익률에 회귀해 잔차를 구하고, 형성기간 잔차 누적을 잔차 표준편차로
+    표준화한다. 총수익 모멘텀 대비 위험조정수익이 약 2배이고 시점 일관성도 높다는 결과.
+    현행 RS(단순 수익률 차이)는 암묵적으로 β=1 을 가정하는데, 고베타 종목이 시장 상승만으로
+    RS>0 을 통과하는 경로를 막지 못한다.
+    """
+    need = window + skip + 1
+    if len(stock_closes) < need or len(kospi_closes) < need:
+        return None
+    s = stock_closes[-need:len(stock_closes) - skip] if skip > 0 else stock_closes[-window - 1:]
+    m = kospi_closes[-need:len(kospi_closes) - skip] if skip > 0 else kospi_closes[-window - 1:]
+    if len(s) != len(m) or len(s) < 30:
+        return None
+    sr = [(s[i] - s[i - 1]) / s[i - 1] for i in range(1, len(s)) if s[i - 1] > 0]
+    mr = [(m[i] - m[i - 1]) / m[i - 1] for i in range(1, len(m)) if m[i - 1] > 0]
+    n = min(len(sr), len(mr))
+    if n < 30:
+        return None
+    sr, mr = sr[-n:], mr[-n:]
+    mbar, sbar = sum(mr) / n, sum(sr) / n
+    var = sum((x - mbar) ** 2 for x in mr)
+    if var <= 0:
+        return None
+    beta = sum((x - mbar) * (y - sbar) for x, y in zip(mr, sr)) / var
+    alpha = sbar - beta * mbar
+    resid = [y - (alpha + beta * x) for x, y in zip(mr, sr)]
+    mu = sum(resid) / n
+    sd = (sum((r - mu) ** 2 for r in resid) / n) ** 0.5
+    if sd <= 0:
+        return None
+    return round(sum(resid) / sd, 4)
 
 
 def is_big_bullish_candle(bar: dict, body_pct: float, wick_max: float) -> bool:

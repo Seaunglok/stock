@@ -927,9 +927,14 @@ def _exit_line(x: dict) -> str:
 async def _manage_alerts(when: str, closed: list[dict], sell_failures: list[dict],
                          price_fails: list[str], eval_fails: list[str] | None = None) -> None:
     """포지션 관리 후 알림 — 시세조회 실패·평가 실패·매도거부 누적·청산 요약."""
-    # 청산 phase 에서 시세조회 실패 = 청산 기회를 침묵 속에 놓칠 수 있음 → 알림
-    if price_fails and when == "exit":
-        await notify("⚠️ 청산 phase 시세조회 실패 — 청산판정 보류(다음 cycle 재시도): " + ", ".join(price_fails))
+    # 시세조회 실패 = 그 종목은 이번 cycle 에 **손절 판정 자체가 안 됐다**(가짜 가격으로 팔지 않는다).
+    # exit phase 면 그날 마지막 기회라 critical, 장중이면 다음 폴링이 있으므로 경고.
+    if price_fails:
+        await notify(f"⚠️ [{when}] 시세조회 실패 {len(price_fails)}종 — 청산판정 건너뜀(포지션 유지)\n"
+                     + ", ".join(price_fails)
+                     + ("\n→ 오늘 마지막 판정 기회였습니다. HTS 확인 권장." if when == "exit"
+                        else "\n→ 다음 폴링에서 재시도합니다."),
+                     critical=(when == "exit"))
     # 평가 자체가 실패한 종목 = 청산 신호가 있었는지조차 모른다 → 시세실패보다 심각
     if eval_fails:
         await notify(f"🚨 <b>[{when}] 청산판정 실패 {len(eval_fails)}종</b> — 해당 종목은 이번 cycle 미평가\n"
@@ -990,10 +995,17 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
         sym, entry, qty = pos["symbol"], pos["entry_price"], int(pos["qty"])
         cur = await _realtime_price(sym)
         if not cur:
-            # entry 폴백은 pnl 0 으로 위장돼 트레일/손절이 침묵 — 최소한 경고는 남긴다
+            cur = await _realtime_price(sym)          # 일시 장애 대비 1회 재조회
+        if not cur:
+            # ★ 2026-08-21 사고: 과거엔 `cur = entry` 로 폴백하고 판정을 **계속했다**.
+            #   트레일이 진입가 위로 래칫된 승자는 entry < stop 이므로 폴백값이 즉시 손절선
+            #   아래가 된다 → 시세 조회 한 번 실패로 GS(+26%)가 강제 청산됐다.
+            #   주석은 '보류'라고 써 있었으나 코드는 보류하지 않았다.
+            #   가짜 가격으로는 어떤 판정도 하지 않는다 — 포지션을 그대로 두고 다음 cycle 에 맡긴다.
             price_fails.append(f"{pos['name']}({sym})")
-            logger.warning("[%s] %s 시세조회 실패 — entry 폴백(청산판정 보류)", when, sym)
-            cur = entry
+            logger.error("[%s] %s 시세조회 실패 — 청산판정 건너뜀(포지션 유지)", when, sym)
+            remaining.append(pos)
+            return
         a = float(pos.get("atr", 0) or 0)
         peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
         pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)

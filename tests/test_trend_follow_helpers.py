@@ -144,3 +144,57 @@ def test_heartbeat_pair_consistent():
     m = re.search(r"^HEARTBEAT_STALE_SEC\s*=\s*(\d+)", src, re.M)
     assert m and int(m.group(1)) == HEARTBEAT_STALE_SEC, \
         f"watchdog({m.group(1) if m else '?'}) != config({HEARTBEAT_STALE_SEC})"
+
+
+# ─── 시세조회 실패 시 가짜 가격으로 판정하지 않는다 (2026-08-21 GS 사고) ────────
+def test_entry_fallback_would_stop_out_a_winner():
+    """★ 사고 재현: 트레일이 진입가 위로 래칫된 승자는 entry 폴백값이 즉시 손절선 아래다.
+
+    GS 실제 값 — 진입 91,200 / 트레일 stop 108,157(peak 120,700) / 당시 실제가 ~115,300.
+    시세조회 실패로 cur=entry(91,200) 를 넣으면 손절이 발동한다. 즉 **이기고 있는 포지션만
+    골라서** 터진다. 그래서 폴백 가격으로는 어떤 판정도 하면 안 된다.
+    """
+    from src.mcp_servers.trend_mcp.signals import exit_decision
+    entry, stop = 91_200.0, 108_157.0
+    act, reason, _ = exit_decision(entry=entry, cur=entry, qty=4, target=128_828.0,
+                                   stop=stop, partial_done=False, hard_stop_pct=10.0)
+    assert act == "EXIT" and "트레일" in reason, "폴백값이 손절을 발동시킨다는 전제 자체를 확인"
+    # 실제 시세였다면 홀드였어야 한다
+    act2, _, _ = exit_decision(entry=entry, cur=115_300.0, qty=4, target=128_828.0,
+                               stop=stop, partial_done=False, hard_stop_pct=10.0)
+    assert act2 is None, "실제가 115,300 은 stop 108,157 위 → 홀드"
+
+
+def test_manage_skips_position_when_price_unavailable(monkeypatch):
+    """시세조회가 실패하면 그 종목은 remaining 에 남고 매도 주문이 나가지 않아야 한다."""
+    import asyncio
+    sold = []
+
+    async def no_price(sym):
+        return None
+
+    async def boom_sell(mcp, when, sym, qty):
+        sold.append(sym)
+        return {}, True, ""
+
+    pos = {"symbol": "078930", "name": "GS", "qty": 4, "entry_price": 91_200.0,
+           "stop_price": 108_157.0, "peak_price": 120_700.0, "target": 128_828.0,
+           "atr": 3000.0, "partial_done": False, "journal_id": "x",
+           "buy_date": "2026-07-30"}
+    saved = {}
+    monkeypatch.setattr(tf, "_realtime_price", no_price)
+    monkeypatch.setattr(tf, "_sell_with_retry", boom_sell)
+    monkeypatch.setattr(tf, "get_state", lambda k, d=None: [dict(pos)] if k == "positions" else d)
+    monkeypatch.setattr(tf, "save_state", lambda k, v: saved.update({k: v}))
+    monkeypatch.setattr(tf, "notify", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(tf, "log_event", lambda *a, **k: None)
+
+    class _MCP:
+        tools = [{"name": "place_sell_order"}]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+    monkeypatch.setattr(tf, "MCPManager", lambda *a, **k: _MCP())
+
+    asyncio.run(tf._manage(do_exit_signals=False, when="intraday"))
+    assert sold == [], "가짜 가격으로 매도 주문이 나갔다"
+    assert len(saved.get("positions", [])) == 1, "포지션이 유지돼야 한다"

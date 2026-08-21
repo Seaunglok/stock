@@ -186,3 +186,63 @@ def test_residual_momentum_needs_history():
 def test_residual_momentum_handles_flat_market():
     """시장이 완전 무변동이면 베타 추정이 불가 → None(0 으로 위장하지 않는다)."""
     assert residual_momentum([100 + i for i in range(300)], [100.0] * 300) is None
+
+
+# ─── 랭킹 (assign_rank_scores) — 2026-08-21 blend 채택 ────────────────────────
+def _c(sym, score, tq, hi):
+    return {"symbol": sym, "score": score, "tq": tq, "hi": hi}
+
+
+def test_blend_uses_rank_sum_not_raw_values():
+    """★ tq 와 hi 는 스케일이 전혀 다르다(tq=연율화 배수 수준, hi=0~1 비율).
+
+    값을 그대로 더하면 tq 가 지배해 hi 가 사실상 무시된다.
+    A 는 tq 가 압도적(9.00)이라 **값 합산이면 1등**이지만, 순위합에서는 hi 꼴찌라 밀린다.
+      순위(tq 내림차순): A=0, C=1, B=2      순위(hi 내림차순): C=0, B=1, A=2
+      순위합:            A=2,  B=3,  C=1  → C 가 1등
+    """
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = [_c("A", 50, 9.00, 0.70), _c("B", 50, 0.50, 0.95), _c("C", 50, 0.60, 0.99)]
+    raw_best = max(cands, key=lambda c: c["tq"] + c["hi"])["symbol"]
+    assert raw_best == "A", "전제 확인 — 값 합산이면 A 가 1등"
+    assign_rank_scores(cands, "blend")
+    order = [c["symbol"] for c in sorted(cands, key=lambda x: -x["rank_score"])]
+    assert order == ["C", "A", "B"], f"순위합 결과가 다르다: {order}"
+
+
+def test_rank_score_is_0_100_scale():
+    """가점(+5)이 기존과 같은 의미를 갖도록 0~100 스케일을 유지한다."""
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = [_c(str(i), 50, i * 0.1, i * 0.01) for i in range(6)]
+    assign_rank_scores(cands, "blend")
+    vals = [c["rank_score"] for c in cands]
+    assert min(vals) == 0.0 and max(vals) == 100.0
+
+
+def test_composite_mode_preserves_existing_score():
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = [_c("A", 71.5, 1.0, 0.9), _c("B", 33.0, 2.0, 0.8)]
+    assign_rank_scores(cands, "composite")
+    assert [c["rank_score"] for c in cands] == [71.5, 33.0]
+
+
+def test_missing_indicator_ranks_last():
+    """지표 결측을 0 으로 취급하면 '데이터 없음'이 '최악'과 섞인다 → 최하위로 보내되 탈락은 아님."""
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = [_c("A", 50, None, None), _c("B", 50, 0.1, 0.5), _c("C", 50, 0.2, 0.6)]
+    assign_rank_scores(cands, "blend")
+    assert min(cands, key=lambda c: c["rank_score"])["symbol"] == "A"
+
+
+def test_single_candidate_gets_full_score():
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = [_c("A", 42.0, None, None)]
+    assign_rank_scores(cands, "blend")
+    assert cands[0]["rank_score"] == 42.0
+
+
+def test_empty_list_is_safe():
+    from src.mcp_servers.trend_mcp.signals import assign_rank_scores
+    cands = []
+    assign_rank_scores(cands, "blend")
+    assert cands == []

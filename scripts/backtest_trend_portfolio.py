@@ -41,13 +41,13 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 with contextlib.redirect_stdout(io.StringIO()):
     import FinanceDataReader as fdr
 
-from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
+from backtest_dynamic import get_broad_universe, get_market_series, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs                       # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    TrendConfig, atr, entry_signal, levels, moving_average,
-    pct_of_52w_high, trend_quality,
+    RANK_MODES, TrendConfig, assign_rank_scores, atr, entry_signal, levels,
+    moving_average, pct_of_52w_high, trend_quality,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억 (backtest_trend 과 동일)
@@ -121,8 +121,7 @@ def _load(start: str, end: str, top_n: int):
     key = (start, end, top_n)
     if key in _CACHE:
         return _CACHE[key]
-    kospi = fdr.DataReader("^KS11", start, end)
-    dates = [d.strftime("%Y-%m-%d") for d in kospi.index]
+    dates, _mkt_close = get_market_series(start, end)
     codes = get_broad_universe()[:top_n]
     bars: dict[str, dict] = {}     # code → {date → bar}
     closes: dict[str, list] = {}   # code → date-ordered close list (동일 캘린더 정렬용)
@@ -177,9 +176,6 @@ _SIG_MEMO: dict = {}
 #               ※ 논문은 252봉이나 현재 캐시가 종목당 320봉이라 warmup 을 253 으로 올리면
 #                 평가구간이 199일→67일로 붕괴한다. 120 은 need(121) 안이라 구간 손실 0.
 #   blend     : tq 와 high_prox 의 순위 평균(둘 다 정규화 없이 rank 로 합산)
-RANK_MODES = ("composite", "tq", "high_prox", "blend")
-
-
 def _signal(code, date_str, full, kospi_upto, cfg):
     k = (code, date_str)
     if k in _SIG_MEMO:
@@ -195,37 +191,11 @@ def _signal(code, date_str, full, kospi_upto, cfg):
     return val
 
 
-def _rank_key(c: dict, mode: str) -> float:
-    """랭킹 정렬값(클수록 우선). 지표가 None 이면 최하위로 보낸다."""
-    if mode == "tq":
-        return c["tq"] if c["tq"] is not None else -9e9
-    if mode == "high_prox":
-        return c["hi"] if c["hi"] is not None else -9e9
-    if mode == "blend":
-        tq = c["tq"] if c["tq"] is not None else -9e9
-        hi = c["hi"] if c["hi"] is not None else -9e9
-        return tq + hi          # 스케일이 달라 rank 합산은 _sort_cands 에서 처리
-    return c["score"]
-
-
-def _sort_cands(cands: list[dict], mode: str) -> None:
-    """in-place 정렬. blend 는 스케일이 다른 두 지표를 **순위**로 합산한다."""
-    if mode != "blend":
-        cands.sort(key=lambda c: -_rank_key(c, mode))
-        return
-    n = len(cands)
-    rank_tq = {c["code"]: i for i, c in enumerate(
-        sorted(cands, key=lambda c: -(c["tq"] if c["tq"] is not None else -9e9)))}
-    rank_hi = {c["code"]: i for i, c in enumerate(
-        sorted(cands, key=lambda c: -(c["hi"] if c["hi"] is not None else -9e9)))}
-    cands.sort(key=lambda c: rank_tq[c["code"]] + rank_hi[c["code"]])
-    del n
-
-
 # ─── 시뮬레이션 ───────────────────────────────────────────────────────────────
 def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, sz: Sizing,
              max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str],
-             hard_stop_pct: float = 0.0, rank_mode: str = "composite") -> Result:
+             hard_stop_pct: float = 0.0, rank_mode: str = "composite",
+             regime_ma: int = 0, breadth_min: float = 0.0) -> Result:
     """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
 
     hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
@@ -323,6 +293,32 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
         positions = still
 
         # ── 3) 당일 종가 신호 → 익일 진입 후보(랭킹) ──
+        # ── 시장 게이트 (2026-08-21 추가) ─────────────────────────────────
+        # 이 하니스엔 레짐·breadth 게이트가 없었다. 라이브는 KOSPI<MA60 이면 신규진입을
+        # **전면 차단**하는데(08-18 첫 발동 후 진입 0건), 하니스는 하락장에도 자유롭게 들어가
+        # 라이브가 하지 않을 거래로 랭킹을 평가하고 있었다. 시장 게이트 없이 잰 결과는
+        # 라이브 성과의 대용이 될 수 없다.
+        blocked = False
+        if regime_ma > 0:
+            mk = _kospi_upto(start, end, date_str)
+            kma = moving_average(mk, regime_ma) if mk else None
+            if kma is None or (mk and mk[-1] < kma):
+                blocked = True
+        if not blocked and breadth_min > 0:
+            # 라이브는 업종지수 상승종목 비율을 쓰지만 하니스엔 없다 → 그날 유니버스 양봉비율로 근사
+            # (backtest_trend.py 의 V_BREADTH_MIN_PCT 와 동일 대용).
+            day = [dmap.get(date_str) for dmap in bars.values()]
+            day = [b for b in day if b]
+            if day:
+                rising = sum(1 for b in day if b["close"] > b["open"])
+                if rising / len(day) < breadth_min:
+                    blocked = True
+        if blocked:
+            pending = []
+            res.equity_curve.append(equity_at(date_str))
+            res.concurrent.append(len(positions))
+            continue
+
         if di < len(dates) - 1 and len(positions) < max_pos:
             kospi_upto = None   # RS 는 종목 자체 시계열로 계산됨(entry_signal 내부) → KOSPI 필요분만
             cands = []
@@ -343,7 +339,8 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                     cands.append({"code": code, "score": val[0], "atr": val[1],
                                   "tq": val[2], "hi": val[3],
                                   "sector": secmap.get(code, "기타")})
-            _sort_cands(cands, rank_mode)
+            assign_rank_scores(cands, rank_mode)
+            cands.sort(key=lambda c: -c["rank_score"])
             pending = cands
 
         res.equity_curve.append(equity_at(date_str))
@@ -363,9 +360,7 @@ _KOSPI_CACHE: dict = {}
 def _kospi_upto(start, end, date_str):
     key = (start, end)
     if key not in _KOSPI_CACHE:
-        k = fdr.DataReader("^KS11", start, end)
-        _KOSPI_CACHE[key] = ([d.strftime("%Y-%m-%d") for d in k.index],
-                             [float(c) for c in k["Close"].values])
+        _KOSPI_CACHE[key] = get_market_series(start, end)
     kd, kc = _KOSPI_CACHE[key]
     idx = _bisect(kd, date_str)
     return kc[:idx + 1] if idx is not None else kc
@@ -407,7 +402,8 @@ def statistics_pstdev(xs: list[float]) -> float:
 
 # ─── 리포트 ──────────────────────────────────────────────────────────────────
 def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
-                max_pos: int, risk_pct: float, hard_stop: float) -> None:
+                max_pos: int, risk_pct: float, hard_stop: float,
+                regime_ma: int = 0, breadth_min: float = 0.0) -> None:
     """랭킹 A/B — **후보 > 슬롯일 때 누구를 사는가**만 바꿔 비교한다.
 
     게이트는 전부 동일하므로 '진입 기회'는 같고, 슬롯 경쟁에서의 선택만 달라진다.
@@ -428,7 +424,8 @@ def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs
     print("  " + "-" * 88)
     for mode in RANK_MODES:
         res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, 0, True, secmap,
-                       hard_stop_pct=hard_stop, rank_mode=mode)
+                       hard_stop_pct=hard_stop, rank_mode=mode,
+                       regime_ma=regime_ma, breadth_min=breadth_min)
         m = pmetrics(res, dl)
         mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
         label = mode + (" (현행)" if mode == "composite" else "")
@@ -443,7 +440,8 @@ def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs
 
 def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
            max_pos: int, base_pct: float, risk_pct: float, sector_cap: int,
-           hard_stop: float = 0.0, rank_mode: str = "composite") -> None:
+           hard_stop: float = 0.0, rank_mode: str = "composite",
+           regime_ma: int = 0, breadth_min: float = 0.0) -> None:
     secmap = _sector_map()
     _SIG_MEMO.clear()
     dates, *_ = _load(start, end, top_n)
@@ -468,7 +466,8 @@ def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
     rows = []
     for label, sizing, cap, partial in variants:
         res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, cap, partial, secmap,
-                       hard_stop_pct=hard_stop, rank_mode=rank_mode)
+                       hard_stop_pct=hard_stop, rank_mode=rank_mode,
+                       regime_ma=regime_ma, breadth_min=breadth_min)
         m = pmetrics(res, dl)
         rows.append((label, m))
         mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
@@ -503,25 +502,29 @@ def main():
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
     # 기본 = 라이브 미러. 이 하니스는 사이징·MDD 판단의 근거라, 라이브와 다른 청산룰로 돌면
     # "리스크 균등 사이징이 MDD 를 줄인다" 같은 결론 자체가 다른 전략의 결론이 된다.
-    hard_stop = 0.0
+    hard_stop, regime_ma, breadth_min = 0.0, 0, 0.0
     if args.legacy_defaults:
         print("⚠️ --legacy-defaults: 구 설정(MA50·하드손절 off·눌림 3%)으로 실행합니다.")
     else:
-        from trend_config import CFG as LIVE, EXIT_MA, HARD_STOP_PCT, MAX_HOLD_DAYS
+        from trend_config import (BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, HARD_STOP_PCT,
+                                  MAX_HOLD_DAYS, REGIME_MA)
         cfg.ma_slow = EXIT_MA                    # 청산 이평선(라이브 MA120)
         cfg.pullback_pct = LIVE.pullback_pct
         cfg.atr_k, cfg.stop_pct, cfg.rr, cfg.partial_pct = LIVE.atr_k, LIVE.stop_pct, LIVE.rr, LIVE.partial_pct
         if MAX_HOLD_DAYS > 0:
             cfg.max_hold = MAX_HOLD_DAYS
         hard_stop = HARD_STOP_PCT
+        regime_ma, breadth_min = REGIME_MA, BREADTH_MIN_PCT
         print(f"라이브 미러: 청산MA{cfg.ma_slow} · 하드손절 {hard_stop:g}% · 눌림 {cfg.pullback_pct:g}% · "
-              f"보유상한 {cfg.max_hold}일   ※ 외인 청산은 일봉 재현 불가로 미반영")
+              f"보유상한 {cfg.max_hold}일 · 레짐 MA{regime_ma or 'off'} · breadth {breadth_min or 'off'}"
+              f"   ※ 외인 청산은 일봉 재현 불가로 미반영")
     if args.ranktest:
         report_rank(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
-                    args.risk_pct, hard_stop)
+                    args.risk_pct, hard_stop, regime_ma, breadth_min)
         return
     report(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
-           args.position_pct, args.risk_pct, args.sector_cap, hard_stop=hard_stop)
+           args.position_pct, args.risk_pct, args.sector_cap, hard_stop=hard_stop,
+           regime_ma=regime_ma, breadth_min=breadth_min)
 
 
 if __name__ == "__main__":

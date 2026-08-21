@@ -30,7 +30,7 @@ import contextlib, io
 with contextlib.redirect_stdout(io.StringIO()):
     import FinanceDataReader as fdr
 
-from backtest_dynamic import get_broad_universe, get_ohlcv  # noqa: E402
+from backtest_dynamic import get_broad_universe, get_market_series, get_ohlcv  # noqa: E402
 from backtest_walkforward import Costs, metrics              # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
@@ -269,9 +269,8 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
         dates, kospi_close, broad = _UNIV_CACHE[key]
         print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} (캐시 재사용 {len(broad)}종목)")
     else:
-        kospi = fdr.DataReader("^KS11", start, end)
-        dates = [d.strftime("%Y%m%d") for d in kospi.index]
-        kospi_close = [float(c) for c in kospi["Close"].values]
+        _mdates, kospi_close = get_market_series(start, end)
+        dates = [d.replace("-", "") for d in _mdates]
         print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs}")
 
         if mode == "watchlist":

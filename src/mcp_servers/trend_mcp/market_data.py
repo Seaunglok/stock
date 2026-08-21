@@ -49,10 +49,18 @@ def get_ohlcv(symbol: str, days: int = 320) -> list[dict]:
             return []
         out = []
         for d, row in df.tail(days + 1).iterrows():
+            close = float(row.get("종가", 0))
+            volume = float(row.get("거래량", 0))
+            # ⚠️ pykrx get_market_ohlcv_by_date 는 **거래대금 컬럼을 주지 않는다**
+            #    (시가/고가/저가/종가/거래량/등락률뿐). 과거엔 row.get("거래대금", 0) 로 읽어
+            #    value 가 **전 종목 항상 0** 이었다. score_volume_surge 는 `value or volume`
+            #    폴백이 있어 조용히 넘어갔지만, 2026-08-21 유동성 필터를 붙이자 모든 후보가
+            #    걸러져 스크리닝 결과가 0종이 됐다(발견 계기).
+            #    backtest_dynamic.get_ohlcv 는 처음부터 volume*close 로 계산한다 — 동일하게 맞춘다.
+            value = float(row.get("거래대금", 0)) or volume * close
             out.append({"date": d.strftime("%Y-%m-%d"), "open": float(row.get("시가", 0)),
                         "high": float(row.get("고가", 0)), "low": float(row.get("저가", 0)),
-                        "close": float(row.get("종가", 0)), "volume": float(row.get("거래량", 0)),
-                        "value": float(row.get("거래대금", 0))})
+                        "close": close, "volume": volume, "value": value})
         # 장중이면 오늘 미완성 일봉 제거 — 거래량·종가가 미완성이라 게이트 판정 왜곡(과소평가) 방지.
         # 추세추종은 '완성된 일봉'으로 신호를 잡고 익일 진입하는 검증 방식과 동일.
         if out and _market_open_now() and out[-1]["date"] == datetime.now().strftime("%Y-%m-%d"):

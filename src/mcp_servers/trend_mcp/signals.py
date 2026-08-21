@@ -95,8 +95,57 @@ def relative_strength(stock_closes: list[float], kospi_closes: list[float], days
     return ret(stock_closes) - ret(kospi_closes)
 
 
-# ─── 문헌 기반 추세 품질 지표 (2026-08-21 추가 — 랭킹/게이트 A/B 용) ──────────
-# 아직 라이브 선정에 연결돼 있지 않다. backtest_trend.py A/B 로 검증한 뒤에만 채택한다.
+# ─── 랭킹 (후보 > 슬롯일 때 누구를 사는가) ───────────────────────────────────
+RANK_MODES = ("composite", "tq", "high_prox", "blend")
+
+
+def assign_rank_scores(cands: list[dict], mode: str = "blend") -> None:
+    """후보에 `rank_score`(0~100, 클수록 우선)를 **in-place** 부여한다. 라이브·백테스트 공용 정본.
+
+    입력 후보 dict 는 `score`(복합점수)·`tq`·`hi` 를 갖는다(없으면 None 취급).
+
+    blend 는 tq 와 high_prox 를 **순위로** 합산한다 — 두 지표는 스케일이 전혀 달라
+    (tq 는 연율화 수익률 배수, hi 는 0~1 비율) 값을 직접 더하면 tq 가 지배한다.
+    순위합은 그날 후보군 안에서의 상대 위치만 쓰므로 스케일에 무관하다.
+
+    2026-08-21 A/B(포트폴리오 하니스, 라이브 게이트 미러, 2025-01~2026-08):
+        composite  MAR 0.78 / Sharpe 0.80 / MDD 11.7%   ← 현행(종가매매 스코어러 재사용)
+        tq         MAR 1.13 / Sharpe 0.93 / MDD  9.8%
+        high_prox  MAR 1.10 / Sharpe 0.93 / MDD 10.8%
+        blend      MAR 1.60 / Sharpe 1.18 / MDD  9.3%   ← 채택
+    ※ 게이트를 미러하지 않은 초기 측정에선 결론이 정반대로 나왔다(tq MAR 3.50→0.35).
+      하락장에 라이브가 하지 않을 진입을 하니스가 했기 때문 — 시장 게이트 없이 잰 랭킹은
+      라이브 성과의 대용이 아니다.
+    """
+    n = len(cands)
+    if n == 0:
+        return
+    if n == 1 or mode == "composite":
+        for c in cands:
+            c["rank_score"] = float(c.get("score") or 0.0)
+        return
+
+    def _order(key: str) -> dict[int, int]:
+        """key 내림차순 순위(0=최상). 결측은 최하위."""
+        idx = sorted(range(n), key=lambda i: -(cands[i].get(key)
+                                               if cands[i].get(key) is not None else -9e9))
+        return {orig: rank for rank, orig in enumerate(idx)}
+
+    if mode == "tq":
+        pos = _order("tq")
+        worst = n - 1
+    elif mode == "high_prox":
+        pos = _order("hi")
+        worst = n - 1
+    else:                                   # blend — 두 순위의 합
+        rt, rh = _order("tq"), _order("hi")
+        pos = {i: rt[i] + rh[i] for i in range(n)}
+        worst = 2 * (n - 1)
+    for i, c in enumerate(cands):
+        c["rank_score"] = round(100.0 * (1.0 - pos[i] / worst), 1) if worst else 100.0
+
+
+# ─── 문헌 기반 추세 품질 지표 (2026-08-21 추가) ──────────────────────────────
 
 def pct_of_52w_high(ohlcv: list[dict], window: int = 252) -> float | None:
     """현재가 / 52주 최고가 (0~1). George-Hwang(2004).

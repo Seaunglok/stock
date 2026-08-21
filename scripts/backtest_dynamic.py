@@ -36,6 +36,44 @@ OHLCV_CACHE.mkdir(parents=True, exist_ok=True)
 
 MIN_VALUE_KRW = 1_000 * 10**8  # 1000억
 
+# 시장 시계열 소스 — KRX 지수 API 인증화(2026-07) 이후 ^KS11/pykrx 지수가 모두 막혔다.
+# ETF 는 개별종목 경로라 여전히 조회된다. KODEX 200 은 KOSPI200 추종이라 대형주 유니버스의
+# 벤치마크로는 오히려 더 맞는다(RS 게이트가 시총 상위 100 을 상대로 재는 것이므로).
+_MARKET_FALLBACKS = (("069500", "KODEX 200"), ("102110", "TIGER 200"))
+_MARKET_MEMO: dict = {}
+
+
+def get_market_series(start: str, end: str) -> tuple[list[str], list[float]]:
+    """(영업일 리스트 'YYYY-MM-DD', 종가 리스트) — ^KS11 우선, 실패 시 KOSPI200 ETF 폴백.
+
+    **폴백이 걸리면 벤치마크가 바뀌므로 절대 수치를 과거 실행과 비교하면 안 된다.**
+    한 번의 실행 안에서는 모든 변형이 같은 시계열을 쓰므로 변형 간 비교는 유효하다.
+    """
+    key = (start, end)
+    if key in _MARKET_MEMO:
+        return _MARKET_MEMO[key]
+    # ⚠️ 심볼의 캐럿을 떼면 안 된다. FDR 에서 "^KS11" 은 Yahoo 계열 경로로 조회되지만
+    #    "KS11" 은 KRX 지수 엔드포인트로 가 인증 요구(LOGOUT)에 걸린다 — 2026-07 인증화 이후.
+    for sym, label in (("^KS11", "KOSPI"),) + _MARKET_FALLBACKS:
+        try:
+            df = fdr.DataReader(sym, start, end)
+            if df is None or df.empty or "Close" not in df:
+                continue
+            dates = [d.strftime("%Y-%m-%d") for d in df.index]
+            closes = [float(c) for c in df["Close"].values]
+            pairs = [(d, c) for d, c in zip(dates, closes) if c == c and c > 0]
+            if len(pairs) < 60:
+                continue
+            if sym != "^KS11":
+                print(f"  ⚠️ KOSPI 지수 조회 실패 → {label}({sym}) 로 대체. "
+                      f"벤치마크가 다르므로 과거 실행 수치와 직접 비교 금지.")
+            res = ([d for d, _ in pairs], [c for _, c in pairs])
+            _MARKET_MEMO[key] = res
+            return res
+        except Exception:
+            continue
+    raise RuntimeError("시장 시계열을 구할 수 없습니다(^KS11·KOSPI200 ETF 전부 실패)")
+
 
 def _suppress():
     return contextlib.redirect_stdout(io.StringIO())

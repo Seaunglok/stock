@@ -34,9 +34,10 @@ from trend_config import (                  # noqa: E402  env·상수·logger·C
     ENTRY_CUTOFF, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA, FORCE_PHASE,
     FOREIGN_TREND_MA, FUND_BONUS, HARD_STOP_PCT, HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
     INTRADAY_POLL_MIN,
-    INVEST_PER_TRADE, JOURNAL_FILE, MAX_HOLD_DAYS, MAX_NOTIONAL_PCT, MAX_POS, MOCK_MODE,
+    INVEST_PER_TRADE, JOURNAL_FILE, MAX_HOLD_DAYS, MAX_NOTIONAL_PCT, MAX_POS, MIN_VALUE_KRW,
+    MOCK_MODE,
     POSITION_PCT, PREMARKET_GAPDOWN_VETO, PRODUCTION_MODE, PYRAMID_ADDS, PYRAMID_BYPASS_GATE,
-    PYRAMID_LOOKBACK, PYRAMID_MIN_NET, PYRAMID_STEP_R, REGIME_MA, RISK_PCT,
+    PYRAMID_LOOKBACK, PYRAMID_MIN_NET, PYRAMID_STEP_R, RANK_MODE, REGIME_MA, RISK_PCT,
     ROUNDTRIP_COST_PCT, SCHEDULE, SECTOR_BONUS, SECTOR_BREADTH, SECTOR_GATE, SECTOR_MIN_AVG,
     SECTOR_TOP_K, SIZING_MODE, TRADING_URL, UNIVERSE_MODE, USE_FOREIGN_EXIT, WATCHLIST,
     _ROOT, logger, setup_daemon_runtime,
@@ -57,7 +58,8 @@ from src.mcp_servers.trend_mcp.market_data import get_ohlcv, same_issuer  # noqa
 from src.claude_agents.base.mcp_client import MCPManager  # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
-    entry_signal, atr, levels, moving_average, classify_zone,
+    entry_signal, assign_rank_scores, atr, levels, moving_average, classify_zone,
+    pct_of_52w_high, trend_quality,
     fundamentals_bonus, leading_sectors, market_breadth, position_size, exit_decision, is_rising,
 )
 
@@ -258,13 +260,17 @@ async def phase_screen() -> list[dict]:
             cl = [b["close"] for b in ohlcv]
             zone = classify_zone(cl[-1], moving_average(cl, 60), moving_average(cl, 120))
             cands.append({"symbol": code, "name": name, "score": sig.score,
+                          # 랭킹 지표(2026-08-21) — score 는 기록 연속성을 위해 그대로 둔다
+                          "tq": trend_quality(cl, 90), "hi": pct_of_52w_high(ohlcv, 120),
                           "price": ohlcv[-1]["close"], "stop": sig.stop, "target": sig.target,
                           "atr": round(atr(ohlcv, CFG.atr_period), 2), "gates": sig.gates,
                           "breakdown": sig.breakdown, "zone": zone})
             logger.info("[SCREEN] ✓ %s %-10s 점수%.1f [%s] 손절%.0f 목표%.0f", code, name[:10], sig.score, zone, sig.stop, sig.target)
         else:
             logger.debug("[SCREEN] %s %s — %s", code, name, sig.reason)
-    cands.sort(key=lambda x: -x["score"])
+    # 랭킹 — 후보 > 슬롯일 때 누구를 사는지 결정한다. RANK_MODE 기본 blend(A/B 채택).
+    assign_rank_scores(cands, RANK_MODE)
+    cands.sort(key=lambda x: -x["rank_score"])
     # 프리장(장전 동시호가) 정보 부착 — 후보에만(표시용). 검증 게이트/점수엔 미반영.
     vetoed = []
     for c in list(cands):
@@ -287,8 +293,8 @@ async def phase_screen() -> list[dict]:
             pts, det = fundamentals_bonus(yoy.get("revenue_yoy"), yoy.get("op_income_yoy"), FUND_BONUS)
             c["fundamental"] = {**det, "bonus": pts}
             if pts > 0:
-                c["score"] = round(c["score"] + pts, 1)
-        cands.sort(key=lambda x: -x["score"])
+                c["rank_score"] = round(c["rank_score"] + pts, 1)
+        cands.sort(key=lambda x: -x["rank_score"])
     save_state("candidates", cands)
     # 날짜 스탬프 — screen 실패 시 phase_entry 가 전일 후보를 매수하는 사고 방지(당일분만 유효)
     save_state("candidates_date", datetime.now().strftime("%Y-%m-%d"))
@@ -601,9 +607,10 @@ async def _apply_sector_rally(cands: list[dict]) -> list[dict]:
         if c["sector"] in lead_names:
             c["sector_lead"] = True
             if SECTOR_BONUS > 0:
-                c["score"] = round(c["score"] + SECTOR_BONUS, 1)
+                # 가점은 랭킹 점수에 붙는다 — score(복합점수)는 기록 연속성을 위해 보존.
+                c["rank_score"] = round(c.get("rank_score", c["score"]) + SECTOR_BONUS, 1)
             logger.info("[SECTOR] ✓ %s %s 주도섹터(%s) 가점 +%g", c["symbol"], c["name"][:10], c["sector"], SECTOR_BONUS)
-    cands.sort(key=lambda x: -x["score"])
+    cands.sort(key=lambda x: -x.get("rank_score", x["score"]))
     if SECTOR_GATE:
         skipped = [c for c in cands if not c.get("sector_lead")]
         cands = [c for c in cands if c.get("sector_lead")]

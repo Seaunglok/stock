@@ -164,6 +164,10 @@ BREADTH_MIN_PCT = float(os.getenv("TREND_BREADTH_MIN_PCT", "0.4") or 0)
 # Reconcile(어댑트) 모드: all=모든 broker 보유분 편입, watchlist=WATCHLIST 종목만, off=어댑트 안 함.
 # 기본 off — 실전에서 HTS 수동매수/장기보유분이 trend 룰(MA120 이탈)로 강제청산되면 되돌릴 수 없다.
 ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "off").lower()
+# 랭킹 기준(후보 > 슬롯일 때 누구를 사는가). composite=구 복합점수(종가매매 스코어러 재사용) /
+# tq=Clenow 기울기×R² / high_prox=120일 고가 근접 / blend=둘의 순위합.
+# 2026-08-21 A/B 채택: blend (MAR 0.78→1.60 · Sharpe 0.80→1.18 · MDD 11.7→9.3%).
+RANK_MODE = os.getenv("TREND_RANK_MODE", "blend")
 
 CFG = TrendConfig(
     mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),

@@ -104,6 +104,9 @@ V_BREADTH_MIN_PCT: float | None = None    # 시장 breadth 게이트: 일별 uni
 # 외인 청산룰(ka10008 완성일 5일합 < 0 이면 종가 청산): None=off / 0=부호만 / >0 = |합|≥ratio×20일평균거래량 일 때만 유효
 V_FOREIGN_MIN_RATIO: float | None = None
 V_FOREIGN_MAP: dict = {}                  # code → (sorted_dates["YYYY-MM-DD"], {date: chg_qty}) — ka10008 이력
+V_MA_BUFFER_PCT: float = 0.0   # MA 이탈 히스테리시스 — 종가 < MA×(1-이 값/100) 일 때만 청산.
+                               # 0=현행(스치기만 해도 청산). 2026-08-25 KB금융이 -0.55% 이탈로
+                               # 팔렸는데 10분 뒤 종가는 MA 위였다 — marginal 이탈 완충 검증용.
 V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
 # 시장 레짐/변동성 필터(2026-08-03): 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장)과
 # 실전구간(5.71%·-20.5% 하락장)의 레짐 불일치가 주원인. 하락장·고변동성 신규진입을 원천 차단.
@@ -141,7 +144,9 @@ def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -
             return False                 # 노이즈 — 신호 아님
     if V_FOREIGN_TREND_MA:               # 추세 확인 — MA(N) 위면 수급만으로 청산하지 않음
         ma = moving_average([b["close"] for b in full[:j + 1]], V_FOREIGN_TREND_MA)
-        if ma is None or bar["close"] >= ma:
+        # 완충(V_MA_BUFFER_PCT): MA 를 스치기만 한 경우 청산하지 않는다.
+        # 2026-08-25 KB금융이 -0.55% 이탈로 팔렸는데 10분 뒤 종가는 MA 위였다.
+        if ma is None or bar["close"] >= ma * (1 - V_MA_BUFFER_PCT / 100.0):
             return False
     return True
 
@@ -193,7 +198,7 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
             break
         # 청산 이평선 하방 돌파(종가)
         ma = moving_average(closes[:j + 1], exit_ma)
-        if ma is not None and b["close"] < ma:
+        if ma is not None and b["close"] < ma * (1 - V_MA_BUFFER_PCT / 100.0):
             realized += rem * (b["close"] - entry) / entry * 100
             rem = 0.0
             break
@@ -251,7 +256,7 @@ def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
         if b["low"] <= stop:
             exit_price = stop; break
         ma = moving_average(closes[:j + 1], exit_ma)
-        if ma is not None and b["close"] < ma:
+        if ma is not None and b["close"] < ma * (1 - V_MA_BUFFER_PCT / 100.0):
             exit_price = b["close"]; break
     if exit_price is None:
         exit_price = closes[last_j]

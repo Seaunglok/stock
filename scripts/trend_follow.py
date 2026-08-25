@@ -470,6 +470,26 @@ async def _verify_buy_fills(bought: list[dict], positions: list[dict]) -> tuple[
     return fixed_bought, positions
 
 
+def _fill_price(resp: Any, fallback: float) -> float:
+    """주문 응답에서 **실제 체결가**를 뽑는다. 없으면 fallback(판정에 쓴 가격).
+
+    2026-08-25: 매수/불타기는 체결가를 썼는데 **매도만 판정가(cur)를 그대로 기록**했다.
+    청산 phase 는 15:20 에 장중 가격으로 판정하고 시장가로 내보내므로, 체결은 그 뒤
+    종가 근처에서 난다 — 둘이 다르다. KB금융은 판정 164,900 / 체결 166,400 으로
+    일지의 net 이 -1.98%(실제 -1.09%), 손익이 -5,200원(실제 -2,905원)으로 기록됐다.
+    08-21 GS 사고(폴백가 91,200 기록 / 실제 115,100 체결)와 같은 계열이다.
+    """
+    d = resp.get("data", {}) if isinstance(resp, dict) else {}
+    raw = d.get("cntr_pric") or d.get("체결가")
+    if not raw:
+        return fallback
+    try:
+        v = float(str(raw).lstrip("+-").replace(",", ""))
+    except Exception:
+        return fallback
+    return v if v > 0 else fallback
+
+
 async def _confirm_unknown_buy(sym: str, want_qty: int) -> tuple[float, float]:
     """응답 불명 매수의 실제 체결 여부를 broker 잔고로 확인 → (체결수량, 평단).
 
@@ -547,9 +567,7 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
         await notify(f"❌ 진입 {tag} {c['name']}({sym}) — {why}",
                      critical=_is_unknown(resp))
         return None
-    d = resp.get("data", {}) if isinstance(resp, dict) else {}
-    fill = d.get("cntr_pric") or d.get("체결가")
-    entry = adopted_entry or (float(str(fill).lstrip("+-").replace(",", "")) if fill else price)
+    entry = adopted_entry or _fill_price(resp, price)
     # 손절/목표는 '실제 체결가' 기준 재계산 — 손익비 1:3 보존(백테스트와 동일).
     stop, target = levels(entry, CFG, atr_value=float(c["atr"]))
     jid = uuid.uuid4().hex[:8]
@@ -901,9 +919,7 @@ async def _pyramid_adds(when: str) -> None:
                                      f"{add_qty}주 — 재전송 안 함\n→ HTS 로 보유수량 확인 필요",
                                      critical=True)
                     continue
-                d = resp.get("data", {}) if isinstance(resp, dict) else {}
-                fill = d.get("cntr_pric") or d.get("체결가")
-                add_price = float(str(fill).lstrip("+-").replace(",", "")) if fill else cur
+                add_price = _fill_price(resp, cur)
                 oq = int(pos["qty"]); nq = oq + add_qty
                 pos["entry_price"] = round((pos["entry_price"] * oq + add_price * add_qty) / nq, 2)
                 pos["qty"] = nq
@@ -932,10 +948,19 @@ async def _exit_signals(pos: dict, cur: float) -> dict:
     장중(intraday)엔 평가하지 않는다(트레일/하드손절만) — 일봉 신호는 마감가 기준이라
     장중 판정이 무의미하고 조회 비용만 든다.
     데이터를 못 구하면 해당 신호는 None = 미적용(fail-open) — 조회 실패로 팔지 않는다.
+
+    **MA 는 완성 종가로만 계산·비교한다**(2026-08-25). 과거엔 장중가 `cur` 를 종가열 끝에
+    덧붙여 MA 를 만들고 `cur` 와 비교했다. 청산 phase 는 15:20 에 도는데 장은 15:30 에 끝나므로,
+    장중엔 MA 아래였다가 종가엔 위인 날 잘못 팔린다 — 08-25 KB금융이 그렇게 나갔다
+    (15:20 164,900 < MA60 165,813 / 종가 166,400 > 165,838).
+    더 결정적으로, 종가 기준이면 이 외인룰은 백테스트에서 **한 번도 발동하지 않는다**(변경 0건).
+    검증된 적 없는 규칙이 장중 판정 때문에 실계좌에서만 작동하고 있었다.
+    반환하는 `ma_ref`(마지막 완성 종가)로 MA 조건만 비교한다 — 트레일·하드손절은 계속 cur.
     """
     sym = pos["symbol"]
     ohlcv = get_ohlcv(sym, max(EXIT_MA, FOREIGN_TREND_MA) + 40)
-    closes_cur = [b["close"] for b in ohlcv] + [cur] if ohlcv else []
+    closes_cur = [b["close"] for b in ohlcv]          # 완성 종가만(장중가 미포함)
+    ma_ref = closes_cur[-1] if closes_cur else None   # MA 비교 기준 = 마지막 완성 종가
     ma_exit = moving_average(closes_cur, EXIT_MA) if ohlcv else None
     foreign = await _foreign_net_5d(sym) if USE_FOREIGN_EXIT else None
     ma_trend = None
@@ -950,7 +975,8 @@ async def _exit_signals(pos: dict, cur: float) -> dict:
     # buy_date 파싱 실패(None)면 판정 불가 → 미적용(다른 신호들과 같은 fail-open). 경고는 남는다.
     held_days = _busdays_since(pos.get("buy_date"))
     aged = MAX_HOLD_DAYS > 0 and held_days is not None and held_days >= MAX_HOLD_DAYS
-    return {"ma_exit": ma_exit, "foreign": foreign, "ma_trend": ma_trend, "aged": aged}
+    return {"ma_exit": ma_exit, "foreign": foreign, "ma_trend": ma_trend,
+            "aged": aged, "ma_ref": ma_ref}
 
 
 def _exit_line(x: dict) -> str:
@@ -1052,7 +1078,8 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             partial_pct=CFG.partial_pct, exit_ma_label=EXIT_MA,
             use_foreign=USE_FOREIGN_EXIT, trend_ma_label=FOREIGN_TREND_MA,
             ma_exit=sig.get("ma_exit"), foreign_net=sig.get("foreign"),
-            ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False))
+            ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False),
+            ma_ref=sig.get("ma_ref"))
         if not action:
             remaining.append(pos); return
         resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
@@ -1067,29 +1094,35 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             sell_failures.append({"symbol": sym, "name": pos["name"], "qty": sell_qty,
                                   "reason": reason, "why": why})
             remaining.append(pos); return
-        pnl_pct = round((cur - entry) / entry * 100, 2)
+        # 손익은 **실제 체결가** 기준으로 기록한다. 판정가(cur)는 15:20 장중 가격이고
+        # 시장가 주문은 그 뒤 종가 근처에서 체결되므로 둘이 다르다(2026-08-25 KB금융:
+        # 판정 164,900 / 체결 166,400 → net -1.98% 로 기록됐으나 실제는 -1.09%).
+        # 사유 문자열에는 판정 근거가 된 가격이 그대로 남아 있어 대조 가능하다.
+        fill = _fill_price(resp, cur)
+        pnl_pct = round((fill - entry) / entry * 100, 2)
         if action == "PARTIAL":
             pos["partial_done"] = True; pos["qty"] = qty - sell_qty
             remaining.append(pos)
             save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
             journal_append({"type": "partial", "id": pos["journal_id"], "symbol": sym, "qty": sell_qty,
-                            "price": cur, "pnl_pct": pnl_pct, "reason": reason})
-            log_event("partial", {"symbol": sym, "qty": sell_qty, "price": cur, "pnl_pct": pnl_pct})
-            await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{cur:,.0f} "
+                            "price": fill, "decided_at": cur, "pnl_pct": pnl_pct, "reason": reason})
+            log_event("partial", {"symbol": sym, "qty": sell_qty, "price": fill, "pnl_pct": pnl_pct})
+            await notify(f"📈 부분익절 <b>{pos['name']}</b>({sym}) {sell_qty}주 @{fill:,.0f} "
                          f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
         else:
             save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
             hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
             net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
-            rr_real = round((cur - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
-            pnl_amt = round((cur - entry) * sell_qty)
-            closed.append({"pos": pos, "cur": cur, "net": net, "reason": reason, "qty": sell_qty,
+            rr_real = round((fill - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
+            pnl_amt = round((fill - entry) * sell_qty)
+            closed.append({"pos": pos, "cur": fill, "net": net, "reason": reason, "qty": sell_qty,
                            "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
             journal_append({"type": "exit", "id": pos["journal_id"], "symbol": sym, "name": pos["name"],
-                            "qty": sell_qty, "entry_price": entry, "exit_price": cur, "pnl_pct": pnl_pct,
-                            "net_pct": net, "pnl_amount": round((cur - entry) * sell_qty), "rr_realized": rr_real,
-                            "reason": reason, "hold_days": hold_days})
-            log_event("exit", {"symbol": sym, "exit": cur, "net_pct": net, "reason": reason})
+                            "qty": sell_qty, "entry_price": entry, "exit_price": fill, "decided_at": cur,
+                            "pnl_pct": pnl_pct, "net_pct": net, "pnl_amount": pnl_amt,
+                            "rr_realized": rr_real, "reason": reason, "hold_days": hold_days})
+            log_event("exit", {"symbol": sym, "exit": fill, "decided_at": cur,
+                               "net_pct": net, "reason": reason})
 
     processed = 0
     try:

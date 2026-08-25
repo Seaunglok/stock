@@ -573,7 +573,7 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
                   ma_exit: float | None = None, exit_ma_label: int = 120,
                   foreign_net: float | None = None, use_foreign: bool = False,
                   ma_trend: float | None = None, trend_ma_label: int = 60,
-                  aged_out: bool = False
+                  aged_out: bool = False, ma_ref: float | None = None,
                   ) -> tuple[str | None, str, int]:
     """포지션 청산/부분익절 판정 → (action, reason, sell_qty). action ∈ {None, PARTIAL, EXIT}.
 
@@ -588,9 +588,17 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
     배경: 07-31 KOSPI +17.9% 반등일에 4종(KT&G·GS·KB금융·하나금융) 동시 외인청산 신호가 났는데
     전부 MA120 위·손절 위 정상 추세였다. 외인 5일 누적은 직전 폭락기를 포함해 반등 초입에도
     음수라 '늦은 신호'가 된다. None 이면 추세조건 없이 기존 동작(하위호환).
-    ※ MA120(ma_exit)은 이미 단독 청산이라 AND 조건으로 쓰면 외인룰이 영구 미발동 → MA60 을 쓴다.
+    ma_ref (2026-08-25 추가): **이평선 조건만** 이 가격으로 비교한다(기본 None=cur 과 동일).
+    라이브 청산 phase 는 15:20 장중가로 판정하는데 백테스트는 종가로 판정한다 — 같은 날
+    장중엔 MA 아래였다가 종가엔 위인 경우가 생긴다. 실제로 08-25 KB금융이 15:20 에 164,900
+    (<MA60 165,813)으로 청산됐으나 종가는 166,400(>MA60)이었다. 더 나쁜 건, 종가 기준으로는
+    이 룰이 백테스트에서 **한 번도 발동하지 않는다**(변경 0건)는 점 — 검증된 적 없는 규칙이
+    장중 판정 때문에 실계좌에서만 작동하고 있었다.
+    → 호출자가 '마지막 완성 종가'를 넘기면 MA 판정이 검증본과 같아진다.
+      트레일·하드손절은 의도적으로 cur(장중가)를 계속 쓴다 — 그건 원래 장중 스톱이다.
     """
     pnl = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
+    ref = ma_ref if ma_ref is not None else cur      # 이평선 비교 전용 기준가
     if hard_stop_pct > 0 and pnl <= -hard_stop_pct:
         return "EXIT", f"하드 손절 ({pnl:.2f}% ≤ -{hard_stop_pct:.0f}%)", qty
     if not partial_done and target > 0 and cur >= target:
@@ -599,14 +607,14 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
             return "PARTIAL", f"첫 목표 도달 {partial_pct:.0f}% 익절", part_qty
     if stop > 0 and cur <= stop:
         return "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}", qty
-    if ma_exit is not None and cur < ma_exit:
-        return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({cur:,.0f} < {ma_exit:,.0f})", qty
+    if ma_exit is not None and ref < ma_exit:
+        return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({ref:,.0f} < {ma_exit:,.0f})", qty
     if use_foreign and foreign_net is not None and foreign_net < 0:
         if ma_trend is None:                      # 추세조건 off — 수급만으로 청산(구 동작)
             return "EXIT", "외국인 5일 순매도 전환", qty
-        if cur < ma_trend:                        # 수급 이탈 + 추세(MA60) 이탈 동시
+        if ref < ma_trend:                        # 수급 이탈 + 추세 이탈 동시
             return "EXIT", (f"외국인 5일 순매도 전환 + MA{trend_ma_label} 이탈 "
-                            f"({cur:,.0f} < {ma_trend:,.0f})"), qty
+                            f"({ref:,.0f} < {ma_trend:,.0f})"), qty
         # 외인 순매도지만 추세 유지(MA60 위) → 보유 (트레일/MA120 에 위임)
     if aged_out:
         return "EXIT", f"보유기간 만료 ({pnl:+.2f}%) — 시간청산", qty

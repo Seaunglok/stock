@@ -128,3 +128,46 @@ def test_disabling_sentinels_behave_as_backtest_expects():
     이 동치가 깨지면 3-pass 어댑터를 쓰는 어떤 통합도 조용히 틀린다."""
     assert _live(1.0, stop=0.0, target=0.0, hard=0.0)[0] is None        # 전부 off → 홀드
     assert _live(99999.0, target=0.0)[0] is None                        # target=0 → 부분익절 off
+
+
+# ─── ma_ref: MA 조건만 완성 종가로 판정 (2026-08-25 KB금융) ────────────────────
+def test_ma_ref_separates_ma_conditions_from_intraday_price():
+    """★ MA 조건은 완성 종가로, 트레일·하드손절은 장중가로 — 서로 다른 가격을 쓴다.
+
+    KB금융 실제: 15:20 장중 164,900 / MA60 165,813 → 청산. 종가는 166,400(>MA)이었다.
+    ma_ref 에 종가를 넘기면 MA 판정만 종가 기준이 되고, 트레일은 장중가를 계속 본다.
+    """
+    common = dict(entry=167_500.0, qty=2, target=229_814.0, stop=146_728.0,
+                  partial_done=True, hard_stop_pct=10.0,
+                  foreign_net=-278_177.0, use_foreign=True, ma_trend=165_813.0)
+    # 장중가만 쓰던 과거 동작 — 청산
+    act, reason, _ = exit_decision(cur=164_900.0, **common)
+    assert act == "EXIT" and "외국인" in reason
+    # 완성 종가를 MA 기준으로 넘기면 — 홀드
+    act2, _, _ = exit_decision(cur=164_900.0, ma_ref=166_400.0, **common)
+    assert act2 is None, "종가 166,400 은 MA 165,813 위 → 외인룰 미발동"
+
+
+def test_ma_ref_does_not_weaken_trail_or_hard_stop():
+    """ma_ref 는 이평선 전용이다 — 트레일/하드손절은 장중가로 계속 판정해야 한다."""
+    # 장중가가 트레일 아래로 뚫렸다면 종가가 위여도 청산
+    act, reason, _ = exit_decision(entry=100.0, cur=89.0, qty=10, target=130.0, stop=90.0,
+                                   partial_done=True, ma_ref=105.0)
+    assert act == "EXIT" and "트레일" in reason
+    # 하드손절도 마찬가지
+    act2, reason2, _ = exit_decision(entry=100.0, cur=88.0, qty=10, target=130.0, stop=0.0,
+                                     partial_done=True, hard_stop_pct=10.0, ma_ref=105.0)
+    assert act2 == "EXIT" and "하드" in reason2
+
+
+def test_ma_ref_defaults_to_cur():
+    """미지정이면 기존 동작(cur 로 MA 비교) — 백테스트는 이미 종가를 cur 로 넘긴다."""
+    kw = dict(entry=100.0, qty=10, target=130.0, stop=80.0, partial_done=True, ma_exit=95.0)
+    assert exit_decision(cur=94.0, **kw)[0] == exit_decision(cur=94.0, ma_ref=94.0, **kw)[0]
+
+
+def test_ma120_exit_also_uses_ma_ref():
+    """MA120 단독 청산도 같은 기준을 쓴다(외인룰만이 아니다)."""
+    kw = dict(entry=100.0, qty=10, target=130.0, stop=80.0, partial_done=True, ma_exit=95.0)
+    assert exit_decision(cur=94.0, **kw)[0] == "EXIT"              # 장중 이탈
+    assert exit_decision(cur=94.0, ma_ref=96.0, **kw)[0] is None   # 종가는 MA 위

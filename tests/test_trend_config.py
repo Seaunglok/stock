@@ -39,7 +39,7 @@ ADOPTED = [
     ("EXIT_MA",              120),
     ("MAX_HOLD_DAYS",        60),
     ("FOREIGN_MIN_RATIO",    0.2),
-    ("FOREIGN_TREND_MA",     60),
+    ("FOREIGN_TREND_MA",     20),   # 2026-08-25 A/B: MA60 은 룰을 무력화(변경 0건)
     ("PYRAMID_ADDS",         0),        # 피라미딩은 기본 off
     ("PYRAMID_BYPASS_GATE",  False),
 ]

@@ -198,3 +198,30 @@ def test_manage_skips_position_when_price_unavailable(monkeypatch):
     asyncio.run(tf._manage(do_exit_signals=False, when="intraday"))
     assert sold == [], "가짜 가격으로 매도 주문이 나갔다"
     assert len(saved.get("positions", [])) == 1, "포지션이 유지돼야 한다"
+
+
+# ─── 체결가 기록 (2026-08-25 KB금융) ──────────────────────────────────────────
+def test_fill_price_prefers_execution_price():
+    """★ 청산 phase 는 15:20 장중가로 판정하고 시장가로 내보낸다 — 체결은 종가 근처에서 난다.
+
+    KB금융 실제: 판정 164,900 / 체결 166,400. 판정가를 기록하면 net 이 -1.98% 로 남지만
+    실제는 -1.09% 다. 08-21 GS(폴백 91,200 기록 / 체결 115,100)와 같은 계열.
+    """
+    resp = {"success": True, "data": {"return_code": 0, "cntr_pric": "166400"}}
+    assert tf._fill_price(resp, 164_900.0) == 166_400.0
+
+
+def test_fill_price_handles_korean_key_and_sign():
+    assert tf._fill_price({"data": {"체결가": "+166,400"}}, 1.0) == 166_400.0
+
+
+@pytest.mark.parametrize("resp", [
+    {}, None, "x",
+    {"data": {}},                              # 체결가 필드 없음
+    {"data": {"cntr_pric": ""}},               # 빈 값
+    {"data": {"cntr_pric": "0"}},              # 0 은 체결가가 아니다
+    {"data": {"cntr_pric": "쓰레기"}},
+])
+def test_fill_price_falls_back_when_unavailable(resp):
+    """체결가를 못 구하면 판정가로 폴백 — 0 이나 None 을 손익 계산에 넣지 않는다."""
+    assert tf._fill_price(resp, 164_900.0) == 164_900.0

@@ -510,6 +510,7 @@ def main():
                                   MAX_HOLD_DAYS, REGIME_MA)
         cfg.ma_slow = EXIT_MA                    # 청산 이평선(라이브 MA120)
         cfg.pullback_pct = LIVE.pullback_pct
+        cfg.pullback_min_pct = LIVE.pullback_min_pct
         cfg.atr_k, cfg.stop_pct, cfg.rr, cfg.partial_pct = LIVE.atr_k, LIVE.stop_pct, LIVE.rr, LIVE.partial_pct
         if MAX_HOLD_DAYS > 0:
             cfg.max_hold = MAX_HOLD_DAYS

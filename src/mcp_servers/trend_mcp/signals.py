@@ -30,7 +30,14 @@ class TrendConfig:
     ma_fast: int = 60               # largecap 정배열
     ma_slow: int = 120
     ma_pullback: int = 20           # 눌림 기준선
-    pullback_pct: float = 3.0       # 현재가 ≤ MA20×(1+pullback_pct%) 면 눌림권
+    pullback_pct: float = 3.0       # 현재가 ≤ MA20×(1+pullback_pct%) 면 눌림권(상한)
+    # 눌림목 **하한**(2026-08-25 채택). None=하한 없음(구 동작) / 0.0=MA20 이상만 /
+    # 5.0=MA20 대비 -5% 까지 허용. 상한만 있던 게이트는 MA20 아래로 아무리 빠져도 통과시켜
+    # '떨어지는 칼'을 눌림목으로 샀다 — 실거래 24건 중 14건이 MA20 아래 진입(최대 -16.3%)이었고
+    # 그쪽 청산평균 -5.61% vs MA20 위 진입 -3.51%.
+    # A/B(2025-01~2026-08, 라이브 미러): 하한없음 +3.09%/PF1.77 → MA20이상 +3.62%/PF1.99.
+    # ※ 0.0 과 None 을 구분해야 한다 — 0.0 은 '딱 MA20 이상', None 이 '검사 안 함'이다.
+    pullback_min_pct: float | None = None
     rs_days: int = 60               # 상대강도 비교 기간
     vol_mult: float = 2.0           # 거래량 ≥ 20일평균 × vol_mult
     body_pct: float = 4.0           # 장대양봉 몸통 % (gainers)
@@ -384,7 +391,10 @@ def entry_signal(
         gates["price>MA60"] = ma_f is not None and price > ma_f
         gates["price>MA120"] = ma_w is not None and price > ma_w
         gates["RS>0"] = rs_pass if rs_pass is not None else (relative_strength(closes, kospi_closes, cfg.rs_days) > 0)
-        gates["pullback"] = ma_p is not None and price <= ma_p * (1 + cfg.pullback_pct / 100.0)
+        gates["pullback"] = (ma_p is not None
+                             and price <= ma_p * (1 + cfg.pullback_pct / 100.0)
+                             and (cfg.pullback_min_pct is None
+                                  or price >= ma_p * (1 - cfg.pullback_min_pct / 100.0)))
         gates["vol_up"] = volume_surge_ok(ohlcv, 1.0)
 
     passed = all(gates.values())

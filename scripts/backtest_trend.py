@@ -70,6 +70,7 @@ def apply_live_mirror(cfg: TrendConfig) -> list[str]:
     V_REGIME_MA = REGIME_MA or None
     V_FOREIGN_TREND_MA = FOREIGN_TREND_MA
     cfg.pullback_pct = LIVE.pullback_pct
+    cfg.pullback_min_pct = LIVE.pullback_min_pct
     cfg.atr_k, cfg.stop_pct = LIVE.atr_k, LIVE.stop_pct
     cfg.rr, cfg.partial_pct = LIVE.rr, LIVE.partial_pct
     if MAX_HOLD_DAYS > 0:

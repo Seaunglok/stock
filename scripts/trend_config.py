@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import sys
 from logging.handlers import TimedRotatingFileHandler
@@ -48,7 +49,16 @@ def _load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        k, v = k.strip(), v.strip().strip('"').strip("'")
+        k, v = k.strip(), v.strip()
+        # 인라인 주석 제거 — 따옴표로 감싸지 않은 값에 한해 ' #' 이후를 버린다.
+        # 2026-08-25: `TREND_PULLBACK_MIN_PCT=0   # 설명` 을 넣었더니 값에 주석이 통째로 섞여
+        # float() 이 터졌다. .env.example 은 주석을 달아 배포하므로 파서가 감당해야 한다.
+        if v[:1] in ('"', "'"):
+            q = v[0]
+            end = v.find(q, 1)
+            v = v[1:end] if end > 0 else v[1:]      # 닫는 따옴표까지만, 뒤는 주석으로 버림
+        else:
+            v = re.split(r"\s+#", v, maxsplit=1)[0].strip()
         if k and k not in os.environ:
             os.environ[k] = v
 
@@ -172,6 +182,9 @@ ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "off").lower()
 # 2026-08-21 A/B 채택: blend (MAR 0.78→1.60 · Sharpe 0.80→1.18 · MDD 11.7→9.3%).
 RANK_MODE = os.getenv("TREND_RANK_MODE", "blend")
 
+_pmin_raw = os.getenv("TREND_PULLBACK_MIN_PCT", "0").strip().lower()
+_PULLBACK_MIN = None if _pmin_raw in ("", "off", "none") else float(_pmin_raw)
+
 CFG = TrendConfig(
     mode=("largecap" if UNIVERSE_MODE in ("largecap", "watchlist") else "gainers"),
     stop_pct=float(os.getenv("TREND_STOP_PCT", "7")),
@@ -181,6 +194,11 @@ CFG = TrendConfig(
     # 눌림목 게이트 폭(현재가 ≤ MA20×(1+X%)). A/B 검증(2026-06-26)으로 12 채택.
     # 양극화/멜트업 장에서 3%는 과도하게 좁아 후보 0 빈발 → 12%가 largecap +2.61%/watchlist +8.90% 기대값 정점.
     pullback_pct=float(os.getenv("TREND_PULLBACK_PCT", "12")),
+    # 눌림목 하한 — 0=MA20 이상만(채택) / 숫자=MA20 대비 그 %까지 허용 / off=하한 없음(구 동작).
+    # 2026-08-25 A/B: 진입 게이트가 MA20 아래를 무제한 허용해 '떨어지는 칼'을 눌림목으로 샀다.
+    # 실거래 24건 중 14건이 MA20 아래 진입(최대 -16.3%), 청산평균 -5.61%(vs MA20 위 -3.51%).
+    # 백테스트 기대값 +3.09→+3.62%·PF 1.77→1.99·승률 44.1→46.3%(진입 338→281건).
+    pullback_min_pct=_PULLBACK_MIN,
 )
 
 DATA_DIR = _ROOT / "data" / "trend_follow"

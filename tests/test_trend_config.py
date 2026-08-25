@@ -85,6 +85,13 @@ def test_pullback_default_is_adopted(cfg_no_env):
     assert cfg_no_env.CFG.pullback_pct == 12.0
 
 
+def test_pullback_lower_bound_is_adopted(cfg_no_env):
+    """★ 0.0 = 'MA20 이상만'. None(하한 없음)과 반드시 구분돼야 한다 — 둘 다 falsy 라
+    `if not x` 로 검사하면 채택값이 조용히 꺼진다(2026-08-25 A/B: +3.09→+3.62%)."""
+    assert cfg_no_env.CFG.pullback_min_pct == 0.0
+    assert cfg_no_env.CFG.pullback_min_pct is not None
+
+
 def test_cutoff_after_entry_time(cfg_no_env):
     """컷오프가 진입시각보다 이르면 하락보류 후보가 즉시 스킵돼 무의미해진다."""
     entry = tuple(int(x) for x in cfg_no_env.ENTRY_TIME.split(":"))
@@ -112,3 +119,54 @@ def test_env_override_still_works(monkeypatch):
     import trend_config
     assert importlib.reload(trend_config).MAX_POS == 3
     sys.modules.pop("trend_config", None)
+
+
+# ─── .env 파서 (2026-08-25) ───────────────────────────────────────────────────
+def test_env_parser_strips_inline_comments(tmp_path, monkeypatch):
+    """★ .env.example 은 주석을 달아 배포한다 — 파서가 감당해야 한다.
+
+    2026-08-25: `TREND_PULLBACK_MIN_PCT=0   # 설명` 을 넣자 값에 주석이 통째로 섞여
+    float() 이 터졌다(데몬 기동 실패).
+    """
+    env = tmp_path / "t.env"
+    env.write_text(
+        "TREND_MAX_POS=7          # 슬롯 수\n"
+        "TREND_RISK_PCT=1.5\t# 탭 앞에도\n"
+        'TREND_WATCHLIST="005930,000660"   # 따옴표 값\n'
+        "TREND_ADOPT_MODE=off\n", encoding="utf-8")
+    import os
+    saved = {k: v for k, v in os.environ.items() if k.startswith("TREND_")}
+    for k in saved:
+        del os.environ[k]
+    os.environ["TREND_ENV_FILE"] = str(env)
+    try:
+        sys.modules.pop("trend_config", None)
+        import trend_config
+        m = importlib.reload(trend_config)
+        assert m.MAX_POS == 7
+        assert m.RISK_PCT == 1.5
+        assert m.WATCHLIST == ["005930", "000660"]
+        assert m.ADOPT_MODE == "off"
+    finally:
+        os.environ.pop("TREND_ENV_FILE", None)
+        os.environ.update(saved)
+        sys.modules.pop("trend_config", None)
+
+
+def test_env_parser_keeps_hash_inside_quoted_value(tmp_path):
+    """따옴표로 감싼 값 안의 # 는 살려야 한다(토큰 등)."""
+    import os
+    env = tmp_path / "t.env"
+    env.write_text('TREND_WATCHLIST="a#b,c"\n', encoding="utf-8")
+    saved = {k: v for k, v in os.environ.items() if k.startswith("TREND_")}
+    for k in saved:
+        del os.environ[k]
+    os.environ["TREND_ENV_FILE"] = str(env)
+    try:
+        sys.modules.pop("trend_config", None)
+        import trend_config
+        assert importlib.reload(trend_config).WATCHLIST == ["a#b", "c"]
+    finally:
+        os.environ.pop("TREND_ENV_FILE", None)
+        os.environ.update(saved)
+        sys.modules.pop("trend_config", None)

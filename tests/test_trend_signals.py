@@ -513,3 +513,42 @@ def test_same_issuer(a, b, expected):
     """
     from src.mcp_servers.trend_mcp.market_data import same_issuer
     assert same_issuer(a, b) is expected
+
+
+# ─── 눌림목 하한 (2026-08-25 채택) ────────────────────────────────────────────
+def _uptrend_at(rel_to_ma20: float):
+    """MA20 대비 rel_to_ma20% 위치로 끝나는 상승추세 봉 — MA60/MA120/RS 게이트는 통과시킨다."""
+    bars = _rising(200, 100.0, 160.0)
+    ma20 = sum(b["close"] for b in bars[-20:]) / 20
+    target = ma20 * (1 + rel_to_ma20 / 100.0)
+    last = dict(bars[-1]); last.update({"close": target, "high": target * 1.001,
+                                        "low": target * 0.999, "open": target})
+    return bars[:-1] + [last]
+
+
+def test_pullback_lower_bound_blocks_below_ma20():
+    """★ 상한만 있던 게이트는 MA20 아래를 무제한 허용했다 — 실거래 24건 중 14건이 그렇게 들어갔다."""
+    cfg = TrendConfig(mode="largecap", pullback_pct=12.0, pullback_min_pct=0.0)
+    kospi = [100.0] * 200
+    assert entry_signal(_uptrend_at(-5.0), kospi, cfg).gates["pullback"] is False
+    assert entry_signal(_uptrend_at(+2.0), kospi, cfg).gates["pullback"] is True
+
+
+def test_pullback_lower_bound_none_is_legacy():
+    """None = 하한 없음(구 동작). MA20 대비 -16% 도 통과했다(실제 삼성생명 07-09)."""
+    cfg = TrendConfig(mode="largecap", pullback_pct=12.0, pullback_min_pct=None)
+    assert entry_signal(_uptrend_at(-16.0), [100.0] * 200, cfg).gates["pullback"] is True
+
+
+def test_pullback_lower_bound_allows_configured_slack():
+    """숫자를 주면 그만큼은 허용 — 0.0 과 5.0 은 다른 뜻이다."""
+    kospi = [100.0] * 200
+    cfg5 = TrendConfig(mode="largecap", pullback_pct=12.0, pullback_min_pct=5.0)
+    assert entry_signal(_uptrend_at(-3.0), kospi, cfg5).gates["pullback"] is True
+    assert entry_signal(_uptrend_at(-7.0), kospi, cfg5).gates["pullback"] is False
+
+
+def test_pullback_upper_bound_still_applies():
+    """하한을 넣어도 상한(과열 배제)은 그대로여야 한다."""
+    cfg = TrendConfig(mode="largecap", pullback_pct=12.0, pullback_min_pct=0.0)
+    assert entry_signal(_uptrend_at(+20.0), [100.0] * 200, cfg).gates["pullback"] is False

@@ -33,7 +33,7 @@ ADOPTED = [
     ("BREADTH_MIN_PCT",      0.4),      # 0 이면 breadth 게이트 없음
     ("REGIME_MA",            60),       # 0 이면 레짐 게이트 없음
     ("ADOPT_MODE",           "off"),    # all 이면 HTS 수동매수분 강제청산
-    ("RANK_MODE",            "blend"),  # 2026-08-21 A/B 채택(MAR 0.78→1.60)
+    ("RANK_MODE",            "composite"),  # 2026-08-27: blend 철회(멜트업 구간 과적합)
     ("ENTRY_TIME",           "11:00"),
     ("ENTRY_CUTOFF",         "14:00"),  # ENTRY_TIME 보다 뒤여야 보류분이 의미를 가진다
     ("EXIT_MA",              120),

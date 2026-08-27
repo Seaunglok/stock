@@ -268,16 +268,39 @@ def simulate_units(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
 _UNIV_CACHE: dict = {}   # A/B 스윕에서 유니버스 재로드 방지
 
 
+_KOSPI_WARM: dict = {}
+
+
+def _kospi_with_warmup(start: str, end: str, warm_days: int = 420) -> tuple[list[str], list[float], int]:
+    """KOSPI 종가 시계열 + start 이전 워밍업. 반환 (전체날짜, 전체종가, start 의 인덱스).
+
+    RS·레짐 계산은 전부 꼬리 기준(`[-1]`, `[-N:]`)이라 앞쪽을 늘려도 뜻이 바뀌지 않는다.
+    바뀌는 건 긴 이평이 **start 시점부터 계산 가능해진다**는 것뿐이다.
+    """
+    key = (start, end, warm_days)
+    if key not in _KOSPI_WARM:
+        warm = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=warm_days)).strftime("%Y-%m-%d")
+        d, c = get_market_series(warm, end)
+        off = next((i for i, x in enumerate(d) if x >= start), 0)
+        _KOSPI_WARM[key] = (d, c, off)
+    return _KOSPI_WARM[key]
+
+
 def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg: TrendConfig) -> list[tuple[float, float]]:
     """반환: 진입별 (gap_pct, net_pct). gap_pct = 진입일 시가 / 신호일 종가 − 1 (프리장 갭의 백테스트 대용)."""
     key = (mode, tuple(watchlist), start, end, cfg_top)
     if key in _UNIV_CACHE:
-        dates, kospi_close, broad = _UNIV_CACHE[key]
+        dates, kospi_close, broad, k_off = _UNIV_CACHE[key]
         print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} (캐시 재사용 {len(broad)}종목)")
     else:
-        _mdates, kospi_close = get_market_series(start, end)
-        dates = [d.replace("-", "") for d in _mdates]
-        print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs}")
+        # KOSPI 는 **start 이전 워밍업을 포함해** 로드한다. 레짐 이평(MA200/224 등)이
+        # start 직후 구간에서 `moving_average → None` 이 되면 그 날들이 통째로 차단되는데,
+        # 그건 필터의 성질이 아니라 데이터 부족이다. 긴 이평일수록 더 오래 차단돼
+        # "긴 이평이 나쁘다"는 가짜 결론이 나온다.
+        _mdates, kospi_close, k_off = _kospi_with_warmup(start, end)
+        dates = [d.replace("-", "") for d in _mdates[k_off:]]
+        print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} "
+              f"(KOSPI 워밍업 {k_off} 영업일)")
 
         if mode == "watchlist":
             universe = watchlist
@@ -285,15 +308,21 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             universe = get_broad_universe()           # KOSPI 시총 상위 ~150 (cap 정렬)
             if mode == "largecap":
                 universe = universe[:cfg_top]
+        # 로드 길이는 **요청 구간에서 역산**한다. 과거엔 320 영업일 고정이라
+        # `--start` 를 아무리 앞으로 당겨도 실제 판정은 종료일 기준 320봉 안에서만
+        # 이뤄졌다(워밍업 121봉 제외하면 ~200일). 구간을 늘린 A/B 가 사실은
+        # 같은 구간을 다시 재는 것이었다.
+        need_bars = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
+        load_days = len(dates) + need_bars + 40
         broad = {}
         for idx, code in enumerate(universe, 1):
-            h = get_ohlcv(code, dates[-1] if dates else end.replace("-", ""), days=320)
+            h = get_ohlcv(code, dates[-1] if dates else end.replace("-", ""), days=load_days)
             if h:
                 broad[code] = h
             if idx % 40 == 0:
                 print(f"  유니버스 로드 {idx}/{len(universe)}")
         print(f"  → {len(broad)}종목 로드 완료")
-        _UNIV_CACHE[key] = (dates, kospi_close, broad)
+        _UNIV_CACHE[key] = (dates, kospi_close, broad, k_off)
 
     trades: list[tuple[float, float]] = []
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
@@ -302,7 +331,7 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
         if i_day < need:
             continue
         date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-        kospi_upto = kospi_close[:i_day + 1]
+        kospi_upto = kospi_close[:k_off + i_day + 1]
 
         # ── 시장 레짐 필터 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 차단(추세추종 대가 표준: Weinstein/O'Neil 'M')
         if V_REGIME_MA:
@@ -510,7 +539,7 @@ def _equity_gated_trades(mode, start, end, watch, costs, cfg, lookback, threshol
     key = (mode, tuple(watch), start, end, cfg_top)
     if key not in _UNIV_CACHE:
         run(mode, start, end, watch, costs, cfg)   # 유니버스 로드(캐시 채움)
-    dates, kospi_close, broad = _UNIV_CACHE[key]
+    dates, kospi_close, broad, k_off = _UNIV_CACHE[key]
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
 
     closed_base: list[float] = []      # 청산 완료 거래의 초기유닛 net%
@@ -525,7 +554,7 @@ def _equity_gated_trades(mode, start, end, watch, costs, cfg, lookback, threshol
         recent = closed_base[-lookback:]
         regime_ok = len(recent) >= max(3, lookback // 2) and (sum(recent) / len(recent)) > threshold
         date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-        kospi_upto = kospi_close[:i_day + 1]
+        kospi_upto = kospi_close[:k_off + i_day + 1]
         for code, full in broad.items():
             idx = next((k for k, b in enumerate(full) if b["date"] == date_fmt), None)
             if idx is None or idx < need or full[idx]["value"] < MIN_VALUE_KRW:
@@ -714,13 +743,15 @@ def report_regime(mode: str, start: str, end: str, watch: list[str], costs: Cost
     global V_REGIME_MA, V_VOL_MAX_PCT, V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT
     V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT = 120, 10.0, 0.40   # 라이브 미러
     variants = [
-        ("기준(필터 off, 현행)",        None, None),
-        ("① 레짐 KOSPI>MA60",          60,   None),
-        ("① 레짐 KOSPI>MA120",         120,  None),
+        ("기준(필터 off)",              None, None),
+        ("레짐 KOSPI>MA20",            20,   None),
+        ("레짐 KOSPI>MA60 (현행)",      60,   None),
+        ("레짐 KOSPI>MA120",           120,  None),
+        ("레짐 KOSPI>MA200",           200,  None),
+        ("레짐 KOSPI>MA224",           224,  None),
         ("② 변동성 ≤4%",               None, 4.0),
         ("② 변동성 ≤3%",               None, 3.0),
         ("①+② MA120 & 변동성≤4%",      120,  4.0),
-        ("①+② MA60 & 변동성≤3%",       60,   3.0),
     ]
     print("\n" + "=" * 100)
     print(f"시장 레짐/변동성 필터 A/B — {label} (비용 차감 후, 라이브 미러: MA120·하드10%·breadth0.4)")

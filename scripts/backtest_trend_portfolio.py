@@ -29,7 +29,7 @@ import math
 import sys
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -127,8 +127,11 @@ def _load(start: str, end: str, top_n: int):
     closes: dict[str, list] = {}   # code → date-ordered close list (동일 캘린더 정렬용)
     ordered: dict[str, list] = {}  # code → date-ordered date list
     end_compact = dates[-1].replace("-", "") if dates else end.replace("-", "")
+    # 로드 길이를 요청 구간에서 역산 — 고정 400봉이면 `--start` 를 앞으로 당겨도
+    # 실제 판정 구간이 늘지 않는다(2026-08-27 발견).
+    load_days = len(dates) + 121 + 40
     for i, code in enumerate(codes, 1):
-        h = get_ohlcv(code, end_compact, days=400)
+        h = get_ohlcv(code, end_compact, days=load_days)
         if not h:
             continue
         bars[code] = {b["date"]: b for b in h}
@@ -358,9 +361,12 @@ _KOSPI_CACHE: dict = {}
 
 
 def _kospi_upto(start, end, date_str):
+    """start 이전 워밍업 포함 — 레짐 이평이 구간 앞머리에서 None 이 되면 그 날들이
+    통째로 차단돼, 긴 이평일수록 불리하게 나오는 가짜 결과가 된다(2026-08-27)."""
     key = (start, end)
     if key not in _KOSPI_CACHE:
-        _KOSPI_CACHE[key] = get_market_series(start, end)
+        warm = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=420)).strftime("%Y-%m-%d")
+        _KOSPI_CACHE[key] = get_market_series(warm, end)
     kd, kc = _KOSPI_CACHE[key]
     idx = _bisect(kd, date_str)
     return kc[:idx + 1] if idx is not None else kc
@@ -438,6 +444,57 @@ def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs
     print("  ※ 유니버스가 현재 시총 스냅샷 고정이라 생존편향이 있다. **변형 간 상대 비교로만** 읽을 것.")
 
 
+def report_regime_ma(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
+                     max_pos: int, risk_pct: float, hard_stop: float, rank_mode: str,
+                     breadth_min: float) -> None:
+    """레짐 이평 길이 A/B — 신규진입을 어느 시계로 차단할 것인가.
+
+    현행 MA60 은 '중기'로도 짧다는 지적(2026-08-27)에서 출발. 길이가 길수록 하락 초입에서
+    늦게 닫히고(손실 노출↑) 반등 초입에서 늦게 열린다(기회비용↑). 어느 쪽이 큰지는
+    거래당 기대값이 아니라 **자산곡선의 MDD/MAR** 로 봐야 한다 — 레짐 필터의 목적이
+    거래 품질이 아니라 파산 회피이기 때문이다.
+    """
+    secmap = _sector_map()
+    _SIG_MEMO.clear()
+    dates, *_ = _load(start, end, top_n)
+    dl = len(dates)
+    sizing = Sizing(mode="risk", risk_pct=risk_pct)
+    variants = [("off (차단 없음)", 0), ("MA20", 20), ("MA60 (현행)", 60),
+                ("MA120", 120), ("MA200", 200), ("MA224", 224)]
+    print()
+    print("=" * 112)
+    print(f"레짐 이평 A/B — KOSPI<MA(N) 이면 신규진입 차단 (max_pos={max_pos} · risk {risk_pct}% · 랭킹 {rank_mode})")
+    print("=" * 112)
+    print(f"  {'레짐':18} {'최종%':>8} {'CAGR':>7} {'MDD':>7} {'MAR':>6} {'Sharpe':>7} "
+          f"{'청산승률':>7} {'거래':>5} {'차단일':>7}")
+    print("  " + "-" * 92)
+    for label, rma in variants:
+        res = simulate(start, end, top_n, cfg, costs, sizing, max_pos, 0, True, secmap,
+                       hard_stop_pct=hard_stop, rank_mode=rank_mode,
+                       regime_ma=rma, breadth_min=breadth_min)
+        m = pmetrics(res, dl)
+        mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
+        blocked = _blocked_days(start, end, dates, rma)
+        print(f"  {label:18} {m['total']:>+7.1f}% {m['cagr']:>+6.1f}% {m['mdd']:>6.1f}% "
+              f"{mar:>6} {m['sharpe']:>7.2f} {m['win']:>6.1f}% {m['entries']:>5} {blocked:>6.0f}%")
+    print("  " + "-" * 92)
+    print("  ※ 짧은 이평 = 일찍 닫고 일찍 연다 / 긴 이평 = 늦게 닫고 늦게 연다.")
+    print("  ※ 차단일 = 레짐만으로 신규진입이 막힌 영업일 비율(breadth·슬롯 제외).")
+    print("  ※ 유니버스 생존편향 상속 — **변형 간 상대 비교로만** 읽을 것.")
+
+
+def _blocked_days(start: str, end: str, dates: list[str], regime_ma: int) -> float:
+    if regime_ma <= 0:
+        return 0.0
+    n = 0
+    for d in dates:
+        mk = _kospi_upto(start, end, d)
+        kma = moving_average(mk, regime_ma) if mk else None
+        if kma is None or (mk and mk[-1] < kma):
+            n += 1
+    return n / len(dates) * 100 if dates else 0.0
+
+
 def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
            max_pos: int, base_pct: float, risk_pct: float, sector_cap: int,
            hard_stop: float = 0.0, rank_mode: str = "composite",
@@ -492,6 +549,8 @@ def main():
     p.add_argument("--tax-bps", type=float, default=COSTS.TAX_BPS)      # 라이브와 단일 소스
     p.add_argument("--fee-bps", type=float, default=COSTS.FEE_BPS)
     p.add_argument("--slippage-bps", type=float, default=COSTS.SLIPPAGE_BPS)
+    p.add_argument("--regimetest", action="store_true",
+                   help="레짐 이평 길이 A/B — off/20/60/120/200/224")
     p.add_argument("--ranktest", action="store_true",
                    help="랭킹 A/B — 슬롯 배분 기준(composite/tq/high_prox/blend) 비교")
     p.add_argument("--legacy-defaults", action="store_true",
@@ -503,11 +562,12 @@ def main():
     # 기본 = 라이브 미러. 이 하니스는 사이징·MDD 판단의 근거라, 라이브와 다른 청산룰로 돌면
     # "리스크 균등 사이징이 MDD 를 줄인다" 같은 결론 자체가 다른 전략의 결론이 된다.
     hard_stop, regime_ma, breadth_min = 0.0, 0, 0.0
+    rank_live = "composite"
     if args.legacy_defaults:
         print("⚠️ --legacy-defaults: 구 설정(MA50·하드손절 off·눌림 3%)으로 실행합니다.")
     else:
         from trend_config import (BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, HARD_STOP_PCT,
-                                  MAX_HOLD_DAYS, REGIME_MA)
+                                  MAX_HOLD_DAYS, RANK_MODE, REGIME_MA)
         cfg.ma_slow = EXIT_MA                    # 청산 이평선(라이브 MA120)
         cfg.pullback_pct = LIVE.pullback_pct
         cfg.pullback_min_pct = LIVE.pullback_min_pct
@@ -516,9 +576,14 @@ def main():
             cfg.max_hold = MAX_HOLD_DAYS
         hard_stop = HARD_STOP_PCT
         regime_ma, breadth_min = REGIME_MA, BREADTH_MIN_PCT
+        rank_live = RANK_MODE
         print(f"라이브 미러: 청산MA{cfg.ma_slow} · 하드손절 {hard_stop:g}% · 눌림 {cfg.pullback_pct:g}% · "
               f"보유상한 {cfg.max_hold}일 · 레짐 MA{regime_ma or 'off'} · breadth {breadth_min or 'off'}"
               f"   ※ 외인 청산은 일봉 재현 불가로 미반영")
+    if args.regimetest:
+        report_regime_ma(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
+                         args.risk_pct, hard_stop, rank_live, breadth_min)
+        return
     if args.ranktest:
         report_rank(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
                     args.risk_pct, hard_stop, regime_ma, breadth_min)

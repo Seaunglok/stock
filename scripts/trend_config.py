@@ -180,7 +180,11 @@ ADOPT_MODE = os.getenv("TREND_ADOPT_MODE", "off").lower()
 # 랭킹 기준(후보 > 슬롯일 때 누구를 사는가). composite=구 복합점수(종가매매 스코어러 재사용) /
 # tq=Clenow 기울기×R² / high_prox=120일 고가 근접 / blend=둘의 순위합.
 # 2026-08-21 A/B 채택: blend (MAR 0.78→1.60 · Sharpe 0.80→1.18 · MDD 11.7→9.3%).
-RANK_MODE = os.getenv("TREND_RANK_MODE", "blend")
+# 랭킹 기준(후보>슬롯 일 때 누구를 사는가). 2026-08-21 blend 채택 → **2026-08-27 철회**.
+# 채택 근거였던 A/B 가 사실상 2025-11~2026-05 멜트업 구간만 잰 결과였다(OHLCV 로더가 종료일
+# 기준 고정 봉수만 가져와 `--start` 가 무시됐다). 3년 구간 재측정: composite +7.2%(MDD 26.3%)
+# vs blend -19.9%(MDD 44.7%) — 4개 중 최악이었다. 문헌 지표(tq/high_prox)도 단독으론 열위.
+RANK_MODE = os.getenv("TREND_RANK_MODE", "composite")
 
 _pmin_raw = os.getenv("TREND_PULLBACK_MIN_PCT", "0").strip().lower()
 _PULLBACK_MIN = None if _pmin_raw in ("", "off", "none") else float(_pmin_raw)

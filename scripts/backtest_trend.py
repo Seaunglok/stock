@@ -113,6 +113,7 @@ V_MA_BUFFER_PCT: float = 0.0   # MA 이탈 히스테리시스 — 종가 < MA×(
 V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
 # 시장 레짐/변동성 필터(2026-08-03): 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장)과
 # 실전구간(5.71%·-20.5% 하락장)의 레짐 불일치가 주원인. 하락장·고변동성 신규진입을 원천 차단.
+V_TRADE_LOG: list | None = None  # 진입일·종목·net 기록(연도별 분해용). None=미기록
 V_PIT_UNIVERSE: bool = False   # 시점별 유니버스(그날 시총 상위 top_n 재산정). False=현재 스냅샷 소급(생존편향)
 V_PIT_POOL_N: int = 350        # 시점별 모드의 후보 풀 크기(현재 시총 상위 N)
 V_REGIME_MA: int | None = None            # KOSPI < MA(N) 이면 그날 신규진입 차단(None=off)
@@ -416,6 +417,8 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
                 net = simulate_trade(full, idx, cfg, costs, code=code)
                 if net is not None:
                     trades.append((gap, net))
+                    if V_TRADE_LOG is not None:
+                        V_TRADE_LOG.append((date_fmt, code, net))
         if (i_day + 1) % 40 == 0:
             print(f"  [{i_day+1}/{len(dates)}] {date_fmt}: 누적 진입 {len(trades)}건")
     return trades

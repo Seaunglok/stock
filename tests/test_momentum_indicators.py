@@ -162,21 +162,39 @@ def _market(n=300, seed=1):
     return m
 
 
-def test_residual_momentum_discounts_pure_beta():
-    """★ 시장 상승에 편승한 고베타 종목(α=0)은 잔차 모멘텀이 낮다.
+def _long_market(n=1000, seed=3):
+    import random
+    random.seed(seed)
+    m = [1000.0]
+    for _ in range(n):
+        m.append(m[-1] * (1 + random.gauss(0.0004, 0.01)))
+    return m
 
-    현행 RS(단순 수익률 차이)는 β=1 을 가정해 이 경로를 못 막는다.
+
+def _stock(mkt, beta, alpha_recent=0.0, recent=252, seed=5):
+    """베타는 전 구간 일정, 알파는 **마지막 recent 일에만** 준다."""
+    import random
+    random.seed(seed)
+    out = [1000.0]
+    start = len(mkt) - recent
+    for i in range(1, len(mkt)):
+        mr = (mkt[i] - mkt[i - 1]) / mkt[i - 1]
+        a = alpha_recent if i >= start else 0.0
+        out.append(out[-1] * (1 + beta * mr + a + random.gauss(0, 0.003)))
+    return out
+
+
+def test_residual_momentum_discounts_pure_beta():
+    """★ 시장 상승에 편승한 고베타 종목(α=0)은 최근 초과성과 종목보다 낮다.
+
+    현행 RS(단순 수익률 차이)는 β=1 을 가정해 고베타 편승 경로를 못 막는다.
+    ※ 알파를 **전 구간 상수**로 주면 OLS 절편이 흡수해 잔차가 0 이 된다 — 이 지표가
+       재는 것은 '자기 장기평균 대비 최근 초과분'이다(2026-08-28).
     """
-    mkt = _market()
-    hi_beta = [100.0]
-    for i in range(1, len(mkt)):
-        mr = (mkt[i] - mkt[i - 1]) / mkt[i - 1]
-        hi_beta.append(hi_beta[-1] * (1 + 2 * mr))
-    alpha = [100.0]
-    for i in range(1, len(mkt)):
-        mr = (mkt[i] - mkt[i - 1]) / mkt[i - 1]
-        alpha.append(alpha[-1] * (1 + mr + 0.002))
-    assert residual_momentum(alpha, mkt) > residual_momentum(hi_beta, mkt)
+    mkt = _long_market()
+    hi_beta = _stock(mkt, beta=2.0)
+    recent_alpha = _stock(mkt, beta=1.0, alpha_recent=0.002)
+    assert residual_momentum(recent_alpha, mkt) > residual_momentum(hi_beta, mkt)
 
 
 def test_residual_momentum_needs_history():
@@ -246,3 +264,32 @@ def test_empty_list_is_safe():
     cands = []
     assign_rank_scores(cands, "blend")
     assert cands == []
+
+
+# ─── 잔차 모멘텀 퇴화 회귀 (2026-08-28) ───────────────────────────────────────
+def test_residual_momentum_is_not_identically_zero():
+    """★ 절편 있는 OLS 는 **적합 표본 위에서 잔차 합이 정확히 0** 이다.
+
+    구 구현은 회귀 표본과 누적 구간이 같아 `sum(resid)/sd` 가 항상 0 이었다 —
+    게이트로 쓰면 전 종목 탈락(백테스트 진입 0건). 값이 0 근처에 붙어 있으면 실패.
+    """
+    mkt = _long_market(seed=7)
+    stk = _stock(mkt, beta=1.5, alpha_recent=0.0015, seed=9)
+    v = residual_momentum(stk, mkt)
+    assert v is not None
+    assert abs(v) > 1.0, f"잔차 모멘텀이 0 으로 퇴화했다({v}) — 누적 구간이 회귀 표본과 같다"
+    assert v > 0, f"최근 초과수익 종목인데 잔차 모멘텀이 양수가 아니다({v})"
+
+
+def test_residual_momentum_negative_for_persistent_underperformer():
+    """반대 방향도 잡아야 한다 — 베타 대비 꾸준히 밀리는 종목은 음수."""
+    mkt = _long_market(seed=11)
+    stk = _stock(mkt, beta=1.0, alpha_recent=-0.0015, seed=13)
+    v = residual_momentum(stk, mkt)
+    assert v is not None and v < -1.0, f"최근 열위 종목인데 {v}"
+
+
+def test_residual_momentum_needs_estimation_window():
+    """추정구간(기본 3년)이 안 차면 None — 부족한 데이터로 베타를 잡지 않는다."""
+    short = [100.0 + i for i in range(300)]
+    assert residual_momentum(short, short) is None

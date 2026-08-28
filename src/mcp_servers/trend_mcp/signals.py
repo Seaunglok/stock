@@ -225,27 +225,37 @@ def trend_quality(closes: list[float], window: int = 90) -> float | None:
 
 
 def residual_momentum(stock_closes: list[float], kospi_closes: list[float],
-                      window: int = 252, skip: int = 21) -> float | None:
+                      window: int = 252, skip: int = 21, est: int = 756) -> float | None:
     """시장 베타를 제거한 잔차 모멘텀. Blitz-Huij-Martens(2011).
 
-    종목 일간수익률을 시장수익률에 회귀해 잔차를 구하고, 형성기간 잔차 누적을 잔차 표준편차로
-    표준화한다. 총수익 모멘텀 대비 위험조정수익이 약 2배이고 시점 일관성도 높다는 결과.
-    현행 RS(단순 수익률 차이)는 암묵적으로 β=1 을 가정하는데, 고베타 종목이 시장 상승만으로
-    RS>0 을 통과하는 경로를 막지 못한다.
+    현행 RS(단순 수익률 차이)는 암묵적으로 β=1 을 가정해, 고베타 종목이 시장 상승만으로
+    RS>0 을 통과하는 경로를 막지 못한다. 잔차 모멘텀은 그 성분을 걷어낸다.
+
+    ⚠️ 2026-08-28 수정: 이전 구현은 **회귀 표본과 누적 구간이 같아서 항상 0** 이었다.
+    절편이 있는 OLS 는 적합 표본 위에서 잔차 합이 정확히 0 이므로 `sum(resid)/sd` 는
+    정의상 0 이다(부동소수 오차만 남는다). 게이트로 쓰면 전 종목이 탈락한다.
+    원논문대로 **베타는 긴 추정구간(est, 기본 3년)에서 잡고, 잔차 누적은 그 안의 최근
+    형성구간(window, 기본 1년)에서만** 잰다 — 그래야 합이 0 이 아니다.
+
+    반환: 형성구간 잔차 누적 ÷ 추정구간 잔차 표준편차. 데이터 부족 시 None.
     """
-    need = window + skip + 1
+    need = est + skip + 1
     if len(stock_closes) < need or len(kospi_closes) < need:
         return None
-    s = stock_closes[-need:len(stock_closes) - skip] if skip > 0 else stock_closes[-window - 1:]
-    m = kospi_closes[-need:len(kospi_closes) - skip] if skip > 0 else kospi_closes[-window - 1:]
-    if len(s) != len(m) or len(s) < 30:
+    s_end = len(stock_closes) - skip if skip > 0 else len(stock_closes)
+    m_end = len(kospi_closes) - skip if skip > 0 else len(kospi_closes)
+    s = stock_closes[s_end - est - 1:s_end]
+    m = kospi_closes[m_end - est - 1:m_end]
+    if len(s) != len(m) or len(s) < window + 30:
         return None
-    sr = [(s[i] - s[i - 1]) / s[i - 1] for i in range(1, len(s)) if s[i - 1] > 0]
-    mr = [(m[i] - m[i - 1]) / m[i - 1] for i in range(1, len(m)) if m[i - 1] > 0]
-    n = min(len(sr), len(mr))
-    if n < 30:
+    sr, mr = [], []
+    for i in range(1, len(s)):
+        if s[i - 1] > 0 and m[i - 1] > 0:
+            sr.append((s[i] - s[i - 1]) / s[i - 1])
+            mr.append((m[i] - m[i - 1]) / m[i - 1])
+    n = len(sr)
+    if n < window + 30:
         return None
-    sr, mr = sr[-n:], mr[-n:]
     mbar, sbar = sum(mr) / n, sum(sr) / n
     var = sum((x - mbar) ** 2 for x in mr)
     if var <= 0:
@@ -257,7 +267,7 @@ def residual_momentum(stock_closes: list[float], kospi_closes: list[float],
     sd = (sum((r - mu) ** 2 for r in resid) / n) ** 0.5
     if sd <= 0:
         return None
-    return round(sum(resid) / sd, 4)
+    return round(sum(resid[-window:]) / sd, 4)   # 형성구간만 누적 — 전체를 더하면 0 이다
 
 
 def is_big_bullish_candle(bar: dict, body_pct: float, wick_max: float) -> bool:

@@ -198,7 +198,8 @@ def _signal(code, date_str, full, kospi_upto, cfg):
 def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, sz: Sizing,
              max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str],
              hard_stop_pct: float = 0.0, rank_mode: str = "composite",
-             regime_ma: int = 0, breadth_min: float = 0.0) -> Result:
+             regime_ma: int = 0, breadth_min: float = 0.0,
+             exits: tuple[str, ...] = ("partial", "trail", "ma", "hold")) -> Result:
     """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
 
     hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
@@ -262,7 +263,7 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                 continue
             exited = False
             # (a) 첫 목표 부분익절 — 장중 고가 도달
-            if partial_on and not p.partial_done and b["high"] >= p.target and p.shares > 1:
+            if "partial" in exits and partial_on and not p.partial_done and b["high"] >= p.target and p.shares > 1:
                 part = int(p.shares * cfg.partial_pct / 100)
                 if 1 <= part < p.shares:
                     cash += part * p.target * sell_f
@@ -274,19 +275,21 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
             #     (2026-08-17 추가: 라이브엔 HARD_STOP_PCT=10 이 있는데 이 하니스엔 없었다.
             #      사이징·MDD·Sharpe 를 하드손절 없는 전략으로 측정해 온 셈이다.)
             eff_stop = max(p.stop, p.entry * (1 - hard_stop_pct / 100.0)) if hard_stop_pct > 0 else p.stop
-            if b["low"] <= eff_stop:
+            if "trail" not in exits:                 # 트레일 off — 하드손절만 남길 수 있다
+                eff_stop = p.entry * (1 - hard_stop_pct / 100.0) if hard_stop_pct > 0 else 0.0
+            if eff_stop > 0 and b["low"] <= eff_stop:
                 cash += p.shares * eff_stop * sell_f
                 res.closed.append((eff_stop - p.entry) / p.entry * 100)
                 exited = True
             if not exited:
                 # (d) MA120 종가 이탈
                 cl, idx = _closes_upto(closes[p.code], ordered[p.code], date_str)
-                ma = moving_average(cl, cfg.ma_slow) if cl else None
+                ma = moving_average(cl, cfg.ma_slow) if ("ma" in exits and cl) else None
                 if ma is not None and b["close"] < ma:
                     cash += p.shares * b["close"] * sell_f
                     res.closed.append((b["close"] - p.entry) / p.entry * 100)
                     exited = True
-            if not exited and (di - p.entry_idx) >= cfg.max_hold:
+            if not exited and "hold" in exits and (di - p.entry_idx) >= cfg.max_hold:
                 # (e) 보유기간 만료 — 종가 시간청산
                 cash += p.shares * b["close"] * sell_f
                 res.closed.append((b["close"] - p.entry) / p.entry * 100)

@@ -262,3 +262,20 @@ def test_benchmark_curve_mdd_matches_underlying():
     dates = ["2020-01-01", "2020-06-01", "2020-12-31"]
     bars = {"A": {d: {"close": v} for d, v in zip(dates, [100.0, 60.0, 90.0])}}
     assert W._mdd(W._benchmark_curve(bars, dates, "2020-01-01", "2020-12-31")) == pytest.approx(40.0)
+
+
+# ─── 노출 축 (2026-08-28 2차) ─────────────────────────────────────────────────
+def test_exposure_is_global_not_in_grid():
+    """★ 노출은 **후보 격자에 없어야** 한다.
+
+    노출은 학습으로 찾을 전략 파라미터가 아니라 운용자의 위험 선호다. 격자에 넣으면
+    폴드마다 위험 선호를 다시 고르게 되고(과적합), MAR 이 노출에 거의 불변이라
+    그 선택은 사실상 난수가 된다.
+    """
+    exposures = {c.max_pos * c.position_pct for c in W.GRID}
+    assert exposures == {100.0}, f"격자에 노출 축이 섞였다: {sorted(exposures)}"
+    assert hasattr(W, "EXPOSURE"), "전역 노출 배수가 없다"
+
+
+def test_exposure_default_is_full():
+    assert W.EXPOSURE == 1.0

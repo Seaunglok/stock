@@ -73,6 +73,24 @@ TOP_N = 100
 MDD_RATIO = 0.5          # 전략 MDD 가 벤치마크의 이 배수 이하여야 함
 MIN_WIN_YEARS = 0.60     # 플러스 검증연도 최소 비율
 
+# ── 노출(exposure) 축 — **폴드별로 고르지 않는다** (2026-08-28 2차) ──────────
+#
+# 1차 검증에서 ①(위험 절반)만 미충족이었다(MDD 34.1% vs 목표 22.7%). 격자가 전부
+# 사실상 만기 투자(슬롯5×20% / 20×5% = 100%)라 노출을 낮출 방법이 아예 없었다.
+#
+# 노출을 **후보 격자에 넣어 폴드마다 고르게 하지 않는다.** 노출은 학습으로 찾을 전략
+# 파라미터가 아니라 **운용자의 위험 선호**다. 폴드별로 고르면 위험 선호를 과적합하게 되고,
+# 게다가 MAR 은 노출에 대략 불변이라(수익·MDD 가 함께 비례 축소) 선택이 사실상 난수가 된다.
+#
+# 대신 전역 배수로 두고 **같은 절차를 여러 노출에서 돌려 프론티어를 보고**한다.
+# 어느 점을 택할지는 사람이 정한다 — 그게 위험 선호의 정의다.
+#
+# ⚠️ 예상되는 결과를 미리 적어 둔다(측정 전 선언): MDD 는 노출에 거의 비례하므로
+#    노출 ~0.65 에서 ① 이 충족될 가능성이 높다. 그렇게 통과한다면 그것은
+#    **"전략이 좋아졌다"가 아니라 "크기를 줄였다"** 는 뜻이다. ① 은 이 축을 열면
+#    산술적으로 거의 자동 충족되므로, 판단의 무게는 ②(MAR) 에 두어야 한다.
+EXPOSURE = 1.0           # 전 후보의 position_pct 에 곱하는 배수(운영 결정, 학습 대상 아님)
+
 
 # ── 후보 격자 — **검증 결과를 보기 전에 고정한다** ──────────────────────────
 @dataclass(frozen=True)
@@ -160,7 +178,7 @@ def _run(c: Candidate, lo: str, hi: str, costs: Costs, secmap: dict) -> dict:
     from trend_config import BREADTH_MIN_PCT, RANK_MODE, REGIME_MA
     P._SIG_MEMO.clear()
     res = P.simulate(DATA_START, DATA_END, TOP_N, _cfg(c), costs,
-                     P.Sizing(mode="notional", position_pct=c.position_pct),
+                     P.Sizing(mode="notional", position_pct=c.position_pct * EXPOSURE),
                      c.max_pos, 0, "partial" in c.exits, secmap,
                      hard_stop_pct=c.hard_stop, rank_mode=RANK_MODE,
                      regime_ma=REGIME_MA, breadth_min=BREADTH_MIN_PCT,
@@ -198,7 +216,13 @@ def main() -> int:
     ap.add_argument("--test-years", type=int, default=1)
     ap.add_argument("--metric", default="mar", choices=["mar", "total", "sharpe", "cagr"],
                     help="학습구간에서 후보를 고르는 기준(기본 MAR=CAGR/MDD)")
+    ap.add_argument("--exposure", type=float, default=1.0,
+                    help="전 후보 노출 배수(1.0=만기투자). 운영 결정이지 학습 대상이 아니다")
     args = ap.parse_args()
+    global EXPOSURE
+    EXPOSURE = args.exposure
+    if not 0.05 <= EXPOSURE <= 1.5:
+        raise SystemExit(f"--exposure 범위 이상: {EXPOSURE}")
 
     costs = Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS)
     secmap = P._sector_map()
@@ -208,7 +232,8 @@ def main() -> int:
 
     print("=" * 112)
     print(f"워크포워드 검증 — 학습 {args.train_years}년 / 검증 {args.test_years}년 롤링 · "
-          f"선택기준 {args.metric.upper()} · 후보 {len(GRID)}개 · 폴드 {len(folds)}개")
+          f"선택기준 {args.metric.upper()} · 후보 {len(GRID)}개 · 폴드 {len(folds)}개 · "
+          f"노출 {EXPOSURE:.0%}")
     print(f"데이터 {dates[0]}~{dates[-1]} ({len(dates)} 영업일) · 유니버스 시총상위 {TOP_N}")
     print("=" * 112)
     print(f"  {'검증구간':11} {'학습구간':23} {'선택된 규칙':22} "

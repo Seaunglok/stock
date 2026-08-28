@@ -566,7 +566,11 @@ def position_size(price: float, *, mode: str = "pct_equity", equity: float = 0.0
     - risk: 예탁자산 risk_pct% ÷ 손절폭(price−stop) = 종목당 감수 리스크 균등(터틀식). notional 은
       max_notional_pct% 로 상한(손절폭 극소 종목 과대편입 방지). 손절폭↑ 종목은 적게, ↓ 종목은 많이 사서
       거래별 실질 리스크를 맞춘다 → equity 곡선 MDD/변동성 대폭 축소(백테스트 검증: MAR 0.87→2.34).
-    - pct_equity: 예탁자산 pct% notional (현금 한도 내).
+    - pct_equity (= notional): 예탁자산 pct% notional (현금 한도 내).
+      ※ 두 이름은 **같은 규칙**이다. 백테스트 하니스(backtest_trend_portfolio.Sizing)가
+        `notional` 이라 부르고 라이브가 `pct_equity` 라 불러, 라이브에 `notional` 을 넣으면
+        조용히 **고정금액 폴백**으로 떨어졌다(2026-08-28 발견 — 385만 계좌에 종목당 50만원
+        주문이 나갈 뻔했다). 이름이 갈린 채로 두면 같은 사고가 반복되므로 동의어로 못박는다.
     - fixed / 데이터 부족: 고정금액(invest_fixed).
 
     예탁자산 조회 실패(equity=0) 또는 risk 모드인데 손절폭 무효(stop<=0 or price<=stop) 시 안전 폴백:
@@ -580,7 +584,7 @@ def position_size(price: float, *, mode: str = "pct_equity", equity: float = 0.0
         if cash > 0:
             qty = min(qty, int(cash / price))
         return max(0, qty)
-    if mode in ("pct_equity", "risk") and equity > 0:   # risk 폴백 = notional
+    if mode in ("pct_equity", "notional", "risk") and equity > 0:   # risk 폴백 = notional
         qty = int(equity * pct / 100.0 / price)
         if cash > 0:
             qty = min(qty, int(cash / price))

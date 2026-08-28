@@ -111,7 +111,11 @@ EXITS = tuple(x.strip() for x in os.getenv("TREND_EXITS", "ma,hold").split(",") 
 # 2023(+19.3%) 상승장에서도 마이너스라 '상승장 전략'조차 아니다. 12년 표본에서 플러스가
 # 확인되는 진입 규칙을 찾을 때까지 새 자본을 넣지 않는다. **청산·트레일·손절은 계속 작동한다.**
 # 기본값 True = 설정 유실 시에도 닫힌 쪽(08-17 원칙: 안전장치는 실패 시 닫힌다).
-ENTRY_HALT = os.getenv("TREND_ENTRY_HALT", "true").lower() == "true"
+ENTRY_HALT = os.getenv("TREND_ENTRY_HALT", "true").lower() == "true"   # 기본은 닫힌 쪽 유지
+# 워크포워드를 **어느 예탁금으로** 검증했는지. 정수 주식수 제약 때문에 계좌 크기가 결과를
+# 바꾼다(2026-08-28: 1억 검증값을 385만 계좌에 적용하면 유니버스의 29%만 매수 가능했다).
+# 예탁금이 여기서 크게 벗어나면 기동 시 경고한다 — 사람이 기억할 일이 아니다.
+VALIDATED_EQUITY = float(os.getenv("TREND_VALIDATED_EQUITY", "3852844"))
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 # 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
 #   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.
@@ -119,8 +123,11 @@ INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 # 12년 재측정에서 notional 이 동일 노출에서 MDD 가 더 낮았다. 워크포워드는 notional 로 검증했다.
 # 슬롯 20 × 2.5% = 총 노출 50% — 노출은 학습 대상이 아니라 위험 선호이며, 프론티어에서
 # 65%(MDD 22.3%)·50%(MDD 17.4%) 둘 다 기준 충족. 손실 구간 이후 재개라 낮은 쪽을 택했다.
-SIZING_MODE = os.getenv("TREND_SIZING_MODE", "notional")
-POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "2.5"))  # 종목당 예탁 대비 %
+# 코드 기본값은 `pct_equity` — 백테스트 하니스의 `notional` 과 **같은 규칙**이다
+# (2026-08-28: 이름이 갈려 라이브가 고정금액 폴백으로 떨어질 뻔했다. signals.position_size 가
+#  두 이름을 동의어로 받는다).
+SIZING_MODE = os.getenv("TREND_SIZING_MODE", "pct_equity")
+POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "5"))    # 종목당 예탁 대비 % (슬롯20 → 노출 100%)
 # risk 모드: 종목당 감수 리스크(예탁 대비 %). 1.0=보수(MDD~7%)·1.5=현 15% notional 노출 근사(MDD~11%).
 RISK_PCT = float(os.getenv("TREND_RISK_PCT", "1.5"))
 # risk 모드 notional 상한(예탁 대비 %) — 손절폭 극소 종목이 과대편입되는 것 방지.

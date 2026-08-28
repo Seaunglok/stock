@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import contextlib
 import glob
 import io
@@ -51,7 +52,12 @@ from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억 (backtest_trend 과 동일)
-START_EQUITY = 100_000_000.0    # 시작 예탁자산 1억
+# 시작 예탁자산. **실계좌 크기와 다르면 검증이 무효가 될 수 있다** — 정수 주식수 제약 때문에
+# 소액 계좌에서는 비싼 종목이 통째로 매수 불가가 되고(종목당 예산 < 1주 가격), 그 결과
+# "검증한 유니버스"와 "실제로 살 수 있는 유니버스"가 갈린다. 2026-08-28 실측: 예탁 385만원에
+# 슬롯20×2.5%(96,321원) 면 KOSPI 상위 99종 중 **29종만** 매수 가능했다(1억이면 98종).
+# TREND_BT_EQUITY 로 실계좌 예탁금을 주입해 검증할 것.
+START_EQUITY = float(os.getenv("TREND_BT_EQUITY", "100000000"))
 
 
 # ─── 섹터 맵 (유니버스 캐시) ─────────────────────────────────────────────────
@@ -113,6 +119,7 @@ class Result:
     concurrent: list[int] = field(default_factory=list)  # 일별 동시보유 수
     n_days: int = 0                      # **실제로 시뮬한** 영업일 수(요청 구간 검증용)
     entry_dates: list[str] = field(default_factory=list)  # 진입일(워크포워드 누수 검증용)
+    open_positions: list[dict] = field(default_factory=list)  # 종료 시점 보유(라이브 대조용)
 
 
 # ─── 유니버스 로드(캐시) ──────────────────────────────────────────────────────
@@ -366,6 +373,10 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
         res.concurrent.append(len(positions))
 
     res.n_days = len(dates)
+    res.open_positions = [{"code": p.code, "entry": p.entry, "shares": p.shares,
+                           "entry_idx": p.entry_idx,
+                           "entry_date": dates[p.entry_idx] if 0 <= p.entry_idx < len(dates) else "",
+                           "sector": p.sector} for p in positions]
     # 종료 시 잔여 포지션 마지막 종가 청산(집계용)
     if positions and dates:
         for p in positions:

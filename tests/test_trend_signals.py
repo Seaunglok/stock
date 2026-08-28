@@ -552,3 +552,30 @@ def test_pullback_upper_bound_still_applies():
     """하한을 넣어도 상한(과열 배제)은 그대로여야 한다."""
     cfg = TrendConfig(mode="largecap", pullback_pct=12.0, pullback_min_pct=0.0)
     assert entry_signal(_uptrend_at(+20.0), [100.0] * 200, cfg).gates["pullback"] is False
+
+
+# ─── 사이징 모드 이름 일치 (2026-08-28) ───────────────────────────────────────
+def test_live_sizer_understands_every_harness_mode():
+    """★ 백테스트 하니스가 쓰는 모드 이름을 라이브 사이저가 전부 알아야 한다.
+
+    2026-08-28: 하니스는 `notional`, 라이브는 `pct_equity` 로 같은 규칙을 다르게 불렀다.
+    검증 결과를 그대로 .env 에 옮기면 라이브가 그 이름을 모르고 **고정금액 폴백**으로
+    떨어진다 — 385만원 계좌에 종목당 50만원 주문이 나갈 뻔했다.
+    이름이 갈린 채로 두면 같은 사고가 반복되므로, 여기서 잠근다.
+    """
+    from src.mcp_servers.trend_mcp.signals import position_size
+    equity, price = 3_852_844.0, 100_000.0
+    expected = int(equity * 5.0 / 100.0 / price)          # 예탁 5% notional
+    for mode in ("pct_equity", "notional"):
+        qty = position_size(price, mode=mode, equity=equity, cash=equity,
+                            pct=5.0, invest_fixed=500_000.0)
+        assert qty == expected, f"mode={mode} 가 예탁 비례로 계산되지 않는다(qty={qty})"
+
+
+def test_unknown_sizing_mode_falls_back_to_fixed_not_silently_huge():
+    """알 수 없는 모드는 고정금액으로 떨어진다 — 그 자체는 의도된 폴백이지만,
+    **예탁금 대비 과대**할 수 있으므로 값이 invest_fixed 를 넘지 않아야 한다."""
+    from src.mcp_servers.trend_mcp.signals import position_size
+    qty = position_size(100_000.0, mode="오타난모드", equity=3_852_844.0,
+                        pct=5.0, invest_fixed=500_000.0)
+    assert qty * 100_000.0 <= 500_000.0 * 1.001

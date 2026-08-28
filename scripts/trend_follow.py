@@ -32,6 +32,7 @@ from trend_config import (                  # noqa: E402  env·상수·logger·C
     # 하는 숨은 순서 의존까지 있었다. 실거래 파라미터를 읽는 코드에서 출처 불명은 그 자체가 위험.
     ACCOUNT_NO, ADOPT_MODE, BREADTH_MIN_PCT, CFG, DAILY_LOSS_LIMIT_PCT, DATA_DIR,
     ENTRY_CUTOFF, ENTRY_HALT, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA, EXITS,
+    VALIDATED_EQUITY,
     FORCE_PHASE,
     FOREIGN_TREND_MA, FUND_BONUS, HARD_STOP_PCT, HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
     INTRADAY_POLL_MIN,
@@ -135,8 +136,9 @@ async def _size_qty(price: float, stop: float = 0.0) -> int:
 
     risk 모드는 손절폭(price−stop)으로 수량을 정하므로 stop 을 넘겨야 한다(없으면 notional 폴백).
     """
-    equity, cash = (await _account_equity()) if SIZING_MODE in ("pct_equity", "risk") else (0.0, 0.0)
-    if SIZING_MODE in ("pct_equity", "risk") and equity <= 0:
+    _needs_equity = SIZING_MODE in ("pct_equity", "notional", "risk")
+    equity, cash = (await _account_equity()) if _needs_equity else (0.0, 0.0)
+    if _needs_equity and equity <= 0:
         logger.warning("[SIZE] 예탁자산 조회 실패 → 고정금액 폴백")
     return position_size(price, mode=SIZING_MODE, equity=equity, cash=cash,
                          pct=POSITION_PCT, invest_fixed=INVEST_PER_TRADE,
@@ -638,6 +640,71 @@ async def _apply_sector_rally(cands: list[dict]) -> list[dict]:
                                      "reason": "주도섹터 아님(SECTOR_GATE)"})
             shadow_record("sector_gate", skipped, {"leaders": sorted(lead_names)})
     return cands
+
+
+async def _check_sizing_feasible() -> None:
+    """종목당 예산으로 유니버스의 몇 %를 실제로 살 수 있는지 확인하고, 낮으면 경고한다.
+
+    2026-08-28 발견: 워크포워드는 예탁 1억을 가정해 검증했는데 실계좌는 385만원이었다.
+    슬롯20×2.5% = 종목당 96,321원이면 KOSPI 상위 99종 중 **29종만** 매수 가능하다
+    (1억이면 98종). 나머지는 `int(예산/주가)=0` 으로 조용히 스킵되고, 남는 것은
+    '싼 종목만' 이라 검증한 유니버스와 실제 매매 유니버스가 갈린다.
+
+    정수 주식수 제약은 소액 계좌에서만 문제가 되므로, 예탁금이 바뀌면 언제든 재발한다.
+    그래서 기동할 때마다 확인한다 — 사람이 기억할 일이 아니다.
+    """
+    if SIZING_MODE not in ("pct_equity", "notional"):   # 두 이름은 동의어(2026-08-28)
+        return
+    try:
+        eq = await _account_equity()
+        equity = eq[0] if isinstance(eq, tuple) else eq
+        if not equity or equity <= 0:
+            return
+        budget = equity * POSITION_PCT / 100.0
+        from src.mcp_servers.trend_mcp.market_data import _broad_codes
+        codes = _broad_codes()[:100]
+        prices = [p for p in (await _prices_for(codes)) if p and p > 0]
+        if len(prices) < 15:
+            return
+        ok = sum(1 for p in prices if p <= budget)
+        ratio = ok / len(prices)
+        logger.info("[SIZING] 예탁 %s원 · 종목당 %s원 → 유니버스 %d/%d(%.0f%%) 매수가능",
+                    f"{equity:,.0f}", f"{budget:,.0f}", ok, len(prices), ratio * 100)
+        drift = ""
+        if VALIDATED_EQUITY > 0:
+            d = equity / VALIDATED_EQUITY - 1
+            if abs(d) > 0.40:
+                drift = (f" 예탁금이 검증 시점({VALIDATED_EQUITY:,.0f}원) 대비 {d:+.0%} 변했습니다 — "
+                         "정수 주식수 제약이 달라지므로 재검증이 필요합니다"
+                         " (`TREND_BT_EQUITY=<현재예탁> python scripts/walkforward_trend.py --select-now`).")
+        if ratio < 0.45 or drift:
+            await notify(
+                f"⚠️ 사이징 경고 — 종목당 예산 {budget:,.0f}원으로 유니버스의 "
+                f"{ratio:.0%}({ok}/{len(prices)})만 매수 가능합니다. 나머지는 0주로 스킵돼 "
+                f"'싼 종목만' 사게 됩니다(검증 유니버스와 불일치). "
+                f"슬롯 수를 줄이거나 종목당 비중을 올리세요.{drift}", critical=True)
+    except Exception as e:                     # 가드 실패가 매매를 막지는 않는다
+        logger.warning("[SIZING] 매수가능 비율 확인 실패(무시): %s", e)
+
+
+async def _prices_for(codes: list[str]) -> list[float]:
+    """유니버스 현재가 — 사이징 가드 전용(실패는 조용히 건너뛴다).
+
+    전 종목을 조회하면 기동이 느려지므로 표본만 본다. 매수가능 '비율' 추정이 목적이라
+    표본으로 충분하다.
+    """
+    # **균등 추출**한다. 유니버스는 시총 내림차순이라 앞쪽만 보면 비싼 종목에 쏠려
+    # 매수가능 비율이 실제보다 낮게 나온다(2026-08-28: 상위40 기준 35% vs 전체 60%).
+    step = max(1, len(codes) // 24)
+    out: list[float] = []
+    for c in codes[::step][:24]:
+        try:
+            cur, _ = await _cur_and_open(c)
+            if cur and cur > 0:
+                out.append(float(cur))
+        except Exception:
+            continue
+    return out
 
 
 async def _market_gates(cands: list[dict]) -> list[dict] | None:
@@ -1271,14 +1338,13 @@ async def scheduler_daemon() -> None:
     if not ENV_LOADED:
         warns.append(f"⚠️ .env 를 찾지 못했습니다({_ROOT / '.env'}) — 모든 설정이 코드 기본값입니다. "
                      "PRODUCTION_MODE 판정도 신뢰할 수 없으니 주문 경로를 직접 확인하세요")
-    if SIZING_MODE == "pct_equity" and POSITION_PCT > 3:
-        warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
+    # 종목당 % 단독이 아니라 **총 노출**로 본다 — 슬롯 수와 함께 봐야 의미가 있다.
+    # 과거 임계(3%)는 슬롯 5 시절 값이라, 슬롯 20 구성에서는 정상값에도 경고가 떴다.
+    if SIZING_MODE in ("pct_equity", "notional") and MAX_POS * POSITION_PCT > 105:
+        warns.append(f"총 노출 {MAX_POS * POSITION_PCT:.0f}% (슬롯{MAX_POS}×{POSITION_PCT:g}%) "
+                     "— 검증 구성은 100%")
     if SIZING_MODE == "risk" and RISK_PCT > 2:
         warns.append(f"RISK_PCT={RISK_PCT}% > 권장 ≤1.5% (거래별 리스크 과대 — MDD 급증)")
-    _exposure = MAX_POS * POSITION_PCT if SIZING_MODE == "notional" else None
-    if _exposure is not None and _exposure > 55:
-        warns.append(f"총 노출 {_exposure:.0f}% > 채택 50% (슬롯{MAX_POS}×{POSITION_PCT:g}%) "
-                     "— 워크포워드는 노출 50%에서 위험기준을 충족했다")
     if set(EXITS) & {"trail", "partial"}:
         warns.append(f"EXITS={','.join(EXITS)} — 트레일/부분익절 포함. 워크포워드 8폴드에서 "
                      "한 번도 선택되지 않은 구성이다(12년 기대값 -0.57%)")
@@ -1310,6 +1376,10 @@ async def scheduler_daemon() -> None:
                 UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF)
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
+    # 사이징 가드는 **락 획득 뒤에** 돈다. 시세 조회 ~24회로 수십 초가 걸리는데, 락 앞에 두면
+    # 그 사이 두 인스턴스가 나란히 통과해 중복 기동이 된다(2026-08-28 실제 발생).
+    # 느린 검사는 단일 인스턴스가 확정된 뒤에 한다.
+    await _check_sizing_feasible()
     _write_heartbeat()
     asyncio.create_task(_heartbeat_loop())   # hang 감지용 heartbeat (watchdog 이 stale 시 재기동)
     await notify(f"🚀 추세추종 데몬 시작 ({'🧪 MOCK' if MOCK_MODE else '💰 REAL'}) 모드:{UNIVERSE_MODE}")

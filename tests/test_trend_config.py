@@ -23,10 +23,10 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 # (속성명, 채택 기본값) — .env 없이 import 했을 때의 기대값
 ADOPTED = [
     ("UNIVERSE_MODE",        "largecap"),
-    ("SIZING_MODE",          "notional"),  # 2026-08-28 워크포워드 검증 구성
+    ("SIZING_MODE",          "pct_equity"),  # = 하니스의 notional (동의어)
     ("RISK_PCT",             1.5),
     ("MAX_NOTIONAL_PCT",     25.0),
-    ("POSITION_PCT",         2.5),    # 슬롯20 × 2.5% = 총 노출 50%
+    ("POSITION_PCT",         5.0),    # 슬롯20 × 5% = 노출 100%(실계좌 385만 검증)
     ("MAX_POS",              20),     # 분산 — MDD 50.7%→35.1%
     ("HARD_STOP_PCT",        10.0),     # 0 이면 하드손절 없음
     ("DAILY_LOSS_LIMIT_PCT", 2.0),      # 0 이면 서킷 없음
@@ -218,6 +218,11 @@ def test_hard_stop_is_not_a_strategy_switch(cfg_no_env):
 
 
 def test_total_exposure_is_the_validated_level(cfg_no_env):
-    """★ 총 노출 = 슬롯 × 종목당 %. 워크포워드에서 위험기준을 충족한 값(50%)."""
-    assert cfg_no_env.SIZING_MODE == "notional"
-    assert cfg_no_env.MAX_POS * cfg_no_env.POSITION_PCT == pytest.approx(50.0)
+    """★ 총 노출 = 슬롯 × 종목당 %. **실계좌 예탁(385만원)** 기준 워크포워드 채택값.
+
+    1억 가정으로 검증한 50%(슬롯20×2.5%)는 실계좌에서 종목당 96,321원이 되어 유니버스의
+    29%만 매수 가능했다 — 검증한 유니버스와 실제 매매 유니버스가 갈린다. 예탁금을 주입해
+    재검증한 결과가 슬롯20×5%(노출 100%, MAR 0.96·MDD 18.4%)다.
+    """
+    assert cfg_no_env.SIZING_MODE in ("pct_equity", "notional")
+    assert cfg_no_env.MAX_POS * cfg_no_env.POSITION_PCT == pytest.approx(100.0)

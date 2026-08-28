@@ -23,11 +23,11 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 # (속성명, 채택 기본값) — .env 없이 import 했을 때의 기대값
 ADOPTED = [
     ("UNIVERSE_MODE",        "largecap"),
-    ("SIZING_MODE",          "risk"),
+    ("SIZING_MODE",          "notional"),  # 2026-08-28 워크포워드 검증 구성
     ("RISK_PCT",             1.5),
     ("MAX_NOTIONAL_PCT",     25.0),
-    ("POSITION_PCT",         15.0),
-    ("MAX_POS",              5),
+    ("POSITION_PCT",         2.5),    # 슬롯20 × 2.5% = 총 노출 50%
+    ("MAX_POS",              20),     # 분산 — MDD 50.7%→35.1%
     ("HARD_STOP_PCT",        10.0),     # 0 이면 하드손절 없음
     ("DAILY_LOSS_LIMIT_PCT", 2.0),      # 0 이면 서킷 없음
     ("BREADTH_MIN_PCT",      0.4),      # 0 이면 breadth 게이트 없음
@@ -37,9 +37,11 @@ ADOPTED = [
     ("ENTRY_TIME",           "11:00"),
     ("ENTRY_CUTOFF",         "14:00"),  # ENTRY_TIME 보다 뒤여야 보류분이 의미를 가진다
     ("EXIT_MA",              120),
-    ("MAX_HOLD_DAYS",        60),
+    ("MAX_HOLD_DAYS",        120),    # 워크포워드 채택 구성(ma,hold)
+    ("USE_FOREIGN_EXIT",     False),  # 12년 검증 불가(ka10008 2026-05~) — 검증본에 없음
     ("FOREIGN_MIN_RATIO",    0.2),
     ("FOREIGN_TREND_MA",     20),   # 2026-08-25 A/B: MA60 은 룰을 무력화(변경 0건)
+    ("EXITS",                ("ma", "hold")),  # 트레일·부분익절 제거(8폴드 중 0회 선택)
     ("PYRAMID_ADDS",         0),        # 피라미딩은 기본 off
     ("PYRAMID_BYPASS_GATE",  False),
 ]
@@ -190,3 +192,32 @@ def test_entry_halt_can_be_lifted_by_env(monkeypatch):
     import trend_config
     assert importlib.reload(trend_config).ENTRY_HALT is False
     sys.modules.pop("trend_config", None)
+
+
+# ─── 워크포워드 채택 구성 (2026-08-28) ────────────────────────────────────────
+def test_exit_ladder_excludes_trail_and_partial(cfg_no_env):
+    """★ 트레일·부분익절이 기본 구성에 들어오면 안 된다.
+
+    워크포워드 8폴드에서 현행 4단 사다리는 **한 번도 선택되지 않았다**. 같은 진입에
+    청산만 바꿨을 때 거래당 -0.57% → +7.40% 였고, 범인은 ATR 트레일이었다
+    (휩소마다 손실 확정 + 왕복비용 0.43% 부과, 거래 613 → 170).
+    """
+    assert "trail" not in cfg_no_env.EXITS
+    assert "partial" not in cfg_no_env.EXITS
+    assert set(cfg_no_env.EXITS) == {"ma", "hold"}
+
+
+def test_hard_stop_is_not_a_strategy_switch(cfg_no_env):
+    """하드손절은 EXITS 스위치에 없다 — 전략 선택지가 아니라 위험 바닥이다.
+
+    백테스트는 항상 모델가 체결을 가정하지만 실거래엔 하한가·거래정지가 있다.
+    MA120 이 살아있으면 거의 발동하지 않으므로(비용 0의 보험) 끌 이유가 없다.
+    """
+    assert "hard" not in cfg_no_env.EXITS
+    assert cfg_no_env.HARD_STOP_PCT == 10.0
+
+
+def test_total_exposure_is_the_validated_level(cfg_no_env):
+    """★ 총 노출 = 슬롯 × 종목당 %. 워크포워드에서 위험기준을 충족한 값(50%)."""
+    assert cfg_no_env.SIZING_MODE == "notional"
+    assert cfg_no_env.MAX_POS * cfg_no_env.POSITION_PCT == pytest.approx(50.0)

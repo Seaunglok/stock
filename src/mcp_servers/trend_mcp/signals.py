@@ -594,6 +594,7 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
                   foreign_net: float | None = None, use_foreign: bool = False,
                   ma_trend: float | None = None, trend_ma_label: int = 60,
                   aged_out: bool = False, ma_ref: float | None = None,
+                  exits: tuple[str, ...] = ("partial", "trail", "ma", "hold"),
                   ) -> tuple[str | None, str, int]:
     """포지션 청산/부분익절 판정 → (action, reason, sell_qty). action ∈ {None, PARTIAL, EXIT}.
 
@@ -616,18 +617,24 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
     장중 판정 때문에 실계좌에서만 작동하고 있었다.
     → 호출자가 '마지막 완성 종가'를 넘기면 MA 판정이 검증본과 같아진다.
       트레일·하드손절은 의도적으로 cur(장중가)를 계속 쓴다 — 그건 원래 장중 스톱이다.
+
+    exits (2026-08-28 추가): 사다리 구성 스위치. 백테스트 하니스의 동명 인자와 **같은 규약**이다.
+    워크포워드 8폴드에서 현행 4단 사다리가 한 번도 선택되지 않았고(트레일이 휩소마다 손실을
+    확정), 선택된 것은 전부 트레일·부분익절 없는 MA 청산 계열이었다. 구성을 바꿀 수 있어야
+    검증본과 라이브가 같은 규칙으로 돌 수 있다.
+    **하드손절은 스위치에 없다** — 전략 선택지가 아니라 위험 바닥이기 때문이다(갭·거래정지 방어).
     """
     pnl = (cur - entry) / entry * 100.0 if entry > 0 else 0.0
     ref = ma_ref if ma_ref is not None else cur      # 이평선 비교 전용 기준가
     if hard_stop_pct > 0 and pnl <= -hard_stop_pct:
         return "EXIT", f"하드 손절 ({pnl:.2f}% ≤ -{hard_stop_pct:.0f}%)", qty
-    if not partial_done and target > 0 and cur >= target:
+    if "partial" in exits and not partial_done and target > 0 and cur >= target:
         part_qty = max(1, int(qty * partial_pct / 100))
         if part_qty < qty:   # qty=1 등 쪼갤 수 없으면 익절 없이 트레일 지속
             return "PARTIAL", f"첫 목표 도달 {partial_pct:.0f}% 익절", part_qty
-    if stop > 0 and cur <= stop:
+    if "trail" in exits and stop > 0 and cur <= stop:
         return "EXIT", f"트레일/손절 이탈 stop {stop:,.0f}", qty
-    if ma_exit is not None and ref < ma_exit:
+    if "ma" in exits and ma_exit is not None and ref < ma_exit:
         return "EXIT", f"MA{exit_ma_label} 이평선 하방돌파 ({ref:,.0f} < {ma_exit:,.0f})", qty
     if use_foreign and foreign_net is not None and foreign_net < 0:
         if ma_trend is None:                      # 추세조건 off — 수급만으로 청산(구 동작)
@@ -636,7 +643,7 @@ def exit_decision(*, entry: float, cur: float, qty: int, target: float, stop: fl
             return "EXIT", (f"외국인 5일 순매도 전환 + MA{trend_ma_label} 이탈 "
                             f"({ref:,.0f} < {ma_trend:,.0f})"), qty
         # 외인 순매도지만 추세 유지(MA60 위) → 보유 (트레일/MA120 에 위임)
-    if aged_out:
+    if "hold" in exits and aged_out:
         return "EXIT", f"보유기간 만료 ({pnl:+.2f}%) — 시간청산", qty
     return None, "", 0
 

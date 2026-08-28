@@ -216,6 +216,8 @@ def main() -> int:
     ap.add_argument("--test-years", type=int, default=1)
     ap.add_argument("--metric", default="mar", choices=["mar", "total", "sharpe", "cagr"],
                     help="학습구간에서 후보를 고르는 기준(기본 MAR=CAGR/MDD)")
+    ap.add_argument("--select-now", action="store_true",
+                    help="연간 재선택 — 직전 train-years 로 올해 쓸 규칙 하나를 고르고 .env 형식으로 출력")
     ap.add_argument("--exposure", type=float, default=1.0,
                     help="전 후보 노출 배수(1.0=만기투자). 운영 결정이지 학습 대상이 아니다")
     args = ap.parse_args()
@@ -227,6 +229,8 @@ def main() -> int:
     costs = Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS)
     secmap = P._sector_map()
     dates, bars, _closes, _ordered = P._load(DATA_START, DATA_END, TOP_N)
+    if args.select_now:
+        return _select_now(dates, costs, secmap, args.train_years, args.metric)
     folds = _folds(dates, args.train_years, args.test_years)
     _assert_folds(folds)
 
@@ -271,6 +275,51 @@ def main() -> int:
     print("  " + "-" * 100)
     _summary(oos_returns, oos_bench, picks,
              _stitch(strat_curves), _stitch(bench_curves), oos_days)
+    return 0
+
+
+def _select_now(dates: list[str], costs: Costs, secmap: dict,
+                train_years: int, metric: str) -> int:
+    """연간 재선택 — 직전 train_years 로 **올해 쓸 규칙 하나**를 고른다.
+
+    워크포워드가 잰 것은 특정 규칙의 성적이 아니라 **"매년 학습구간으로 다시 고르는 절차"**
+    의 성적이다(8폴드에서 4종이 뽑혔다). 그 절차를 매년 실행하지 않으면 검증된 것과
+    다른 전략을 돌리는 셈이 된다. 그래서 문서가 아니라 **명령**으로 만든다.
+
+    선택 규칙·후보 격자는 워크포워드와 **같은 것을 쓴다**(GRID/select) — 갈리면 검증 무효.
+    """
+    yr = int(dates[-1][:4])
+    lo, hi = f"{yr - train_years}-01-01", f"{yr - 1}-12-31"
+    n = sum(1 for d in dates if lo <= d <= hi)
+    print("=" * 92)
+    print(f"연간 재선택 — {yr}년에 쓸 규칙 (학습 {lo[:7]}~{hi[:7]}, {n} 영업일, 기준 {metric.upper()})")
+    print("=" * 92)
+    if n < 250 * train_years * 0.8:
+        print(f"  ⚠️ 학습 영업일이 부족하다({n}) — 데이터 범위(DATA_END={DATA_END})를 확인할 것")
+    scored = []
+    for cand in GRID:
+        m = _run(cand, lo, hi, costs, secmap)
+        _assert_window(m["_res"], lo, hi, dates, "재선택")
+        scored.append((cand, m))
+        mar = "inf" if m["mar"] == float("inf") else f"{m['mar']:.2f}"
+        print(f"  {cand.label:24} MAR {mar:>6} · 수익 {m['total']:>+8.1f}% · "
+              f"MDD {m['mdd']:>5.1f}% · 거래 {m['entries']:>4}")
+    best, bm = select(scored, metric)
+    print("-" * 92)
+    print(f"  선택: **{best.label}**  (학습 {metric.upper()} "
+          f"{bm['mar'] if metric == 'mar' else bm.get(metric):.2f})")
+    print()
+    print("  .env 에 반영할 값:")
+    print(f"    TREND_EXITS={','.join(best.exits)}")
+    print(f"    TREND_EXIT_MA={best.exit_ma}")
+    print(f"    TREND_MAX_HOLD={best.max_hold}")
+    print(f"    TREND_MAX_POS={best.max_pos}")
+    print(f"    TREND_SIZING_MODE=notional")
+    print(f"    TREND_POSITION_PCT={best.position_pct * EXPOSURE:g}   "
+          f"# 총 노출 {best.max_pos * best.position_pct * EXPOSURE:.0f}%")
+    print()
+    print("  ※ 이 출력을 그대로 반영할 것. 결과를 보고 다른 후보를 고르면 워크포워드가 무효가 된다.")
+    print("  ※ 반영 후 `pytest tests/test_trend_config.py` 스냅샷도 함께 갱신한다.")
     return 0
 
 

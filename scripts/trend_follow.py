@@ -31,7 +31,7 @@ from trend_config import (                  # noqa: E402  env·상수·logger·C
     # 오는가"를 추적할 수 없었고, `_ROOT`/`logger` 는 밑줄이라 스타에 안 실려 두 번째 import 를
     # 하는 숨은 순서 의존까지 있었다. 실거래 파라미터를 읽는 코드에서 출처 불명은 그 자체가 위험.
     ACCOUNT_NO, ADOPT_MODE, BREADTH_MIN_PCT, CFG, DAILY_LOSS_LIMIT_PCT, DATA_DIR,
-    ENTRY_CUTOFF, ENTRY_HALT, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA,
+    ENTRY_CUTOFF, ENTRY_HALT, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA, EXITS,
     FORCE_PHASE,
     FOREIGN_TREND_MA, FUND_BONUS, HARD_STOP_PCT, HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
     INTRADAY_POLL_MIN,
@@ -1080,7 +1080,13 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             remaining.append(pos)
             return
         a = float(pos.get("atr", 0) or 0)
-        peak, stop = ratchet_stop(entry, pos.get("peak_price", entry), pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
+        if "trail" in EXITS:
+            peak, stop = ratchet_stop(entry, pos.get("peak_price", entry),
+                                      pos.get("stop_price", 0), cur, a, CFG.atr_k, -CFG.stop_pct)
+        else:
+            # 트레일 미사용 — 래칫을 돌리지 않는다. 돌려두면 일지·알림에 '사용되지 않는
+            # 손절선'이 표시돼 운영자가 있는 줄 알게 된다. 위험 바닥은 하드손절이 맡는다.
+            peak, stop = max(pos.get("peak_price", entry), cur), pos.get("stop_price", 0)
         pos["peak_price"], pos["stop_price"] = round(peak, 2), round(stop, 2)
         sig = await _exit_signals(pos, cur) if do_exit_signals else {}
         action, reason, sell_qty = exit_decision(
@@ -1090,7 +1096,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             use_foreign=USE_FOREIGN_EXIT, trend_ma_label=FOREIGN_TREND_MA,
             ma_exit=sig.get("ma_exit"), foreign_net=sig.get("foreign"),
             ma_trend=sig.get("ma_trend"), aged_out=sig.get("aged", False),
-            ma_ref=sig.get("ma_ref"))
+            ma_ref=sig.get("ma_ref"), exits=EXITS)
         if not action:
             remaining.append(pos); return
         resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
@@ -1269,8 +1275,15 @@ async def scheduler_daemon() -> None:
         warns.append(f"POSITION_PCT={POSITION_PCT}% > 권장 3% (실전 첫주 사이즈 과대)")
     if SIZING_MODE == "risk" and RISK_PCT > 2:
         warns.append(f"RISK_PCT={RISK_PCT}% > 권장 ≤1.5% (거래별 리스크 과대 — MDD 급증)")
-    if MAX_POS > 5:
-        warns.append(f"MAX_POS={MAX_POS} > 권장 5 (실전 첫주 슬롯 과다)")
+    _exposure = MAX_POS * POSITION_PCT if SIZING_MODE == "notional" else None
+    if _exposure is not None and _exposure > 55:
+        warns.append(f"총 노출 {_exposure:.0f}% > 채택 50% (슬롯{MAX_POS}×{POSITION_PCT:g}%) "
+                     "— 워크포워드는 노출 50%에서 위험기준을 충족했다")
+    if set(EXITS) & {"trail", "partial"}:
+        warns.append(f"EXITS={','.join(EXITS)} — 트레일/부분익절 포함. 워크포워드 8폴드에서 "
+                     "한 번도 선택되지 않은 구성이다(12년 기대값 -0.57%)")
+    if not ENTRY_HALT and MAX_POS > 25:
+        warns.append(f"MAX_POS={MAX_POS} > 25 (분산 과다 — 검증 구성은 20)")
     if HARD_STOP_PCT <= 0:
         warns.append("HARD_STOP_PCT=0 — 하드손절 비활성 (권장 10%)")
     if DAILY_LOSS_LIMIT_PCT <= 0:

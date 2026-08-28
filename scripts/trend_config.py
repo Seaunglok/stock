@@ -100,7 +100,12 @@ UNIVERSE_MODE = os.getenv("TREND_UNIVERSE", "largecap")    # 채택: largecap (w
 WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").split(",") if c.strip()]
 TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 100))
 MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
-MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
+MAX_POS = int(os.getenv("TREND_MAX_POS", "20"))
+# 청산 사다리 구성(2026-08-28 워크포워드 채택). 하드손절은 여기 없다 — 전략 선택지가 아니라
+# 위험 바닥이라 항상 켜져 있다. 8폴드 중 현행 4단 사다리는 **한 번도 선택되지 않았고**,
+# 2026년 학습구간(2022-01~2025-12)이 고른 것은 `ma,hold`(MA120 + 시간청산 120영업일)다.
+# 상세: docs/2026-08-28-walkforward.md
+EXITS = tuple(x.strip() for x in os.getenv("TREND_EXITS", "ma,hold").split(",") if x.strip())
 # 신규진입 정지(2026-08-28). 12년 시점별 표본에서 거래당 -0.57%·PF 0.84 — 12년 중 플러스는
 # 3년(2020·2025·2026)뿐이고 그중 2년이 검증구간 결함으로 드러난 멜트업이다. 2017(+21.8%)·
 # 2023(+19.3%) 상승장에서도 마이너스라 '상승장 전략'조차 아니다. 12년 표본에서 플러스가
@@ -110,13 +115,20 @@ ENTRY_HALT = os.getenv("TREND_ENTRY_HALT", "true").lower() == "true"
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 # 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
 #   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.
-SIZING_MODE = os.getenv("TREND_SIZING_MODE", "risk")        # 채택(2026-07-13 포트폴리오 A/B)
-POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "15"))  # risk 폴백용 notional %
+# 사이징(2026-08-28 재채택). 구 risk 1.5% 는 결함 구간(멜트업 9개월)에서 정한 값이고,
+# 12년 재측정에서 notional 이 동일 노출에서 MDD 가 더 낮았다. 워크포워드는 notional 로 검증했다.
+# 슬롯 20 × 2.5% = 총 노출 50% — 노출은 학습 대상이 아니라 위험 선호이며, 프론티어에서
+# 65%(MDD 22.3%)·50%(MDD 17.4%) 둘 다 기준 충족. 손실 구간 이후 재개라 낮은 쪽을 택했다.
+SIZING_MODE = os.getenv("TREND_SIZING_MODE", "notional")
+POSITION_PCT = float(os.getenv("TREND_POSITION_PCT", "2.5"))  # 종목당 예탁 대비 %
 # risk 모드: 종목당 감수 리스크(예탁 대비 %). 1.0=보수(MDD~7%)·1.5=현 15% notional 노출 근사(MDD~11%).
 RISK_PCT = float(os.getenv("TREND_RISK_PCT", "1.5"))
 # risk 모드 notional 상한(예탁 대비 %) — 손절폭 극소 종목이 과대편입되는 것 방지.
 MAX_NOTIONAL_PCT = float(os.getenv("TREND_MAX_NOTIONAL_PCT", "25"))
-USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "true").lower() == "true"
+# 외인 청산 — **기본 off 로 전환(2026-08-28)**. ka10008 이력이 2026-05 부터라 12년 검증이
+# 불가능하고, 워크포워드가 채택한 구성에도 없다. 검증본에 없는 규칙이 라이브에서만 발동하는
+# 상태는 08-25 KB금융 오청산의 구조 그 자체다 — 라이브를 검증본과 일치시킨다.
+USE_FOREIGN_EXIT = os.getenv("TREND_USE_FOREIGN_EXIT", "false").lower() == "true"
 # 외인 청산 신호 규모 임계값: |5일 순매수합| ≥ 이 값 × 20일 평균거래량 이어야 유효 신호(0=부호만).
 # 2026-07-15 삼성생명 노이즈 오발동(0.001% 규모) 재발 방지. 백테스트: backtest_trend --foreignexit.
 FOREIGN_MIN_RATIO = float(os.getenv("TREND_FOREIGN_MIN_RATIO", "0.2") or 0)
@@ -148,7 +160,7 @@ HARD_STOP_PCT = float(os.getenv("TREND_HARD_STOP_PCT", "10") or 0)
 EXIT_MA = int(os.getenv("TREND_EXIT_MA", "120"))
 # 최대 보유 영업일(시간청산, 0=off). 백테스트가 cfg.max_hold=60 강제 마감으로 기대값을 산출했으므로
 # 라이브도 동일 조건 유지 — MA120 위 횡보 종목의 무기한 자본 점유 방지. 15:20 exit phase 에서만 평가.
-MAX_HOLD_DAYS = int(os.getenv("TREND_MAX_HOLD", "60") or 0)
+MAX_HOLD_DAYS = int(os.getenv("TREND_MAX_HOLD", "120") or 0)   # 워크포워드 채택(ma,hold)
 # 실적(재무) 자동 가점(차수재시실 '실적'): 매출·영업이익 YoY 동반증가 +N점, 영업이익만 +N/2 — 순위 가점만. 0=off.
 FUND_BONUS = float(os.getenv("TREND_FUND_BONUS", "5") or 0)
 # 주도섹터 집단상승(차수재시실 '시황'): 당일 섹터 평균등락·상승비율로 주도섹터 판정 → 소속 후보 가점. 0=off.

@@ -171,3 +171,73 @@ def test_ma120_exit_also_uses_ma_ref():
     kw = dict(entry=100.0, qty=10, target=130.0, stop=80.0, partial_done=True, ma_exit=95.0)
     assert exit_decision(cur=94.0, **kw)[0] == "EXIT"              # 장중 이탈
     assert exit_decision(cur=94.0, ma_ref=96.0, **kw)[0] is None   # 종가는 MA 위
+
+
+# ─── EXITS 스위치 동치 (2026-08-28) ───────────────────────────────────────────
+# 라이브(signals.exit_decision)와 백테스트(backtest_trend_portfolio.simulate)가 **같은
+# 문자열 규약**으로 사다리를 켜고 끈다. 한쪽만 바뀌면 여기서 깨진다.
+ADOPTED_EXITS = ("ma", "hold")
+
+
+def _ex(cur, exits, **kw):
+    base = dict(entry=10000.0, qty=100, target=12100.0, stop=9300.0,
+                partial_done=False, hard_stop_pct=10.0, partial_pct=CFG.partial_pct,
+                exit_ma_label=120, exits=exits)
+    base.update(kw)
+    return exit_decision(cur=cur, **base)
+
+
+def test_adopted_config_ignores_trail():
+    """★ 채택 구성에서 트레일 이탈은 청산 사유가 아니다."""
+    assert _ex(9200.0, ADOPTED_EXITS)[0] is None, "트레일이 꺼졌는데 청산됐다"
+    assert _ex(9200.0, ("partial", "trail", "ma", "hold"))[0] == "EXIT"   # 구 구성은 청산
+
+
+def test_adopted_config_ignores_partial():
+    """부분익절도 꺼진다 — 목표 도달해도 전량 보유(우측꼬리 유지)."""
+    assert _ex(12100.0, ADOPTED_EXITS)[0] is None
+    assert _ex(12100.0, ("partial", "trail", "ma", "hold"))[0] == "PARTIAL"
+
+
+def test_adopted_config_keeps_ma_exit():
+    act, reason, _ = _ex(9400.0, ADOPTED_EXITS, ma_exit=9500.0)
+    assert act == "EXIT" and "MA120" in reason
+
+
+def test_adopted_config_keeps_time_exit():
+    act, reason, _ = _ex(10500.0, ADOPTED_EXITS, aged_out=True)
+    assert act == "EXIT" and "보유기간" in reason
+
+
+def test_hard_stop_survives_every_exits_combo():
+    """★ 하드손절은 어떤 조합에서도 살아 있어야 한다 — 위험 바닥이므로."""
+    for exits in ((), ("ma",), ("hold",), ADOPTED_EXITS, ("partial", "trail", "ma", "hold")):
+        act, reason, _ = _ex(8900.0, exits, stop=0.0, target=0.0)
+        assert act == "EXIT" and "하드" in reason, f"exits={exits} 에서 하드손절이 죽었다"
+
+
+def test_empty_exits_holds_unless_hard_stop():
+    """전부 끄면 하드손절 외엔 아무것도 팔지 않는다."""
+    assert _ex(9200.0, (), ma_exit=9500.0, aged_out=True)[0] is None
+    assert _ex(8000.0, ())[0] == "EXIT"
+
+
+def test_live_and_backtest_share_exit_token_vocabulary():
+    """★ 라이브와 백테스트가 같은 토큰을 쓰는지 — 오타 하나로 규칙이 조용히 꺼진다."""
+    import inspect
+    import sys
+    sys.path.insert(0, str(_ROOT / "scripts"))
+    import backtest_trend_portfolio as P
+    bt = inspect.signature(P.simulate).parameters["exits"].default
+    live = inspect.signature(exit_decision).parameters["exits"].default
+    assert set(bt) == set(live) == {"partial", "trail", "ma", "hold"}, \
+        "두 하니스의 사다리 토큰이 갈렸다 — 한쪽에서만 켜지는 규칙이 생긴다"
+
+
+def test_config_exits_are_valid_tokens():
+    """설정에 오타가 있으면 그 규칙은 조용히 꺼진다 — 기동 전에 잡는다."""
+    import sys
+    sys.path.insert(0, str(_ROOT / "scripts"))
+    from trend_config import EXITS
+    assert set(EXITS) <= {"partial", "trail", "ma", "hold"}, f"알 수 없는 토큰: {EXITS}"
+    assert EXITS, "EXITS 가 비었다 — 하드손절 외 청산이 없다"

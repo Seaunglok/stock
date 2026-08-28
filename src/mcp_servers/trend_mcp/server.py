@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -18,6 +19,23 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.mcp_servers.base.base_mcp_server import BaseMCPServer  # noqa: E402
+
+
+_DEFAULT_EXITS = ("ma", "hold")     # 2026-08-28 워크포워드 채택
+
+
+def _live_exits() -> tuple[str, ...]:
+    """운용 중인 청산 사다리 구성.
+
+    `scripts/trend_config` 를 import 하지 않는다 — 순수 도메인(src/)이 스크립트(scripts/)를
+    참조하는 역방향 의존은 2026-08-17 에 제거한 것이다. 대신 **같은 환경변수**를 읽어
+    데몬과 값을 공유한다. 미설정 시 채택 기본값.
+    """
+    raw = os.getenv("TREND_EXITS", "")
+    toks = tuple(t.strip() for t in raw.split(",") if t.strip())
+    valid = {"partial", "trail", "ma", "hold"}
+    return tuple(t for t in toks if t in valid) or _DEFAULT_EXITS
+
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     TrendConfig,
     classify_zone,
@@ -110,18 +128,26 @@ class TrendMCPServer(BaseMCPServer):
             exit_ma_label: int = 120,
             foreign_net: float | None = None,
             use_foreign: bool = False,
+            exits: list[str] | None = None,
         ) -> dict[str, Any]:
             """포지션 청산/부분익절 판정 → (action, reason, sell_qty).
 
             우선순위: 하드손절 → 첫목표 부분익절 → 트레일/손절 이탈 → 이평선 이탈 → 외인 전환.
             ma_exit/foreign_net 은 청산 phase(15:20) 에서만 호출자가 채워 넘김.
+
+            exits: 사다리 구성(partial/trail/ma/hold). 생략하면 **운용 중인 구성**을 쓴다.
+            2026-08-28 워크포워드 채택은 `["ma","hold"]` — 트레일·부분익절은 12년 표본에서
+            거래당 -0.57% 를 만든 원인이라 제거됐다. 이 도구가 구 4단 사다리로 고정돼 있으면
+            외부 에이전트가 운용하지 않는 전략의 판정을 받는다.
+            하드손절은 목록에 없다: 전략 선택지가 아니라 위험 바닥이라 항상 적용된다.
             """
             try:
+                ladder = tuple(exits) if exits else _live_exits()
                 action, reason, sell_qty = exit_decision(
                     entry=entry, cur=cur, qty=qty, target=target, stop=stop,
                     partial_done=partial_done, hard_stop_pct=hard_stop_pct,
                     partial_pct=partial_pct, ma_exit=ma_exit, exit_ma_label=exit_ma_label,
-                    foreign_net=foreign_net, use_foreign=use_foreign,
+                    foreign_net=foreign_net, use_foreign=use_foreign, exits=ladder,
                 )
                 pnl_pct = (cur - entry) / entry * 100 if entry > 0 else 0.0
                 return self.create_standard_response(
@@ -132,6 +158,7 @@ class TrendMCPServer(BaseMCPServer):
                         "reason": reason,
                         "sell_qty": sell_qty,
                         "pnl_pct": round(pnl_pct, 2),
+                        "exits": list(ladder),            # 어떤 사다리로 판정했는지 명시
                     },
                 )
             except Exception as e:
@@ -239,23 +266,58 @@ class TrendMCPServer(BaseMCPServer):
                 success=True,
                 query="get_strategy_rules",
                 data={
-                    "universe": "KOSPI 시총상위 100 (거래대금 1,000억 이상)",
+                    "universe": (
+                        f"KOSPI 시총상위 {os.getenv('TREND_TOP_N', '100')} "
+                        f"(거래대금 {int(float(os.getenv('TREND_MIN_VALUE_KRW', '1e11'))) // 100000000:,}억 이상). "
+                        "백테스트는 시점별 시총 재산정(--pit) 사용 — 현재 스냅샷 소급은 생존편향"
+                    ),
                     "entry_gate": (
-                        "현재가 > MA60 & MA120(정배열) + RS(60일) > KOSPI + "
-                        "MA20 눌림 + 거래량↑"
+                        "현재가 > MA60 & MA120(정배열) + RS(60일) > KOSPI(절대) + "
+                        "MA20 ≤ 현재가 ≤ MA20×1.12(눌림 상·하한) + 거래량 ≥ 20일평균"
                     ),
-                    "entry_timing": "09:30 (상승중 즉시 / 하락중 보류→반등 진입, 10:30 마감)",
-                    "stop_target": "ATR 초기손절, 목표 = 진입 + 3×손절폭 (손익비 1:3)",
-                    "partial_profit_trail": "첫목표 30% 익절 → 나머지 ATR 트레일",
-                    "exit": "MA120 이탈 / 외인 5일 순매도전환 / 트레일 이탈",
-                    "sizing": "예탁자산 6% 균등 (최대 15종목 · ~90% 투입)",
-                    "pyramiding": (
-                        "옵션(검증=equity-curve 게이트): 진입+ k×R 도달 시 1유닛 추가, 종목당 최대 2회. "
-                        "rising-day 가드(2026-06-22): 양봉일에만 추가 허용."
+                    "market_gate": (
+                        f"KOSPI > MA{os.getenv('TREND_REGIME_MA', '60')}(레짐) + "
+                        f"breadth ≥ {os.getenv('TREND_BREADTH_MIN_PCT', '0.4')} + "
+                        f"일일손실 서킷 {os.getenv('TREND_DAILY_LOSS_LIMIT_PCT', '2')}%"
                     ),
+                    "entry_timing": (
+                        f"{os.getenv('TREND_ENTRY_TIME', '11:00')} "
+                        f"(상승중 즉시 / 하락중 보류→반등 진입, "
+                        f"{os.getenv('TREND_ENTRY_CUTOFF', '14:00')} 마감)"
+                    ),
+                    "exit": (
+                        f"사다리 {','.join(_live_exits())} — "
+                        f"MA{os.getenv('TREND_EXIT_MA', '120')} 종가 이탈 / "
+                        f"{os.getenv('TREND_MAX_HOLD', '120')}영업일 시간청산. "
+                        f"하드손절 {os.getenv('TREND_HARD_STOP_PCT', '10')}%(구성과 무관한 위험 바닥)"
+                    ),
+                    "exit_removed": (
+                        "ATR 트레일·첫목표 30% 부분익절·외인 5일 순매도 — 2026-08-28 제거. "
+                        "12년 시점별 표본에서 트레일이 거래당 -0.57%(PF 0.84)의 원인이었고, "
+                        "같은 진입에 청산만 바꾸면 +7.40%(PF 2.15). "
+                        "워크포워드 8폴드에서 구 4단 사다리는 한 번도 선택되지 않았다"
+                    ),
+                    "stop_target": (
+                        "ATR 기준손절·목표(진입+3×손절폭)는 **청산을 발동하지 않는다** — "
+                        "그림자 원장의 R 배수 측정 기준으로만 쓰인다"
+                    ),
+                    "sizing": (
+                        f"예탁자산 {os.getenv('TREND_POSITION_PCT', '5')}% 균등 × "
+                        f"최대 {os.getenv('TREND_MAX_POS', '20')}종목. "
+                        "⚠️ 정수 주식수 제약 때문에 계좌 크기가 결과를 바꾼다 — "
+                        "소액 계좌는 비싼 종목이 통째로 매수 불가가 되어 검증 유니버스와 갈린다"
+                    ),
+                    "pyramiding": "영구 비활성 — 12년 표본 마이너스, 2026-06-22 손실의 67%",
                     "validated_backtest": (
-                        "watchlist(삼성·하이닉스) 기대값 +17.5%·손익비 8.45 / "
-                        "largecap 기대값 +5.2%·손익비 2.3 (2025-01~2026-05, 비용 차감)"
+                        "워크포워드(학습4년/검증1년 롤링, 실계좌 예탁 기준, 2015-2026 8폴드): "
+                        "OOS 누적 +234.8% · CAGR 17.6% · MDD 18.4% · MAR 0.96 "
+                        "(동일가중 벤치마크 MAR 0.58) · 플러스 7/8 연도. "
+                        "유니버스 생존편향은 전략·벤치마크가 공유 — 상대 비교만 유효"
+                    ),
+                    "validation_policy": (
+                        "단일 구간 in-sample 채택 금지. 판정 기준을 측정 전에 코드 상수로 "
+                        "선언·커밋하고, 워크포워드 OOS 로만 채택한다. "
+                        "매년 1월 `walkforward_trend.py --select-now` 로 규칙 재선택"
                     ),
                     "tools_workflow": [
                         "1) 데이터 수집(다른 MCP·pykrx): OHLCV + KOSPI 종가 + (선택) 외인/기관/업종지수",

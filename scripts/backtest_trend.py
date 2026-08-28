@@ -63,10 +63,12 @@ def apply_live_mirror(cfg: TrendConfig) -> list[str]:
     곧 '우리 전략의 백테스트'가 되게 한다. A/B 함수들은 여기서 명시적으로 이탈시킨다.
     """
     global V_EXIT_MA, V_HARD_STOP_PCT, V_BREADTH_MIN_PCT, V_REGIME_MA, V_FOREIGN_TREND_MA
+    global V_EXITS
     from trend_config import (                      # 지연 import — 모듈 로드 시 .env/로깅 부작용 회피
-        BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, FOREIGN_TREND_MA, HARD_STOP_PCT,
+        BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, EXITS, FOREIGN_TREND_MA, HARD_STOP_PCT,
         MAX_HOLD_DAYS, REGIME_MA, USE_FOREIGN_EXIT,
     )
+    V_EXITS = tuple(EXITS)
     V_EXIT_MA = EXIT_MA
     V_HARD_STOP_PCT = HARD_STOP_PCT
     V_BREADTH_MIN_PCT = BREADTH_MIN_PCT or None
@@ -92,6 +94,9 @@ def _gap_pct(full: list[dict], i: int) -> float:
 
 
 # ─── A/B 변형 노브(검증대기 항목 비교용) ─────────────────────────────────────
+# 청산 사다리 구성 — 라이브 `signals.exit_decision(exits=)` · 포트폴리오 하니스
+# `simulate(exits=)` 와 **같은 토큰 규약**. apply_live_mirror() 가 trend_config.EXITS 로 채운다.
+V_EXITS: tuple[str, ...] = ("partial", "trail", "ma", "hold")
 V_FIRST_PARTIAL_R: float | None = None   # 첫 30% 익절 지점(R배수). None=cfg.rr(1:3). 1.0=1:1
 V_EXIT_MA: int | None = None             # 청산 이평선. None=cfg.ma_support(50). 120 등
 V_HARD_STOP_PCT: float = 0.0             # 진입가 -X% 하드 손절(트레일 floor). 0=off
@@ -121,7 +126,10 @@ V_RS_SKIP: int = 0        # 최근 N일 제외(Jegadeesh-Titman 12-1 관례)
 V_RS_MIN: float = 0.0     # 통과 임계(%). 0=현행(지수 초과). 음수면 소폭 열위도 허용
 V_RS_RESIDUAL: bool = False   # 베타조정 잔차 모멘텀(Blitz-Huij-Martens 2011)
 V_TRADE_LOG: list | None = None  # 진입일·종목·net 기록(연도별 분해용). None=미기록
-V_PIT_UNIVERSE: bool = False   # 시점별 유니버스(그날 시총 상위 top_n 재산정). False=현재 스냅샷 소급(생존편향)
+# 시점별 유니버스 — **기본 True**(2026-08-28). 현재 스냅샷을 과거에 소급하면 "그 사이 상위로
+# 올라온 종목을 미리 아는" look-ahead 가 되고, 그 크기가 거래당 +0.4~0.6%p 로 **측정됐다**.
+# 편향의 방향과 크기를 아는 이상 기본값이 편향된 쪽이면 안 된다. `--no-pit` 로 구 동작 재현.
+V_PIT_UNIVERSE: bool = True
 V_PIT_POOL_N: int = 350        # 시점별 모드의 후보 풀 크기(현재 시총 상위 N)
 V_REGIME_MA: int | None = None            # KOSPI < MA(N) 이면 그날 신규진입 차단(None=off)
 V_VOL_MAX_PCT: float | None = None        # 최근 20일 KOSPI 일간변동성(표준편차%) > 이 값이면 차단(None=off)
@@ -166,10 +174,18 @@ def _foreign_exit_today(code: str | None, bar: dict, full: list[dict], j: int) -
 
 def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
                    code: str | None = None) -> float | None:
-    """신호 봉 i 다음날 시가 진입 → 트레일/목표/MA 청산. net 수익률(%) 반환.
+    """신호 봉 i 다음날 시가 진입 → 청산 사다리 적용. net 수익률(%) 반환.
 
-    변형 노브: V_FIRST_PARTIAL_R(첫익절 지점), V_EXIT_MA(청산선), V_HARD_STOP_PCT(하드손절),
-    V_FOREIGN_MIN_RATIO(외인 수급 청산 — code 필요).
+    사다리 구성은 `V_EXITS` 가 정한다 — 라이브 `signals.exit_decision(exits=)` ·
+    포트폴리오 하니스 `simulate(exits=)` 와 **같은 토큰 규약**(partial/trail/ma/hold).
+    하드손절은 토큰에 없다: 전략 선택지가 아니라 위험 바닥이라 항상 적용된다.
+
+    2026-08-28: 이 함수만 구 4단 사다리로 고정돼 있었다. 라이브가 `ma,hold` 로 바뀐 뒤에도
+    여기로 A/B 를 돌리면 **운용하지 않는 전략의 숫자**가 나온다 — 08-27 에 철회한 `blend`
+    채택이 정확히 그 형태였다. 세 구현이 같은 규약을 공유하도록 맞춘다.
+
+    변형 노브: V_EXITS(사다리 구성), V_FIRST_PARTIAL_R(첫익절 지점), V_EXIT_MA(청산선),
+    V_HARD_STOP_PCT(하드손절), V_FOREIGN_MIN_RATIO(외인 수급 청산 — code 필요).
     """
     if i + 1 >= len(full):
         return None
@@ -182,39 +198,44 @@ def simulate_trade(full: list[dict], i: int, cfg: TrendConfig, costs: Costs,
     first_target = entry + first_r * (entry - stop)     # A/B 노브가 rr 을 덮어쓸 수 있어 별도 산출
     exit_ma = V_EXIT_MA if V_EXIT_MA is not None else cfg.ma_support
     hard_floor = entry * (1 - V_HARD_STOP_PCT / 100.0) if V_HARD_STOP_PCT > 0 else None
+    use_partial, use_trail = "partial" in V_EXITS, "trail" in V_EXITS
+    use_ma, use_hold = "ma" in V_EXITS, "hold" in V_EXITS
     closes = [b["close"] for b in full]
     peak = entry
     realized = 0.0       # 가중 실현 수익률(%)
     rem = 1.0
     partial = False
 
-    end = min(i + 1 + cfg.max_hold, len(full))
+    end = min(i + 1 + cfg.max_hold, len(full)) if use_hold else len(full)
     last_j = i + 1
     for j in range(i + 1, end):
         b = full[j]
         last_j = j
         # 첫 목표 도달(장중 고가) → 부분 익절
-        if not partial and b["high"] >= first_target:
+        if use_partial and not partial and b["high"] >= first_target:
             realized += (cfg.partial_pct / 100) * (first_target - entry) / entry * 100
             rem -= cfg.partial_pct / 100
             partial = True
-        # 트레일 갱신(종가)
-        peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
-        # Break-even: 장중 고가가 entry +X% 도달했으면 stop 을 entry 로 끌어올림(floor) — 손실 진입 방지
-        if V_BREAKEVEN_TRIGGER_PCT and b["high"] >= entry * (1 + V_BREAKEVEN_TRIGGER_PCT / 100.0):
-            stop = max(stop, entry)
-        # 손절/트레일 이탈(장중 저가) — 하드손절은 트레일 floor 로 적용
-        eff_stop = max(stop, hard_floor) if hard_floor is not None else stop
-        if b["low"] <= eff_stop:
+        if use_trail:
+            # 트레일 갱신(종가)
+            peak, stop = ratchet_stop(entry, peak, stop, b["close"], a, cfg.atr_k, -cfg.stop_pct)
+            # Break-even: 장중 고가가 entry +X% 도달했으면 stop 을 entry 로 끌어올림(floor)
+            if V_BREAKEVEN_TRIGGER_PCT and b["high"] >= entry * (1 + V_BREAKEVEN_TRIGGER_PCT / 100.0):
+                stop = max(stop, entry)
+        # 손절 이탈(장중 저가). 트레일 off 면 **하드손절만** 바닥이 된다
+        # (포트폴리오 하니스의 `"trail" not in exits` 분기와 동일).
+        eff_stop = (max(stop, hard_floor) if hard_floor is not None else stop) if use_trail             else (hard_floor if hard_floor is not None else 0.0)
+        if eff_stop > 0 and b["low"] <= eff_stop:
             realized += rem * (eff_stop - entry) / entry * 100
             rem = 0.0
             break
         # 청산 이평선 하방 돌파(종가)
-        ma = moving_average(closes[:j + 1], exit_ma)
-        if ma is not None and b["close"] < ma * (1 - V_MA_BUFFER_PCT / 100.0):
-            realized += rem * (b["close"] - entry) / entry * 100
-            rem = 0.0
-            break
+        if use_ma:
+            ma = moving_average(closes[:j + 1], exit_ma)
+            if ma is not None and b["close"] < ma * (1 - V_MA_BUFFER_PCT / 100.0):
+                realized += rem * (b["close"] - entry) / entry * 100
+                rem = 0.0
+                break
         # 외인 수급 청산(완성일 5일 순매도, 종가) — 라이브 exit_decision 우선순위와 동일(MA 다음)
         if _foreign_exit_today(code, b, full, j):
             realized += rem * (b["close"] - entry) / entry * 100
@@ -974,18 +995,18 @@ def main():
     p.add_argument("--slippage-bps", type=float, default=COSTS.SLIPPAGE_BPS)
     p.add_argument("--gapdown-sweep", action="store_true", help="프리장 갭다운 veto 임계값 스윕 비교")
     p.add_argument("--abtest", action="store_true", help="검증대기 항목 A/B 비교(첫익절/청산선/하드손절)")
-    p.add_argument("--rstest", action="store_true", help="RS 게이트 A/B 비교(절대값 vs 상위 20/30/40%)")
+    p.add_argument("--rstest", action="store_true", help="RS 게이트 A/B 비교(절대값 vs 상위 20/30/40%%)")
     p.add_argument("--pyramidtest", action="store_true", help="피라미딩(승자 불타기) A/B 비교")
     p.add_argument("--pyramidregime", action="store_true", help="레짐 게이트 피라미딩 A/B(KOSPI>MA 일 때만)")
     p.add_argument("--pyramidequity", action="store_true", help="equity-curve 게이트 피라미딩 A/B(전략 최근 성적>0일 때만)")
     p.add_argument("--pyramidrising", action="store_true", help="피라미딩 rising-day 게이트 A/B(양봉일에만 추가)")
-    p.add_argument("--breakeven", action="store_true", help="Break-even 트리거 A/B(+X% 도달 시 stop을 entry로 끌어올림)")
+    p.add_argument("--breakeven", action="store_true", help="Break-even 트리거 A/B(+X%% 도달 시 stop을 entry로 끌어올림)")
     p.add_argument("--breadthtest", action="store_true", help="시장 breadth 게이트 A/B(universe 양봉비율 < X 시 신규진입 차단)")
     p.add_argument("--pullbacktest", action="store_true", help="눌림목 게이트 폭 A/B(pullback_pct 3/5/8/12/20/off)")
-    p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
+    p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%%)")
     p.add_argument("--foreignexit", action="store_true", help="외인 청산룰 A/B(off/부호만/임계 0.2·0.5) — investor-domain 필요")
-    p.add_argument("--pit", action="store_true",
-                   help="시점별 유니버스 — 그날 시총 상위 top_n 재산정(생존편향 축소)")
+    p.add_argument("--no-pit", dest="pit", action="store_false", default=True,
+                   help="시점별 유니버스 끄기 — 현재 스냅샷 소급(생존편향 포함, 구 동작 재현용)")
     p.add_argument("--pit-pool", type=int, default=350, help="시점별 모드 후보 풀 크기")
     p.add_argument("--regimetest", action="store_true", help="시장 레짐/변동성 필터 A/B(KOSPI>MA · 변동성 상한)")
     p.add_argument("--legacy-defaults", action="store_true",
@@ -1003,7 +1024,8 @@ def main():
         print("⚠️ --legacy-defaults: 라이브와 다른 구 설정(MA50·게이트 off·눌림 3%)으로 실행합니다.")
     else:
         gaps = apply_live_mirror(cfg)
-        print(f"라이브 미러: 청산MA{V_EXIT_MA} · 하드손절 {V_HARD_STOP_PCT:g}% · 눌림 {cfg.pullback_pct:g}% · "
+        print(f"라이브 미러: 사다리 {','.join(V_EXITS)} · 청산MA{V_EXIT_MA} · "
+              f"하드손절 {V_HARD_STOP_PCT:g}% · 눌림 {cfg.pullback_pct:g}% · "
               f"breadth {V_BREADTH_MIN_PCT or 'off'} · 레짐 MA{V_REGIME_MA or 'off'} · 보유상한 {cfg.max_hold}일")
         for g in gaps:
             print(f"  ※ 미러 불가: {g}")

@@ -279,3 +279,33 @@ def test_exposure_is_global_not_in_grid():
 
 def test_exposure_default_is_full():
     assert W.EXPOSURE == 1.0
+
+
+# ─── 하니스 기본값이 안전한 쪽인가 (2026-08-28 리팩터) ────────────────────────
+def test_pit_universe_is_default_on():
+    """★ 생존편향은 +0.4~0.6%p 로 **측정된** 값이다. 기본이 편향된 쪽이면 안 된다."""
+    import backtest_trend as BT
+    assert BT.V_PIT_UNIVERSE is True, "무플래그 백테스트가 생존편향 포함 유니버스로 돈다"
+
+
+def test_backtest_equity_default_warns():
+    """★ 조용한 1억 기본값 금지 — 계좌 크기가 결과를 바꾼다(정수 주식수 제약)."""
+    import backtest_trend_portfolio as P
+    if P.BT_EQUITY_IS_DEFAULT:
+        assert P.warn_if_default_equity(), "예탁금 미지정인데 경고 문구가 비어 있다"
+    else:
+        assert P.warn_if_default_equity() == ""
+
+
+def test_all_cli_help_strings_are_formattable():
+    """argparse 는 help 를 %% 포맷한다 — `%` 하나면 --help 전체가 터진다.
+
+    2026-08-28: 세 개의 help 에 이스케이프가 빠져 `--help` 가 항상 예외였다.
+    """
+    import subprocess
+    import sys as _s
+    for script in ("backtest_trend.py", "backtest_trend_portfolio.py",
+                   "walkforward_trend.py", "trend_paper.py"):
+        r = subprocess.run([_s.executable, str(_ROOT / "scripts" / script), "--help"],
+                           capture_output=True, text=True, timeout=180)
+        assert r.returncode == 0, f"{script} --help 실패:\n{r.stderr[-400:]}"

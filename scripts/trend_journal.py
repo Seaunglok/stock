@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from trend_config import PRODUCTION_MODE, UNIVERSE_MODE, _ROOT, logger
+from trend_config import EXITS, PRODUCTION_MODE, UNIVERSE_MODE, _ROOT, logger
 from trend_kiwoom_io import _realtime_price, kospi_closes
 from trend_runtime import get_state, log_event, notify, read_events, read_journal
 
@@ -85,7 +85,12 @@ async def _position_rows() -> tuple[list[tuple], float]:
 
 
 def _trade_md(entries: list[dict], exits: list[dict], partials: list[dict]) -> list[str]:
-    L = [f"## 매매 (신규 {len(entries)} · 청산 {len(exits)} · 부분익절 {len(partials)})"]
+    # 부분익절은 EXITS 에 없으면 영구히 0 이다 — 항상 표시하면 "오늘도 0건" 이 아니라
+    # "그런 게 있는데 안 났다" 로 읽힌다. 켜져 있을 때만 적는다(2026-08-28).
+    _head = f"## 매매 (신규 {len(entries)} · 청산 {len(exits)}"
+    if partials or "partial" in EXITS:
+        _head += f" · 부분익절 {len(partials)}"
+    L = [_head + ")"]
     if entries:
         L += ["| 종목 | 진입가 | 수량 | 금액 | 점수 |", "|------|--------|------|------|------|"]
         L += [f"| {e['name']}({e['symbol']}) | {e['entry_price']:,.0f} | {e['qty']} | "

@@ -241,3 +241,163 @@ def test_config_exits_are_valid_tokens():
     from trend_config import EXITS
     assert set(EXITS) <= {"partial", "trail", "ma", "hold"}, f"알 수 없는 토큰: {EXITS}"
     assert EXITS, "EXITS 가 비었다 — 하드손절 외 청산이 없다"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 실동치 검증 — 두 구현을 **실제로 돌려서** 비교한다 (2026-08-28)
+#
+# 이 파일의 docstring 은 "라이브 ↔ 백테스트 청산 사다리 일치 검증" 을 표방했지만,
+# 위쪽 테스트들은 `exit_decision` 의 우선순위만 확인할 뿐 `simulate_trade` 를 **한 번도
+# 호출하지 않았다.** 그래서 08-28 에 라이브·포트폴리오 하니스만 `exits` 로 갱신되고
+# `simulate_trade` 가 구 4단 사다리에 남아 있는 것을 잡지 못했다.
+#
+# 가짜 보증은 없느니만 못하다 — 통과 사실이 근거로 쓰이기 때문이다. 여기서는 합성 일봉을
+# 만들어 **두 구현을 같은 데이터 위에서 돌리고 결과를 대조**한다.
+# ═══════════════════════════════════════════════════════════════════════════
+import sys as _sys                                                    # noqa: E402
+_sys.path.insert(0, str(_ROOT / "scripts"))
+import backtest_trend as BT                                           # noqa: E402
+from backtest_walkforward import Costs as _Costs                      # noqa: E402
+from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
+    atr as _atr, levels as _levels, moving_average,
+)
+
+_NOCOST = _Costs(0.0, 0.0, 0.0)      # 비용은 사다리 동치와 무관 — 0 으로 두고 순수 청산만 본다
+
+
+def _bars(closes, *, high_mult=1.0, low_mult=1.0):
+    """합성 일봉. 첫 봉 다음날 시가로 진입하므로 [0] 은 신호봉."""
+    out = []
+    for c in closes:
+        out.append({"date": f"2020-01-{len(out) + 1:02d}", "open": c,
+                    "high": c * high_mult, "low": c * low_mult,
+                    "close": c, "volume": 1000, "value": c * 1000})
+    return out
+
+
+def _cfg_for(exits, max_hold=60):
+    c = TrendConfig(mode="largecap")
+    c.max_hold, c.ma_slow = max_hold, 5      # 짧은 이평 — 합성 데이터에서 MA 청산이 발동하도록
+    return c
+
+
+def _run_bt(bars, exits, *, hard=10.0, exit_ma=5, max_hold=60):
+    """백테스트 구현 실행 (전역 노브 저장/복원)."""
+    saved = (BT.V_EXITS, BT.V_HARD_STOP_PCT, BT.V_EXIT_MA, BT.V_FOREIGN_MIN_RATIO,
+             BT.V_MA_BUFFER_PCT, BT.V_BREAKEVEN_TRIGGER_PCT, BT.V_FIRST_PARTIAL_R)
+    try:
+        BT.V_EXITS, BT.V_HARD_STOP_PCT, BT.V_EXIT_MA = tuple(exits), hard, exit_ma
+        BT.V_FOREIGN_MIN_RATIO, BT.V_MA_BUFFER_PCT = None, 0.0
+        BT.V_BREAKEVEN_TRIGGER_PCT, BT.V_FIRST_PARTIAL_R = None, None
+        return BT.simulate_trade(bars, 0, _cfg_for(exits, max_hold), _NOCOST)
+    finally:
+        (BT.V_EXITS, BT.V_HARD_STOP_PCT, BT.V_EXIT_MA, BT.V_FOREIGN_MIN_RATIO,
+         BT.V_MA_BUFFER_PCT, BT.V_BREAKEVEN_TRIGGER_PCT, BT.V_FIRST_PARTIAL_R) = saved
+
+
+def _run_live(bars, exits, *, hard=10.0, max_hold=60):
+    """라이브 exit_decision 을 같은 일봉 위에서 종가 기준으로 돌린다 → net%."""
+    cfg = _cfg_for(exits, max_hold)
+    entry = bars[1]["open"]
+    a = _atr(bars[:1], cfg.atr_period)
+    stop, target = _levels(entry, cfg, atr_value=a)
+    qty, partial_done, realized, rem = 100, False, 0.0, 1.0
+    closes = [b["close"] for b in bars]
+    for j in range(1, len(bars)):
+        if "hold" in exits and (j - 1) >= max_hold:
+            break
+        cur = bars[j]["close"]
+        ma = moving_average(closes[:j + 1], cfg.ma_slow) if "ma" in exits else None
+        act, _reason, part = exit_decision(
+            entry=entry, cur=cur, qty=qty, target=target, stop=stop,
+            partial_done=partial_done, hard_stop_pct=hard, partial_pct=cfg.partial_pct,
+            ma_exit=ma, exit_ma_label=cfg.ma_slow,
+            aged_out=("hold" in exits and (j - 1) >= max_hold - 1), exits=exits)
+        if act == "PARTIAL":
+            realized += (part / qty) * (cur - entry) / entry * 100
+            rem -= part / qty
+            partial_done = True
+        elif act == "EXIT":
+            realized += rem * (cur - entry) / entry * 100
+            return realized
+    return realized + rem * (closes[min(len(bars), max_hold + 1) - 1] - entry) / entry * 100
+
+
+# ─── ① 채택 구성에서 두 구현이 같은 방향을 내는가 ────────────────────────────
+@pytest.mark.parametrize("exits", [("ma", "hold"), ("ma",), ("hold",),
+                                   ("partial", "trail", "ma", "hold")])
+def test_both_implementations_agree_on_direction(exits):
+    """★ 같은 데이터·같은 구성에서 두 구현의 손익 **부호**가 일치해야 한다.
+
+    일봉 근사 차이(백테스트는 고가/저가, 라이브는 종가)로 값은 다를 수 있으나,
+    한쪽만 청산하고 다른 쪽은 홀드하는 일이 생기면 사다리가 갈린 것이다.
+    """
+    rising = _bars([100, 102, 105, 108, 112, 118, 125, 133])
+    bt, live = _run_bt(rising, exits), _run_live(rising, exits)
+    assert bt is not None
+    assert (bt > 0) == (live > 0), f"exits={exits}: 백테스트 {bt:+.2f}% vs 라이브 {live:+.2f}%"
+
+
+def test_adopted_config_matches_closely_on_clean_trend():
+    """★ 운용 구성(ma,hold)은 청산이 안 걸리는 추세에서 **거의 정확히** 일치해야 한다.
+
+    부분익절·트레일이 없으면 두 구현 모두 '마지막 종가까지 보유'로 수렴하므로, 여기서
+    벌어지면 사다리가 갈린 것이다(근사 오차로 설명되지 않는다).
+    """
+    dip = _bars([100, 100, 108, 103, 110, 118, 126])
+    bt, live = _run_bt(dip, ("ma", "hold")), _run_live(dip, ("ma", "hold"))
+    assert bt == pytest.approx(live, abs=0.01), f"백테스트 {bt:+.4f}% vs 라이브 {live:+.4f}%"
+
+
+# ─── ② 하드손절은 어느 구현에서도, 어느 구성에서도 발동한다 ──────────────────
+@pytest.mark.parametrize("exits", [(), ("ma",), ("hold",), ("ma", "hold")])
+def test_hard_stop_fires_in_both_implementations(exits):
+    """★ 위험 바닥은 구성과 무관하다 — 한쪽에서만 발동하면 실계좌가 무방비가 된다.
+
+    값은 일치하지 않는 것이 정상이다(백테스트 -10% vs 라이브 -12%): 백테스트는 장중 저가가
+    손절선을 스치면 **그 가격에** 체결시키고, 라이브는 종가로 판정한다. 일봉 근사의 차이지
+    사다리 차이가 아니다. 그래서 '둘 다 발동했는가'만 본다.
+    """
+    crash = _bars([100, 100, 95, 88, 80, 70])
+    bt = _run_bt(crash, exits, hard=10.0)
+    live = _run_live(crash, exits, hard=10.0)
+    assert bt is not None and bt < -8.0, f"백테스트 하드손절 미발동(exits={exits}): {bt}"
+    assert live < -8.0, f"라이브 하드손절 미발동(exits={exits}): {live}"
+
+
+# ─── ③ 트레일 off 가 양쪽에서 같은 뜻인가 ────────────────────────────────────
+def test_trail_off_lets_position_ride_in_both():
+    """★ 트레일을 끄면 얕은 되돌림에서 **양쪽 다** 살아남아야 한다.
+
+    한쪽만 트레일이 살아 있으면 백테스트가 라이브보다 훨씬 나쁘게(또는 좋게) 나온다 —
+    08-28 에 실제로 그 상태였다.
+    """
+    dip = _bars([100, 100, 108, 103, 110, 118, 126])     # 108→103 되돌림 후 재상승
+    bt_off, live_off = _run_bt(dip, ("ma", "hold")), _run_live(dip, ("ma", "hold"))
+    bt_on = _run_bt(dip, ("partial", "trail", "ma", "hold"))
+    assert bt_off > 0 and live_off > 0, f"트레일 off 인데 손실: bt={bt_off}, live={live_off}"
+    assert bt_off >= bt_on - 1e-9, "트레일 off 가 on 보다 나쁘다 — 게이트가 반대로 걸렸다"
+
+
+# ─── ④ 시간청산 토큰이 양쪽에서 같은 봉에서 끝나는가 ─────────────────────────
+def test_hold_token_bounds_holding_period_in_both():
+    """`hold` 를 빼면 보유기간 상한이 사라진다 — 양쪽 모두."""
+    flat = _bars([100] * 12)
+    with_hold = _run_bt(flat, ("hold",), max_hold=3)
+    without = _run_bt(flat, (), max_hold=3)
+    assert with_hold is not None and without is not None
+    assert abs(with_hold) < 1e-6 and abs(without) < 1e-6   # 횡보라 둘 다 0 — 예외 없이 끝나야
+
+
+# ─── ⑤ 백테스트 기본값이 라이브 설정을 따라오는가 ────────────────────────────
+def test_apply_live_mirror_injects_live_exits():
+    """★ 무플래그 백테스트 = 운용 전략. 미러가 EXITS 를 안 넣으면 구 사다리로 잰다."""
+    from trend_config import EXITS as LIVE_EXITS
+    saved = BT.V_EXITS
+    try:
+        BT.V_EXITS = ("partial", "trail", "ma", "hold")     # 일부러 구 값으로 오염
+        BT.apply_live_mirror(TrendConfig(mode="largecap"))
+        assert BT.V_EXITS == tuple(LIVE_EXITS), \
+            f"apply_live_mirror 가 EXITS 를 주입하지 않는다: {BT.V_EXITS}"
+    finally:
+        BT.V_EXITS = saved

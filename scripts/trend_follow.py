@@ -268,7 +268,10 @@ async def phase_screen() -> list[dict]:
                           "price": ohlcv[-1]["close"], "stop": sig.stop, "target": sig.target,
                           "atr": round(atr(ohlcv, CFG.atr_period), 2), "gates": sig.gates,
                           "breakdown": sig.breakdown, "zone": zone})
-            logger.info("[SCREEN] ✓ %s %-10s 점수%.1f [%s] 손절%.0f 목표%.0f", code, name[:10], sig.score, zone, sig.stop, sig.target)
+            # 손절/목표는 **청산을 발동하지 않는다**(EXITS=ma,hold). 그림자 원장의 R 기준값이라
+            # 계속 계산·기록하되, 표시할 땐 '기준' 임을 밝힌다 — 있는 줄 알면 오판한다.
+            logger.info("[SCREEN] ✓ %s %-10s 점수%.1f [%s] 기준손절%.0f 기준목표%.0f",
+                        code, name[:10], sig.score, zone, sig.stop, sig.target)
         else:
             logger.debug("[SCREEN] %s %s — %s", code, name, sig.reason)
     # 랭킹 — 후보 > 슬롯일 때 누구를 사는지 결정한다. RANK_MODE 기본 blend(A/B 채택).
@@ -306,7 +309,7 @@ async def phase_screen() -> list[dict]:
 
     def _scr_line(c: dict) -> str:
         z = f"[{c['zone']}] " if c.get("zone") else ""
-        s = f"• {z}{c['name']}({c['symbol']}) 점수{c['score']} 손절{c['stop']:,.0f} 목표{c['target']:,.0f}"
+        s = f"• {z}{c['name']}({c['symbol']}) 점수{c['score']} 기준손절{c['stop']:,.0f}"
         pm = c.get("premarket")
         if pm:
             s += f"\n   프리장 예상 {pm['exp_price']:,.0f} ({pm['gap_pct']:+.1f}%) 예상량 {pm['exp_qty']:,.0f}"
@@ -591,8 +594,8 @@ async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
     # entry_actual(실체결가)을 넘겨야 손절/목표와 기준이 맞아 R 이 성립한다.
     shadow_record("taken", [{**c, "stop": stop, "target": target, "entry_actual": entry}],
                   {"qty": qty, "entry": entry})
-    logger.info("[ENTRY] %s %-10s %d주 @%.0f 손절%.0f 목표%.0f %s",
-                sym, c["name"][:10], qty, entry, stop, target, mode_tag)
+    logger.info("[ENTRY] %s %-10s %d주 @%.0f 기준손절%.0f 청산[%s] %s",
+                sym, c["name"][:10], qty, entry, stop, ",".join(EXITS), mode_tag)
     return pos
 
 

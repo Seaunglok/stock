@@ -58,8 +58,15 @@ async def api_state(request):
     except Exception as e:            # StateCorrupted 포함 — 대시보드가 500 으로 죽지 않게
         return JSONResponse({"positions": [], "candidates": [], "updated": "",
                              "error": f"state 판독 실패: {e}"}, status_code=200)
+    from trend_config import EXITS, EXIT_MA, HARD_STOP_PCT, MAX_HOLD_DAYS
     return JSONResponse({"positions": st.get("positions", []), "candidates": st.get("candidates", []),
-                         "updated": st.get("last_updated", "")})
+                         "updated": st.get("last_updated", ""),
+                         # 어떤 청산이 **실제로 발동하는지** 화면이 알아야 한다.
+                         # 2026-08-28 이전엔 트레일선·목표가를 그냥 찍어서, 꺼진 뒤에도
+                         # 있는 것처럼 보였다(운영자가 그 선에서 팔릴 거라 믿게 된다).
+                         "exit_rules": {"exits": list(EXITS), "exit_ma": EXIT_MA,
+                                        "hard_stop_pct": HARD_STOP_PCT,
+                                        "max_hold_days": MAX_HOLD_DAYS}})
 
 
 async def api_trades(request):
@@ -108,9 +115,19 @@ function tab(t){document.querySelectorAll('.pane').forEach(p=>p.classList.add('h
 async function load(){
  const s=await (await fetch('/api/state')).json();
  document.getElementById('upd').textContent='업데이트 '+(s.updated||'').slice(0,16);
+ const er=s.exit_rules||{exits:[],exit_ma:120,hard_stop_pct:10,max_hold_days:120};
+ const act=p=>{const L=[];
+  if(er.hard_stop_pct>0) L.push(`하드손절 ${f(Math.round(p.entry_price*(1-er.hard_stop_pct/100)))}`);
+  if(er.exits.includes('ma')) L.push(`MA${er.exit_ma} 이탈`);
+  if(er.exits.includes('hold')) L.push(`${er.max_hold_days}영업일`);
+  if(er.exits.includes('trail')) L.push(`트레일 ${f(p.stop_price)}`);
+  if(er.exits.includes('partial')) L.push(`첫목표 ${f(p.target)}`);
+  return L.join(' · ')||'하드손절만';};
  document.getElementById('pos').innerHTML = s.positions.length? s.positions.map(p=>
   `<div class="bg-slate-800 rounded p-3 mb-2"><b>${p.name}(${p.symbol})</b> <span class=text-xs>${p.mode}</span><br>
-   ${p.qty}주 @${f(p.entry_price)} · 손절 ${f(p.stop_price)} · 목표 ${f(p.target)} ${p.partial_done?'· <span class=text-emerald-400>부분익절</span>':''}</div>`).join('')
+   ${p.qty}주 @${f(p.entry_price)}<br>
+   <span class="text-xs text-amber-300">청산조건: ${act(p)}</span><br>
+   <span class="text-xs text-slate-500">기준값(측정용·청산 미발동): 손절 ${f(p.stop_price)} · 목표 ${f(p.target)}</span></div>`).join('')
   : '<div class=text-slate-400>보유 포지션 없음</div>';
  const t=await (await fetch('/api/trades')).json(); const sm=t.summary;
  document.getElementById('sum').innerHTML=`청산 ${sm.total}건 · 승률 ${sm.win_rate}% · 손익비(payoff) ${sm.payoff??'-'} · net평균 ${sm.avg_net}% · 누적 ${sm.total_net}%`;
@@ -120,7 +137,7 @@ async function load(){
   const last=r.notes&&r.notes.length?r.notes[r.notes.length-1]:{};
   return `<div class="bg-slate-800 rounded p-3 mb-2"><b>${r.name||r.symbol}(${r.symbol})</b> <span class=text-xs>${r.mode||''} · id ${r.id}</span>
    ${r.closed?`<span class="${(r.net_pct||0)>0?'text-emerald-400':'text-rose-400'}"> net ${r.net_pct}% (손익비 ${r.rr_realized??'-'})</span>`:'<span class=text-amber-400> 보유중</span>'}<br>
-   <span class=text-xs>진입 ${f(r.entry_price)} 손절 ${f(r.stop)} 목표 ${f(r.target)} · 근거: ${r.rationale?Object.keys(r.rationale).filter(k=>r.rationale[k]).join(','):''}</span>
+   <span class=text-xs>진입 ${f(r.entry_price)} · <span class=text-slate-500>기준손절 ${f(r.stop)} 기준목표 ${f(r.target)}</span> · 근거: ${r.rationale?Object.keys(r.rationale).filter(k=>r.rationale[k]).join(','):''}</span>
    ${r.premarket?`<br><span class="text-xs text-sky-400">프리장 예상 ${f(r.premarket.exp_price)} (${r.premarket.gap_pct>0?'+':''}${r.premarket.gap_pct}%)</span>`:''}
    <div class="grid grid-cols-3 gap-1 mt-2">
     <input id="ps_${r.id}" placeholder="심리상태" value="${last.psych||''}" class="bg-slate-700 text-xs p-1 rounded">

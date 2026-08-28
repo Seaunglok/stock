@@ -57,7 +57,23 @@ MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억 (backtest_trend �
 # "검증한 유니버스"와 "실제로 살 수 있는 유니버스"가 갈린다. 2026-08-28 실측: 예탁 385만원에
 # 슬롯20×2.5%(96,321원) 면 KOSPI 상위 99종 중 **29종만** 매수 가능했다(1억이면 98종).
 # TREND_BT_EQUITY 로 실계좌 예탁금을 주입해 검증할 것.
-START_EQUITY = float(os.getenv("TREND_BT_EQUITY", "100000000"))
+_BT_EQUITY_RAW = os.getenv("TREND_BT_EQUITY", "")
+START_EQUITY = float(_BT_EQUITY_RAW) if _BT_EQUITY_RAW else 100_000_000.0
+BT_EQUITY_IS_DEFAULT = not _BT_EQUITY_RAW      # 무지정이면 호출자가 경고를 띄운다
+
+
+def warn_if_default_equity() -> str:
+    """예탁금 미지정 경고 문구(없으면 빈 문자열).
+
+    조용한 1억 기본값은 위험하다 — 2026-08-28 에 1억 검증값을 385만 계좌에 적용했더니
+    종목당 예산이 1주 값에 못 미쳐 유니버스의 29%만 매수 가능했다. 검증한 유니버스와
+    실제 매매 유니버스가 갈린 채로 '검증 완료'가 됐다.
+    """
+    if not BT_EQUITY_IS_DEFAULT:
+        return ""
+    return ("⚠️ TREND_BT_EQUITY 미지정 — 예탁 1억으로 시뮬합니다. 정수 주식수 제약 때문에 "
+            "계좌 크기가 결과를 바꿉니다. 실계좌 기준으로 보려면 "
+            "`TREND_BT_EQUITY=<예탁금>` 을 지정하세요.")
 
 
 # ─── 섹터 맵 (유니버스 캐시) ─────────────────────────────────────────────────
@@ -584,6 +600,8 @@ def main():
     p.add_argument("--legacy-defaults", action="store_true",
                    help="라이브 미러 없이 구 설정(MA50 청산·하드손절 off·눌림 3%%)으로 실행")
     args = p.parse_args()
+    if (_w := warn_if_default_equity()):
+        print(_w)
 
     cfg = TrendConfig(mode="largecap")
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)

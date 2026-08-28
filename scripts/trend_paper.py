@@ -1,9 +1,13 @@
-"""모의운용(paper) — 채택 구성이 실제로 무엇을 사고 파는지 매일 기록한다.
+"""모델 장부(paper) — 채택 구성이 무엇을 사고 팔았어야 하는지 매일 계산한다.
 
-설계 이유
----------
+역할 (2026-08-28 라이브 재개로 변경)
+------------------------------------
+당초엔 '재개 전 사전 게이트'였다. 지금은 라이브가 돌고 있으므로 역할이 바뀌었다:
+**라이브 실체결과 대조하는 기준선**이다.
+
 백테스트는 항상 모델가 체결을 가정한다. 그 가정이 깨지는 곳(슬리피지·부분체결·거래정지·
-유동성)은 실계좌에 넣어봐야 드러난다. 그래서 재개 전에 모의운용 단계를 둔다.
+유동성)은 실계좌에 넣어봐야 드러난다. 같은 규칙의 모델 장부를 매일 만들어 두면,
+라이브가 실제로 낸 체결과 나란히 놓고 **그 괴리를 숫자로** 볼 수 있다.
 
 **브로커를 전혀 호출하지 않는다.** 키움 MCP 를 쓰지 않으므로 주문이 나갈 경로 자체가 없다.
 시세는 백테스트와 같은 소스(FDR 일봉)를 쓴다.
@@ -45,7 +49,7 @@ from backtest_walkforward import Costs  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as C  # noqa: E402
 from src.mcp_servers.trend_mcp.signals import TrendConfig  # noqa: E402
 
-PAPER_START = "2026-08-28"          # 모의운용 개시일(신규진입 정지 선언일)
+PAPER_START = "2026-08-28"          # 모델 장부 개시일(= 라이브 재개일)
 DATA_START = "2015-01-01"           # 워밍업 포함 로드 구간
 LOG_FILE = _ROOT / "data" / "trend_follow" / "paper_log.jsonl"
 
@@ -55,8 +59,11 @@ def _live_cfg() -> tuple[TrendConfig, dict]:
     from trend_config import (BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, EXITS, HARD_STOP_PCT,
                               MAX_HOLD_DAYS, MAX_POS, POSITION_PCT, RANK_MODE, REGIME_MA,
                               SIZING_MODE)
-    if SIZING_MODE != "notional":
-        raise SystemExit(f"모의운용은 notional 사이징 전제 — 현재 {SIZING_MODE}. "
+    # `pct_equity` 와 `notional` 은 **같은 규칙의 다른 이름**이다(2026-08-28 동의어 확정).
+    # 여기서 이름 하나만 받으면 라이브 설정을 그대로 읽는다는 이 함수의 전제가 깨진다 —
+    # 실제로 라이브를 pct_equity 로 바꾼 직후 이 스크립트가 통째로 거부됐다.
+    if SIZING_MODE not in ("notional", "pct_equity"):
+        raise SystemExit(f"모델 장부는 예탁 비례 사이징 전제 — 현재 {SIZING_MODE}. "
                          "검증 구성과 다르면 결과를 신뢰할 수 없다.")
     cfg = TrendConfig(mode="largecap")
     cfg.ma_slow = EXIT_MA
@@ -84,7 +91,7 @@ def main() -> int:
     dates, bars, _cl, _od = P._load(DATA_START, datetime.now().strftime("%Y-%m-%d"), 100)
     win = [d for d in dates if d >= args.start]
     if not win:
-        print(f"모의운용 구간에 영업일이 없다({args.start} 이후). 개시 전이거나 데이터 미갱신.")
+        print(f"구간에 영업일이 없다({args.start} 이후). 개시 전이거나 데이터 미갱신.")
         return 0
 
     P._SIG_MEMO.clear()
@@ -98,7 +105,7 @@ def main() -> int:
 
     exposure = k["max_pos"] * k["position_pct"]
     print("=" * 88)
-    print(f"모의운용 (paper) — {args.start} ~ {dates[-1]}  ({res.n_days} 영업일)")
+    print(f"모델 장부 (paper) — {args.start} ~ {dates[-1]}  ({res.n_days} 영업일)")
     print("=" * 88)
     print(f"  구성  청산 {','.join(k['exits'])}(MA{k['exit_ma']}·{cfg.max_hold}일) · "
           f"하드손절 {k['hard_stop']:g}% · 슬롯 {k['max_pos']}×{k['position_pct']:g}% "
@@ -123,7 +130,8 @@ def main() -> int:
     print("-" * 88)
     print("  ※ 브로커 미호출 — 주문 경로 없음. 시세는 백테스트와 동일 소스(FDR 일봉).")
     print("  ※ 진입은 익일 시가 가정 — 라이브 11:00 진입과 시각이 다르다.")
-    print("  ※ 슬리피지·부분체결·호가공백은 여기서 검증되지 않는다.")
+    print("  ※ 슬리피지·부분체결·호가공백은 여기서 검증되지 않는다 —")
+    print("     그게 라이브 실체결과 이 장부를 대조하는 이유다.")
 
     if not args.no_log:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)

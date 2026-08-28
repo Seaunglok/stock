@@ -55,6 +55,7 @@ _ENTRY_TIME_INITIAL = "09:30"
 REASONS = {
     "taken": "실제 진입(대조군)",
     "no_slot": "슬롯 만석",
+    "entry_halt": "신규진입 정지(2026-08-28)",
     "regime": "레짐 게이트(KOSPI<MA)",
     "circuit": "서킷브레이커",
     "sector_gate": "주도섹터 게이트",

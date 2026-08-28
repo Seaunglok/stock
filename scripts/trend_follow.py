@@ -31,7 +31,8 @@ from trend_config import (                  # noqa: E402  env·상수·logger·C
     # 오는가"를 추적할 수 없었고, `_ROOT`/`logger` 는 밑줄이라 스타에 안 실려 두 번째 import 를
     # 하는 숨은 순서 의존까지 있었다. 실거래 파라미터를 읽는 코드에서 출처 불명은 그 자체가 위험.
     ACCOUNT_NO, ADOPT_MODE, BREADTH_MIN_PCT, CFG, DAILY_LOSS_LIMIT_PCT, DATA_DIR,
-    ENTRY_CUTOFF, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA, FORCE_PHASE,
+    ENTRY_CUTOFF, ENTRY_HALT, ENTRY_TIME, ENTRY_WAIT_FALLING, ENV_LOADED, EXIT_MA,
+    FORCE_PHASE,
     FOREIGN_TREND_MA, FUND_BONUS, HARD_STOP_PCT, HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
     INTRADAY_POLL_MIN,
     INVEST_PER_TRADE, JOURNAL_FILE, MAX_HOLD_DAYS, MAX_NOTIONAL_PCT, MAX_POS, MIN_VALUE_KRW,
@@ -730,6 +731,16 @@ async def phase_entry() -> None:
         logger.warning("[ENTRY] 오늘 이미 실행 — 중복 방지")
         return
     cands = get_state("candidates", [])
+    if ENTRY_HALT:
+        # 청산·트레일·손절은 그대로 돈다. 막는 것은 **새 자본 투입**뿐이다.
+        # 차단분을 그림자 원장에 남겨, 정지가 옳았는지를 계속 숫자로 검증한다.
+        if cands:
+            log_event("entry_skip", {"reason": "entry_halt",
+                                     "symbols": [c["symbol"] for c in cands]})
+            shadow_record("entry_halt", cands)
+        await notify(f"⏸️ 신규진입 정지 중 — 후보 {len(cands)}종 스킵 "
+                     f"(TREND_ENTRY_HALT=true). 보유분 청산규칙은 정상 작동")
+        return
     # stale 가드: 08:50 screen 이 실패(hang/예외)하면 state 엔 전일 후보가 남는다 — 신호는 당일 한정 유효.
     cdate = get_state("candidates_date", "")
     if cands and cdate != datetime.now().strftime("%Y-%m-%d"):
@@ -1279,6 +1290,9 @@ async def scheduler_daemon() -> None:
     if warns:
         await notify(f"⚠️ 가드 경고 {len(warns)}건 ({'💰REAL' if PRODUCTION_MODE else '🧪MOCK'}): "
                      + "; ".join(warns), critical=True)
+    if ENTRY_HALT:
+        logger.warning("[DAEMON] ⏸️ 신규진입 정지 중 (TREND_ENTRY_HALT=true) — "
+                       "청산·트레일·손절은 정상 작동. 해제하려면 .env 에 TREND_ENTRY_HALT=false")
     logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/%s 진입(보류마감 %s)/장중 트레일/15:20 청산",
                 UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF)
     if not acquire_lock():

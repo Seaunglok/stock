@@ -170,3 +170,23 @@ def test_env_parser_keeps_hash_inside_quoted_value(tmp_path):
         os.environ.pop("TREND_ENV_FILE", None)
         os.environ.update(saved)
         sys.modules.pop("trend_config", None)
+
+
+# ─── 신규진입 정지 (2026-08-28) ────────────────────────────────────────────────
+def test_entry_halt_defaults_closed(cfg_no_env):
+    """★ .env 유실 시에도 **정지 상태**여야 한다.
+
+    12년 시점별 표본에서 거래당 -0.57%·PF 0.84 — 검증된 엣지가 없다는 판단으로 정지했다.
+    이 값이 설정 유실 시 열리는 쪽으로 떨어지면, 근거 없는 규칙이 실계좌에 다시 돈다.
+    08-17 원칙과 같다: 안전장치는 실패 시 닫힌다.
+    """
+    assert cfg_no_env.ENTRY_HALT is True
+
+
+def test_entry_halt_can_be_lifted_by_env(monkeypatch):
+    """해제는 명시적으로만 — 검증된 규칙을 찾으면 .env 로 연다."""
+    monkeypatch.setenv("TREND_ENTRY_HALT", "false")
+    sys.modules.pop("trend_config", None)
+    import trend_config
+    assert importlib.reload(trend_config).ENTRY_HALT is False
+    sys.modules.pop("trend_config", None)

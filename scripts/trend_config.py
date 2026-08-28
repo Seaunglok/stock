@@ -101,6 +101,12 @@ WATCHLIST = [c.strip() for c in os.getenv("TREND_WATCHLIST", "005930,000660").sp
 TOP_N = int(os.getenv("TREND_TOP_N") or (30 if UNIVERSE_MODE == "gainers" else 100))
 MIN_VALUE_KRW = float(os.getenv("TREND_MIN_VALUE_KRW", "100000000000"))
 MAX_POS = int(os.getenv("TREND_MAX_POS", "5"))
+# 신규진입 정지(2026-08-28). 12년 시점별 표본에서 거래당 -0.57%·PF 0.84 — 12년 중 플러스는
+# 3년(2020·2025·2026)뿐이고 그중 2년이 검증구간 결함으로 드러난 멜트업이다. 2017(+21.8%)·
+# 2023(+19.3%) 상승장에서도 마이너스라 '상승장 전략'조차 아니다. 12년 표본에서 플러스가
+# 확인되는 진입 규칙을 찾을 때까지 새 자본을 넣지 않는다. **청산·트레일·손절은 계속 작동한다.**
+# 기본값 True = 설정 유실 시에도 닫힌 쪽(08-17 원칙: 안전장치는 실패 시 닫힌다).
+ENTRY_HALT = os.getenv("TREND_ENTRY_HALT", "true").lower() == "true"
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
 # 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
 #   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.

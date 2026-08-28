@@ -37,6 +37,7 @@ from backtest_walkforward import Costs, metrics              # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
+    residual_momentum,
     TrendConfig, entry_signal, atr, levels, moving_average, relative_strength,
 )
 
@@ -113,6 +114,12 @@ V_MA_BUFFER_PCT: float = 0.0   # MA 이탈 히스테리시스 — 종가 < MA×(
 V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
 # 시장 레짐/변동성 필터(2026-08-03): 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장)과
 # 실전구간(5.71%·-20.5% 하락장)의 레짐 불일치가 주원인. 하락장·고변동성 신규진입을 원천 차단.
+# RS 정의 A/B(2026-08-28) — ② 진단에서 RS 가 상승장 최대 억제 요인으로 나왔다.
+# 게이트를 **푸는** 게 아니라(상대순위 대체는 전 구간 마이너스) 정의를 바꿔 본다.
+V_RS_DAYS: int = 0        # RS 룩백(0=cfg.rs_days=60)
+V_RS_SKIP: int = 0        # 최근 N일 제외(Jegadeesh-Titman 12-1 관례)
+V_RS_MIN: float = 0.0     # 통과 임계(%). 0=현행(지수 초과). 음수면 소폭 열위도 허용
+V_RS_RESIDUAL: bool = False   # 베타조정 잔차 모멘텀(Blitz-Huij-Martens 2011)
 V_TRADE_LOG: list | None = None  # 진입일·종목·net 기록(연도별 분해용). None=미기록
 V_PIT_UNIVERSE: bool = False   # 시점별 유니버스(그날 시총 상위 top_n 재산정). False=현재 스냅샷 소급(생존편향)
 V_PIT_POOL_N: int = 350        # 시점별 모드의 후보 풀 크기(현재 시총 상위 N)
@@ -395,6 +402,17 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
 
         for code, full, idx in day_rows:
             rs_pass = (code in rs_pass_set) if rs_pass_set is not None else None
+            if rs_pass is None and (V_RS_DAYS or V_RS_SKIP or V_RS_MIN or V_RS_RESIDUAL):
+                # RS **정의** A/B — 절대 게이트를 유지하되 룩백/스킵월/임계/베타조정만 바꾼다.
+                cl = [b["close"] for b in full[:idx + 1]]
+                if V_RS_RESIDUAL:
+                    r = residual_momentum(cl, kospi_upto,
+                                          window=V_RS_DAYS or cfg.rs_days, skip=V_RS_SKIP)
+                    rs = r if r is not None else -1e9    # 데이터 부족 = 게이트 탈락(fail-closed)
+                else:
+                    rs = relative_strength(cl, kospi_upto,
+                                           V_RS_DAYS or cfg.rs_days, skip=V_RS_SKIP)
+                rs_pass = rs > V_RS_MIN
             sig = entry_signal(full[:idx + 1], kospi_upto, cfg, rs_pass=rs_pass)
             if not sig.passed:
                 continue

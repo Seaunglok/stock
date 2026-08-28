@@ -30,7 +30,9 @@ import contextlib, io
 with contextlib.redirect_stdout(io.StringIO()):
     import FinanceDataReader as fdr
 
-from backtest_dynamic import get_broad_universe, get_market_series, get_ohlcv  # noqa: E402
+from backtest_dynamic import (  # noqa: E402
+    get_broad_universe, get_market_series, get_ohlcv, get_pit_pool,
+)
 from backtest_walkforward import Costs, metrics              # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
@@ -111,6 +113,8 @@ V_MA_BUFFER_PCT: float = 0.0   # MA 이탈 히스테리시스 — 종가 < MA×(
 V_FOREIGN_TREND_MA: int = 0               # 외인청산 추세확인 이평(0=off, 60=종가<MA60 일 때만 청산)
 # 시장 레짐/변동성 필터(2026-08-03): 실전 6전6패 진단 — 검증구간(일간변동성 2.16%·+136% 상승장)과
 # 실전구간(5.71%·-20.5% 하락장)의 레짐 불일치가 주원인. 하락장·고변동성 신규진입을 원천 차단.
+V_PIT_UNIVERSE: bool = False   # 시점별 유니버스(그날 시총 상위 top_n 재산정). False=현재 스냅샷 소급(생존편향)
+V_PIT_POOL_N: int = 350        # 시점별 모드의 후보 풀 크기(현재 시총 상위 N)
 V_REGIME_MA: int | None = None            # KOSPI < MA(N) 이면 그날 신규진입 차단(None=off)
 V_VOL_MAX_PCT: float | None = None        # 최근 20일 KOSPI 일간변동성(표준편차%) > 이 값이면 차단(None=off)
 
@@ -290,7 +294,7 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
     """반환: 진입별 (gap_pct, net_pct). gap_pct = 진입일 시가 / 신호일 종가 − 1 (프리장 갭의 백테스트 대용)."""
     key = (mode, tuple(watchlist), start, end, cfg_top)
     if key in _UNIV_CACHE:
-        dates, kospi_close, broad, k_off = _UNIV_CACHE[key]
+        dates, kospi_close, broad, k_off, shares = _UNIV_CACHE[key]
         print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} (캐시 재사용 {len(broad)}종목)")
     else:
         # KOSPI 는 **start 이전 워밍업을 포함해** 로드한다. 레짐 이평(MA200/224 등)이
@@ -302,8 +306,14 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
         print(f"기간 {start}~{end}: {len(dates)} 영업일 | mode={mode} | {costs} "
               f"(KOSPI 워밍업 {k_off} 영업일)")
 
+        shares: dict[str, int] = {}
         if mode == "watchlist":
             universe = watchlist
+        elif V_PIT_UNIVERSE:
+            # 시점별 유니버스 — 넓은 풀을 받아두고 날짜마다 시총 순위를 다시 매긴다.
+            pool = get_pit_pool(V_PIT_POOL_N)
+            universe = [c for c, _ in pool]
+            shares = dict(pool)
         else:
             universe = get_broad_universe()           # KOSPI 시총 상위 ~150 (cap 정렬)
             if mode == "largecap":
@@ -322,7 +332,7 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             if idx % 40 == 0:
                 print(f"  유니버스 로드 {idx}/{len(universe)}")
         print(f"  → {len(broad)}종목 로드 완료")
-        _UNIV_CACHE[key] = (dates, kospi_close, broad, k_off)
+        _UNIV_CACHE[key] = (dates, kospi_close, broad, k_off, shares)
 
     trades: list[tuple[float, float]] = []
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
@@ -354,6 +364,10 @@ def run(mode: str, start: str, end: str, watchlist: list[str], costs: Costs, cfg
             if full[idx]["value"] < MIN_VALUE_KRW:
                 continue
             day_rows.append((code, full, idx))
+        if V_PIT_UNIVERSE and shares:
+            # **그날의** 시총 상위 cfg_top 만 남긴다(종가 × 상장주식수).
+            day_rows.sort(key=lambda r: -(r[1][r[2]]["close"] * shares.get(r[0], 0)))
+            day_rows = day_rows[:cfg_top]
 
         if mode == "gainers":   # 당일 등락률 상위 N 로 좁힘
             day_rows.sort(key=lambda r: -_gap_pct(r[1], r[2]))
@@ -539,7 +553,7 @@ def _equity_gated_trades(mode, start, end, watch, costs, cfg, lookback, threshol
     key = (mode, tuple(watch), start, end, cfg_top)
     if key not in _UNIV_CACHE:
         run(mode, start, end, watch, costs, cfg)   # 유니버스 로드(캐시 채움)
-    dates, kospi_close, broad, k_off = _UNIV_CACHE[key]
+    dates, kospi_close, broad, k_off, _shares = _UNIV_CACHE[key]
     need = (cfg.ma_trend if mode == "gainers" else cfg.ma_slow) + 1
 
     closed_base: list[float] = []      # 청산 완료 거래의 초기유닛 net%
@@ -925,7 +939,7 @@ def report_pyramid_rising(mode: str, start: str, end: str, watch: list[str], cos
 
 
 def main():
-    global cfg_top
+    global cfg_top, V_PIT_UNIVERSE, V_PIT_POOL_N
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("--mode", choices=["gainers", "largecap", "watchlist"], default="largecap")
     p.add_argument("--start", default="2025-01-01")
@@ -949,6 +963,9 @@ def main():
     p.add_argument("--pullbacktest", action="store_true", help="눌림목 게이트 폭 A/B(pullback_pct 3/5/8/12/20/off)")
     p.add_argument("--hardstoptest", action="store_true", help="하드손절 임계값 A/B(off / 5 / 7 / 10 / 15%)")
     p.add_argument("--foreignexit", action="store_true", help="외인 청산룰 A/B(off/부호만/임계 0.2·0.5) — investor-domain 필요")
+    p.add_argument("--pit", action="store_true",
+                   help="시점별 유니버스 — 그날 시총 상위 top_n 재산정(생존편향 축소)")
+    p.add_argument("--pit-pool", type=int, default=350, help="시점별 모드 후보 풀 크기")
     p.add_argument("--regimetest", action="store_true", help="시장 레짐/변동성 필터 A/B(KOSPI>MA · 변동성 상한)")
     p.add_argument("--legacy-defaults", action="store_true",
                    help="라이브 미러 없이 구 기본값(MA50·게이트 전부 off·눌림 3%%)으로 실행 — 과거 수치 재현용")
@@ -956,6 +973,7 @@ def main():
 
     cfg = TrendConfig(mode=args.mode)
     cfg_top = args.top_n or (30 if args.mode == "gainers" else 100)
+    V_PIT_UNIVERSE, V_PIT_POOL_N = args.pit, args.pit_pool
     costs = Costs(args.tax_bps, args.fee_bps, args.slippage_bps)
     watch = [c.strip() for c in args.watchlist.split(",") if c.strip()]
 

@@ -212,10 +212,24 @@ def _read_broad_cache() -> list[str] | None:
     if not isinstance(d, dict) or d.get("version") != _BROAD_VERSION:
         logger.info("[UNIVERSE] broad 캐시 구버전 — 재생성(우선주 제외 규칙 반영)")
         return None
+    # 더 새 스냅샷이 있으면 캐시를 버린다. 과거엔 version 만 봐서, `_universe_kiwoom.py` 로
+    # 스냅샷을 새로 받아도 이 캐시가 옛 목록을 영구히 물고 있었다 — stale 경고가 안내하는
+    # 갱신 절차 자체가 무효였다(2026-08-28).
+    newest = _newest_snapshot_date()
+    if newest and str(d.get("snapshot", "")) < newest:
+        logger.info("[UNIVERSE] 새 스냅샷 %s 발견 — broad 캐시 재생성(기존 %s)",
+                    newest, d.get("snapshot"))
+        return None
     codes = d.get("codes") or []
     if codes:
         _warn_if_stale(str(d.get("snapshot", "")))
     return codes or None
+
+
+def _newest_snapshot_date() -> str:
+    """docs_cache 의 가장 최근 universe 스냅샷 날짜(YYYYMMDD). 없으면 빈 문자열."""
+    snaps = sorted((_ROOT / "docs_cache").glob("universe_kiwoom_*.json"), reverse=True)
+    return snaps[0].stem.replace("universe_kiwoom_", "") if snaps else ""
 
 
 def _warn_if_stale(snap_date: str) -> None:

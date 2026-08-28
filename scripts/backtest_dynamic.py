@@ -91,6 +91,37 @@ def get_broad_universe() -> list[str]:
     return _broad_codes()
 
 
+_PIT_POOL_CACHE: dict = {}
+
+
+def get_pit_pool(pool_n: int = 350) -> list[tuple[str, int]]:
+    """시점별(point-in-time) 유니버스용 후보 풀 — [(code, 상장주식수)].
+
+    `get_broad_universe()` 는 **오늘 시총 상위 150** 이라, 과거 구간에 소급 적용하면
+    "그 사이에 상위로 올라온 종목"을 과거에 미리 아는 셈이 된다(look-ahead). 스냅샷에는
+    KOSPI 920 종목의 상장주식수가 다 들어 있으므로, 넓은 풀을 잡아두고 각 날짜에서
+    `종가 × 상장주식수` 로 순위를 다시 매기면 그 편향을 상당 부분 걷어낼 수 있다.
+
+    ⚠️ 완전한 제거는 아니다. 풀 자체가 **현재** 시총 상위 pool_n 이라, 과거엔 상위였다가
+    지금은 pool_n 밖으로 떨어진 종목은 복원되지 않는다. 상장주식수도 현재값 고정이라
+    증자/감자/액면분할은 반영하지 않는다. 남는 편향의 방향은 여전히 **수치를 부풀리는** 쪽이다.
+    """
+    if pool_n in _PIT_POOL_CACHE:
+        return _PIT_POOL_CACHE[pool_n]
+    snaps = sorted(Path(__file__).parent.parent.joinpath("docs_cache").glob("universe_kiwoom_*.json"),
+                   reverse=True)
+    if not snaps:
+        raise RuntimeError("docs_cache/universe_kiwoom_*.json 없음")
+    raw = json.loads(snaps[0].read_text(encoding="utf-8"))
+    kospi = [s for s in raw
+             if s.get("market") in ("거래소", "KOSPI")
+             and s.get("market_cap", 0) > 0 and s.get("list_count", 0) > 0]
+    kospi.sort(key=lambda s: -s["market_cap"])
+    out = [(str(s["code"]).zfill(6), int(s["list_count"])) for s in kospi[:pool_n]]
+    _PIT_POOL_CACHE[pool_n] = out
+    return out
+
+
 def get_top50_by_date(yyyymmdd: str, broad: dict[str, list[dict]]) -> list[tuple[str, float]]:
     """broad universe 안에서 그날 거래대금 상위 50.
 

@@ -1374,8 +1374,10 @@ async def scheduler_daemon() -> None:
     if ENTRY_HALT:
         logger.warning("[DAEMON] ⏸️ 신규진입 정지 중 (TREND_ENTRY_HALT=true) — "
                        "청산·트레일·손절은 정상 작동. 해제하려면 .env 에 TREND_ENTRY_HALT=false")
-    logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/%s 진입(보류마감 %s)/장중 트레일/15:20 청산",
-                UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF)
+    logger.info("[DAEMON] 추세추종 시작 | 유니버스=%s | 08:50 스크린/%s 진입(보류마감 %s)/"
+                "장중 하드손절/15:20 청산[%s·MA%d·%d일]",
+                UNIVERSE_MODE, ENTRY_TIME, ENTRY_CUTOFF,
+                ",".join(EXITS), EXIT_MA, MAX_HOLD_DAYS)
     if not acquire_lock():
         await notify("⚠️ 추세추종 데몬 중복 기동 차단"); return
     # 사이징 가드는 **락 획득 뒤에** 돈다. 시세 조회 ~24회로 수십 초가 걸리는데, 락 앞에 두면

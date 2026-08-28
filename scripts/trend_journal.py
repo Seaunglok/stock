@@ -1,4 +1,4 @@
-"""일별 매매일지 md 생성 — docs/YYYY-MM-DD-trend-journal.md.
+"""일별 매매일지 md 생성 — docs/journal/YYYY-MM-DD-trend-journal.md.
 
 trend_follow.py 에서 분리(2026-08-06). 주문 경로와 무관한 **보고 계층**이라
 여기를 고쳐도 실거래 로직은 건드리지 않는다. 집계는 순수 함수라 단독 테스트 가능.
@@ -128,7 +128,10 @@ async def write_daily_journal() -> None:
     L += _safety_md(counts)
     L += ["", "*자동 생성. 심리/실수/개선은 `--journal-note <id>` 또는 대시보드에서 추가.*", ""]
 
-    out = _ROOT / "docs" / f"{today}-trend-journal.md"
+    # docs/journal/ 로 이동(2026-08-28) — docs/ 최상위가 일지 54개에 묻혀 있었다.
+    # 경로를 바꾸면 Notion 자동화(scripts/notion_journal_task.md)도 함께 고쳐야 한다.
+    out = _ROOT / "docs" / "journal" / f"{today}-trend-journal.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(L), encoding="utf-8")
     logger.info("[JOURNAL] 매매일지 자동작성: %s", out.name)
     log_event("journal_write", {"file": out.name, "entries": len(entries),

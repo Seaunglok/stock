@@ -89,3 +89,17 @@ def test_market_line_formats_change():
 
 def test_market_line_uses_last_two_only():
     assert _market_line([1.0, 2.0, 100.0, 110.0]) == _market_line([100.0, 110.0])
+
+
+def test_journal_path_and_notion_task_agree():
+    """★ 일지 출력 경로와 Notion 자동화가 읽는 경로가 같아야 한다.
+
+    2026-08-28 에 docs/ → docs/journal/ 로 옮겼다. 한쪽만 고치면 자동화가 매일
+    '오늘 일지 없음' 을 출력하며 조용히 아무것도 안 한다 — 며칠 지나야 알아챈다.
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "scripts" / "trend_journal.py").read_text(encoding="utf-8")
+    task = (root / "scripts" / "notion_journal_task.md").read_text(encoding="utf-8")
+    assert '"docs" / "journal"' in src, "일지 출력 경로가 docs/journal 이 아니다"
+    assert "docs/journal/" in task, "Notion 자동화가 옛 경로를 읽는다"

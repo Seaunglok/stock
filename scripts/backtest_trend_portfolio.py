@@ -111,6 +111,8 @@ class Result:
     n_entries: int = 0
     n_rejected_sector: int = 0
     concurrent: list[int] = field(default_factory=list)  # 일별 동시보유 수
+    n_days: int = 0                      # **실제로 시뮬한** 영업일 수(요청 구간 검증용)
+    entry_dates: list[str] = field(default_factory=list)  # 진입일(워크포워드 누수 검증용)
 
 
 # ─── 유니버스 로드(캐시) ──────────────────────────────────────────────────────
@@ -199,12 +201,22 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
              max_pos: int, sector_cap: int, partial_on: bool, secmap: dict[str, str],
              hard_stop_pct: float = 0.0, rank_mode: str = "composite",
              regime_ma: int = 0, breadth_min: float = 0.0,
-             exits: tuple[str, ...] = ("partial", "trail", "ma", "hold")) -> Result:
+             exits: tuple[str, ...] = ("partial", "trail", "ma", "hold"),
+             sim_from: str = "", sim_to: str = "") -> Result:
     """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
 
     hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
     """
     dates, bars, closes, ordered = _load(start, end, top_n)
+    # 시뮬 구간 제한 — bars/closes 는 **전 구간을 그대로 둔다**. 이평·ATR·RS 워밍업은
+    # 구간 이전 데이터에서 계속 계산되고, 매매 판단만 [sim_from, sim_to] 안에서 일어난다.
+    # 워크포워드에서 폴드마다 데이터를 다시 로드하지 않기 위한 것이며, 동시에
+    # "워밍업 부족이 곧 구간 축소"가 되는 사고(2026-08-27)를 구조적으로 막는다.
+    if sim_from or sim_to:
+        dates = [d for d in dates
+                 if (not sim_from or d >= sim_from) and (not sim_to or d <= sim_to)]
+        if not dates:
+            raise ValueError(f"시뮬 구간이 비었다: {sim_from}~{sim_to}")
     buy_f = 1 + (costs.fee + costs.slip) / 100.0             # 매수 체결가 가산(수수료+슬리피지)
     sell_f = 1 - (costs.tax + costs.fee + costs.slip) / 100.0  # 매도 체결가 차감(세금+수수료+슬리피지)
     need = cfg.ma_slow + 1
@@ -252,6 +264,7 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                     stop=stop, peak=entry, target=target, atr0=c["atr"]))
                 sec_count[sec] = sec_count.get(sec, 0) + 1
                 res.n_entries += 1
+                res.entry_dates.append(date_str)
         pending = []
 
         # ── 2) 보유 포지션 관리/청산 (당일 바) ──
@@ -352,6 +365,7 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
         res.equity_curve.append(equity_at(date_str))
         res.concurrent.append(len(positions))
 
+    res.n_days = len(dates)
     # 종료 시 잔여 포지션 마지막 종가 청산(집계용)
     if positions and dates:
         for p in positions:

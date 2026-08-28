@@ -58,6 +58,22 @@ DATA_END = "2026-08-25"
 TOP_N = 100
 
 
+# ── 재개 판정 기준 — **결과를 보기 전에 선언한다** (2026-08-28) ─────────────
+#
+# 사용자 결정: "위험이 절반이면 채택".
+# 그대로 쓰면 '아무것도 안 사는 전략'이 통과하므로 수익 하한을 함께 건다.
+#
+#   ① MDD(전략) ≤ MDD_RATIO × MDD(벤치마크)      ← 선언된 '위험 절반'
+#   ② MAR(전략) ≥ MAR(벤치마크)                   ← 위험을 줄인 대가로 수익을 더 잃지 않을 것
+#   ③ 플러스 연도 ≥ MIN_WIN_YEARS 비율            ← 한두 해에 몰린 결과 배제
+#
+# MDD·MAR 은 **OOS 검증구간만 이어붙인 일별 자산곡선**에서 잰다. 폴드별 MDD 의 평균이
+# 아니다 — 폴드 경계를 넘는 연속 하락은 폴드별로 보면 사라지는데, 실제로는 그걸 겪는다.
+# 벤치마크도 같은 구간·같은 방식으로 이어붙여 잰다(동일 조건 비교).
+MDD_RATIO = 0.5          # 전략 MDD 가 벤치마크의 이 배수 이하여야 함
+MIN_WIN_YEARS = 0.60     # 플러스 검증연도 최소 비율
+
+
 # ── 후보 격자 — **검증 결과를 보기 전에 고정한다** ──────────────────────────
 @dataclass(frozen=True)
 class Candidate:
@@ -200,6 +216,8 @@ def main() -> int:
     print("  " + "-" * 100)
 
     oos_returns, oos_bench, picks = [], [], []
+    strat_curves, bench_curves = [], []
+    oos_days = 0
     for tr_lo, tr_hi, te_lo, te_hi in folds:
         scored = []
         for cand in GRID:
@@ -213,64 +231,134 @@ def main() -> int:
         _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]}")
         _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]}")
 
-        bench = _benchmark(bars, dates, te_lo, te_hi)
+        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi)
+        bench = (bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0
         oos_returns.append(te["total"])
         oos_bench.append(bench)
         picks.append(best.label)
+        strat_curves.append(te["_res"].equity_curve)
+        bench_curves.append(bcurve)
+        oos_days += te["_res"].n_days
         tr_mar = "inf" if tm["mar"] == float("inf") else f"{tm['mar']:.2f}"
         print(f"  {te_lo[:4]:11} {tr_lo[:7]}~{tr_hi[:7]:<15} {best.label:22} "
               f"{tr_mar:>8} {te['total']:>+8.1f}% {te['mdd']:>7.1f}% {bench:>+8.1f}%")
 
     print("  " + "-" * 100)
-    _summary(oos_returns, oos_bench, picks)
+    _summary(oos_returns, oos_bench, picks,
+             _stitch(strat_curves), _stitch(bench_curves), oos_days)
     return 0
 
 
-def _benchmark(bars: dict, dates: list[str], lo: str, hi: str) -> float:
-    """같은 구간·같은 유니버스 동일가중 매수후보유. 생존편향을 전략과 공유한다."""
+def _benchmark_curve(bars: dict, dates: list[str], lo: str, hi: str) -> list[float]:
+    """같은 구간·같은 유니버스 동일가중 매수후보유의 **일별** 지수(시작=100).
+
+    생존편향을 전략과 공유하므로 상대 비교가 유효하다. 일별로 만드는 이유는 MDD 를
+    같은 기준으로 재기 위해서다 — 시작·끝 두 점만으로는 낙폭을 알 수 없다.
+    """
     win = [d for d in dates if lo <= d <= hi]
     if not win:
+        return []
+    base = {}
+    for code, dm in bars.items():
+        first = next((dm[d]["close"] for d in win if d in dm), None)
+        if first and first > 0:
+            base[code] = first
+    if not base:
+        return []
+    curve = []
+    for d in win:
+        vals = [bars[c][d]["close"] / base[c] for c in base if d in bars[c]]
+        if vals:
+            curve.append(sum(vals) / len(vals) * 100.0)
+        elif curve:
+            curve.append(curve[-1])
+    return curve
+
+
+def _benchmark(bars: dict, dates: list[str], lo: str, hi: str) -> float:
+    """구간 총수익률(%) — 표 출력용."""
+    c = _benchmark_curve(bars, dates, lo, hi)
+    return (c[-1] / c[0] - 1) * 100 if len(c) > 1 else 0.0
+
+
+def _stitch(curves: list[list[float]]) -> list[float]:
+    """폴드별 자산곡선을 **복리로 이어붙인다**. 각 폴드는 직전 폴드가 끝난 자산에서 출발.
+
+    폴드별 지표의 평균이 아니라 이어붙인 곡선에서 재야 한다 — 폴드 경계를 넘어 이어지는
+    하락은 폴드별로 보면 두 개의 작은 낙폭으로 쪼개지는데, 운용자는 하나의 큰 낙폭을 겪는다.
+    """
+    out: list[float] = []
+    level = 100.0
+    for c in curves:
+        if len(c) < 2:
+            continue
+        for v in c:
+            out.append(level * v / c[0])
+        level = out[-1]
+    return out
+
+
+def _mdd(curve: list[float]) -> float:
+    peak, worst = (curve[0] if curve else 0.0), 0.0
+    for v in curve:
+        peak = max(peak, v)
+        if peak > 0:
+            worst = max(worst, (peak - v) / peak * 100.0)
+    return worst
+
+
+def _cagr(curve: list[float], n_days: int) -> float:
+    if len(curve) < 2 or curve[0] <= 0 or n_days <= 0:
         return 0.0
-    rets = []
-    for dm in bars.values():
-        a = next((dm[d]["close"] for d in win if d in dm), None)
-        b = next((dm[d]["close"] for d in reversed(win) if d in dm), None)
-        if a and b and a > 0:
-            rets.append((b / a - 1) * 100)
-    return sum(rets) / len(rets) if rets else 0.0
+    return ((curve[-1] / curve[0]) ** (252.0 / n_days) - 1) * 100.0
 
 
-def _summary(rets: list[float], bench: list[float], picks: list[str]) -> None:
+def _summary(rets: list[float], bench: list[float], picks: list[str],
+             strat: list[float], bmk: list[float], oos_days: int) -> None:
     n = len(rets)
-    if not n:
-        print("  폴드 없음")
+    if not n or len(strat) < 2 or len(bmk) < 2:
+        print("  폴드 없음 / 곡선 부족")
         return
-    comp = 1.0
-    for r in rets:
-        comp *= (1 + r / 100)
-    bcomp = 1.0
-    for r in bench:
-        bcomp *= (1 + r / 100)
+
+    s_tot = (strat[-1] / strat[0] - 1) * 100
+    b_tot = (bmk[-1] / bmk[0] - 1) * 100
+    s_mdd, b_mdd = _mdd(strat), _mdd(bmk)
+    s_cagr, b_cagr = _cagr(strat, oos_days), _cagr(bmk, oos_days)
+    s_mar = s_cagr / s_mdd if s_mdd > 0 else float("inf")
+    b_mar = b_cagr / b_mdd if b_mdd > 0 else float("inf")
     wins = sum(1 for r in rets if r > 0)
     beats = sum(1 for r, b in zip(rets, bench) if r > b)
-    print(f"  OOS 누적(복리)      전략 {(comp - 1) * 100:+.1f}%   벤치마크 {(bcomp - 1) * 100:+.1f}%")
-    print(f"  플러스 연도         {wins}/{n}")
-    print(f"  벤치마크 상회 연도   {beats}/{n}")
-    print(f"  연 평균             전략 {sum(rets) / n:+.1f}%   벤치마크 {sum(bench) / n:+.1f}%")
-    uniq = {}
-    for p in picks:
-        uniq[p] = uniq.get(p, 0) + 1
-    print(f"  선택된 규칙          " + " · ".join(f"{k}×{v}" for k, v in
-                                               sorted(uniq.items(), key=lambda x: -x[1])))
+
+    print(f"  OOS 이어붙인 자산곡선 ({oos_days} 영업일, {oos_days / 252:.1f}년)")
+    print(f"    {'':14}{'누적':>10}{'CAGR':>9}{'MDD':>9}{'MAR':>8}")
+    print(f"    {'전략':14}{s_tot:>+9.1f}%{s_cagr:>+8.1f}%{s_mdd:>8.1f}%{s_mar:>8.2f}")
+    print(f"    {'벤치마크':14}{b_tot:>+9.1f}%{b_cagr:>+8.1f}%{b_mdd:>8.1f}%{b_mar:>8.2f}")
+    print(f"  플러스 연도 {wins}/{n} · 벤치마크 상회 연도 {beats}/{n}")
+    uniq: dict[str, int] = {}
+    for p_ in picks:
+        uniq[p_] = uniq.get(p_, 0) + 1
+    print("  선택된 규칙  " + " · ".join(f"{k}×{v}" for k, v in
+                                     sorted(uniq.items(), key=lambda x: -x[1])))
     if len(uniq) > 1:
-        print("    ※ 폴드마다 다른 규칙이 뽑혔다 = 학습구간 최적값이 불안정하다는 뜻.")
-        print("      이 경우 개별 규칙의 in-sample 성적은 채택 근거가 되지 못한다.")
+        print("    ※ 폴드마다 다른 규칙이 뽑혔다 = 학습구간 최적값이 불안정.")
+        print("      견고한 것은 '어느 계열이 뽑히는가'뿐이고, 세부 파라미터는 근거가 못 된다.")
+
     print()
-    print("  판정 — 신규진입 재개는 아래를 **전부** 충족해야 한다(2026-08-28 선언):")
-    ok1, ok2 = (comp > bcomp), (wins >= n * 0.6)
-    print(f"    [{'O' if ok1 else 'X'}] OOS 누적이 동일가중 벤치마크 초과")
-    print(f"    [{'O' if ok2 else 'X'}] 플러스 연도 ≥ 60% ({wins}/{n})")
-    print(f"    → {'조건 충족 — 다음 단계(모의운용) 검토' if ok1 and ok2 else '조건 미충족 — 신규진입 정지 유지'}")
+    print("  판정 — 기준은 **결과를 보기 전에** 코드 상수로 선언됨(MDD_RATIO/MIN_WIN_YEARS)")
+    c1 = s_mdd <= b_mdd * MDD_RATIO
+    c2 = s_mar >= b_mar
+    c3 = wins >= n * MIN_WIN_YEARS
+    print(f"    [{'O' if c1 else 'X'}] ① 위험 절반: 전략 MDD {s_mdd:.1f}% "
+          f"≤ 벤치마크 {b_mdd:.1f}% × {MDD_RATIO:g} = {b_mdd * MDD_RATIO:.1f}%")
+    print(f"    [{'O' if c2 else 'X'}] ② 수익 하한: 전략 MAR {s_mar:.2f} ≥ 벤치마크 {b_mar:.2f}")
+    print(f"    [{'O' if c3 else 'X'}] ③ 플러스 연도 {wins}/{n} ≥ {MIN_WIN_YEARS:.0%}")
+    if c1 and c2 and c3:
+        print("    → **조건 충족** — 다음 단계(모의운용 후 단계적 재개) 검토 가능")
+    else:
+        print("    → 조건 미충족 — 신규진입 정지 유지(TREND_ENTRY_HALT=true)")
+    print()
+    print("  ※ 유니버스 생존편향은 전략·벤치마크가 **공유**한다 → 상대 비교만 유효,")
+    print("     절대 수익률은 실제보다 부풀려져 있다.")
 
 
 if __name__ == "__main__":

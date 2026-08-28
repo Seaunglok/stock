@@ -167,3 +167,98 @@ def test_benchmark_ignores_stocks_without_data():
 
 def test_benchmark_empty_window_is_zero():
     assert W._benchmark({}, ["2020-01-01"], "2021-01-01", "2021-12-31") == 0.0
+
+
+# ─── 판정 기준 (2026-08-28 사용자 선언: "위험이 절반이면 채택") ────────────────
+def test_criteria_are_module_constants():
+    """★ 기준이 코드 상수여야 git 이력이 '사후에 안 고쳤다'는 증거가 된다."""
+    assert W.MDD_RATIO == 0.5, "선언된 '위험 절반'이 바뀌었다 — 변경은 문서에 근거를 남길 것"
+    assert 0 < W.MIN_WIN_YEARS <= 1
+
+
+# ─── 곡선 이어붙이기 ──────────────────────────────────────────────────────────
+def test_stitch_compounds_across_folds():
+    """★ 폴드는 직전 폴드가 끝난 자산에서 출발해야 한다(복리)."""
+    f1 = [100.0, 110.0]          # +10%
+    f2 = [50.0, 60.0]            # +20% (스케일 무관)
+    out = W._stitch([f1, f2])
+    assert out[0] == pytest.approx(100.0)
+    assert out[-1] == pytest.approx(100.0 * 1.10 * 1.20)
+
+
+def test_stitch_skips_degenerate_folds():
+    assert W._stitch([[100.0], [], [100.0, 120.0]])[-1] == pytest.approx(120.0)
+
+
+def test_stitch_empty_is_empty():
+    assert W._stitch([]) == []
+
+
+def test_stitch_preserves_intra_fold_shape():
+    """폴드 내부의 오르내림이 보존돼야 MDD 를 잴 수 있다."""
+    out = W._stitch([[100.0, 80.0, 120.0]])
+    assert out == pytest.approx([100.0, 80.0, 120.0])
+
+
+# ─── MDD ─────────────────────────────────────────────────────────────────────
+def test_mdd_basic():
+    assert W._mdd([100.0, 150.0, 75.0, 200.0]) == pytest.approx(50.0)
+
+
+def test_mdd_monotonic_rise_is_zero():
+    assert W._mdd([100.0, 110.0, 120.0]) == pytest.approx(0.0)
+
+
+def test_mdd_spans_fold_boundary():
+    """★ 폴드 경계를 넘는 연속 하락이 하나의 큰 낙폭으로 잡혀야 한다.
+
+    폴드별 MDD 평균을 쓰면 -20%/-20% 두 개의 작은 낙폭으로 보이지만,
+    운용자가 실제로 겪는 것은 -36% 한 번이다.
+    """
+    f1 = [100.0, 80.0]       # 폴드1: -20%
+    f2 = [100.0, 80.0]       # 폴드2: 다시 -20%
+    stitched = W._stitch([f1, f2])
+    assert W._mdd(stitched) == pytest.approx(36.0)   # 1 - 0.8*0.8
+    assert W._mdd(f1) == pytest.approx(20.0)         # 폴드별로 보면 20% 에 불과
+
+
+def test_mdd_empty_is_zero():
+    assert W._mdd([]) == 0.0
+
+
+# ─── CAGR ────────────────────────────────────────────────────────────────────
+def test_cagr_one_year():
+    assert W._cagr([100.0, 120.0], 252) == pytest.approx(20.0, abs=0.01)
+
+
+def test_cagr_two_years_annualizes():
+    assert W._cagr([100.0, 144.0], 504) == pytest.approx(20.0, abs=0.01)
+
+
+def test_cagr_guards_bad_input():
+    assert W._cagr([100.0], 252) == 0.0
+    assert W._cagr([100.0, 120.0], 0) == 0.0
+
+
+# ─── 벤치마크 일별 곡선 ───────────────────────────────────────────────────────
+def test_benchmark_curve_is_daily_and_starts_at_100():
+    dates = ["2020-01-01", "2020-06-01", "2020-12-31"]
+    bars = {"A": {d: {"close": v} for d, v in zip(dates, [100.0, 120.0, 150.0])}}
+    c = W._benchmark_curve(bars, dates, "2020-01-01", "2020-12-31")
+    assert len(c) == 3
+    assert c[0] == pytest.approx(100.0)
+    assert c[-1] == pytest.approx(150.0)
+
+
+def test_benchmark_curve_carries_forward_on_missing_day():
+    """거래 없는 날은 직전 값을 유지 — 곡선에 구멍이 나면 MDD 가 왜곡된다."""
+    dates = ["2020-01-01", "2020-06-01", "2020-12-31"]
+    bars = {"A": {dates[0]: {"close": 100.0}, dates[2]: {"close": 90.0}}}
+    c = W._benchmark_curve(bars, dates, "2020-01-01", "2020-12-31")
+    assert len(c) == 3 and c[1] == pytest.approx(100.0)
+
+
+def test_benchmark_curve_mdd_matches_underlying():
+    dates = ["2020-01-01", "2020-06-01", "2020-12-31"]
+    bars = {"A": {d: {"close": v} for d, v in zip(dates, [100.0, 60.0, 90.0])}}
+    assert W._mdd(W._benchmark_curve(bars, dates, "2020-01-01", "2020-12-31")) == pytest.approx(40.0)

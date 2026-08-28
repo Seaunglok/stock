@@ -226,3 +226,21 @@ def test_total_exposure_is_the_validated_level(cfg_no_env):
     """
     assert cfg_no_env.SIZING_MODE in ("pct_equity", "notional")
     assert cfg_no_env.MAX_POS * cfg_no_env.POSITION_PCT == pytest.approx(100.0)
+
+
+def test_pyramiding_cannot_be_enabled_by_env(monkeypatch):
+    """★ 피라미딩은 **환경변수로 되살아나지 않는다**(2026-08-28 영구 비활성).
+
+    .env 에 TREND_PYRAMID_ADDS=2 를 적어도 켜지지 않아야 한다. 근거:
+    2026-06-22 피라미딩 사고가 그 시점 전체 손실의 67% 였고, 12년 시점별 표본에서
+    어떤 게이트로도 살아나지 않았다(off -0.28% vs 추가1유닛 -0.55%).
+    재활성은 설정이 아니라 워크포워드 격자 검증을 거쳐야 한다.
+    """
+    monkeypatch.setenv("TREND_PYRAMID_ADDS", "3")
+    monkeypatch.setenv("TREND_PYRAMID_BYPASS_GATE", "true")
+    sys.modules.pop("trend_config", None)
+    import trend_config
+    m = importlib.reload(trend_config)
+    assert m.PYRAMID_ADDS == 0, "환경변수로 피라미딩이 켜진다"
+    assert m.PYRAMID_BYPASS_GATE is False, "안전게이트 우회가 환경변수로 켜진다"
+    sys.modules.pop("trend_config", None)

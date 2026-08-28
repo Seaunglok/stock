@@ -397,6 +397,9 @@ def _pyramid_gate_open() -> tuple[bool, float, int]:
 
     "전략이 최근 통할 때만 승자에 불타기" — 횡보장(전략 cold) 증폭손실 차단.
     """
+    # 영구 비활성(2026-08-28): 12년 표본에서 어떤 게이트로도 마이너스 · 06-22 손실의 67%.
+    # 본체 코드는 남겨두되 PYRAMID_ADDS 가 상수 0 이라 여기서 항상 반환된다.
+    # 재활성은 설정이 아니라 워크포워드 격자 검증을 거칠 것.
     if PYRAMID_ADDS <= 0:
         return False, 0.0, 0
     if PYRAMID_BYPASS_GATE:                      # MOCK 파일럿용 강제 OPEN — 횡보장 증폭위험 인지 전제
@@ -1357,10 +1360,6 @@ async def scheduler_daemon() -> None:
         warns.append("HARD_STOP_PCT=0 — 하드손절 비활성 (권장 10%)")
     if DAILY_LOSS_LIMIT_PCT <= 0:
         warns.append("DAILY_LOSS_LIMIT_PCT=0 — 일일손실 서킷 비활성 (권장 2%)")
-    if PYRAMID_ADDS > 0:
-        warns.append(f"PYRAMID_ADDS={PYRAMID_ADDS} — 피라미딩 ON (실전 첫달 보류 권장)")
-    if PYRAMID_BYPASS_GATE:
-        warns.append("PYRAMID_BYPASS_GATE=true — equity-curve 안전게이트 비활성 (횡보장 증폭위험)")
     if ADOPT_MODE == "all":
         warns.append("ADOPT_MODE=all — broker 모든 보유분이 trend 청산룰로 처분됨 (HTS 수동매수 위험). watchlist/off 권장")
     if BREADTH_MIN_PCT <= 0:

@@ -117,7 +117,9 @@ ENTRY_HALT = os.getenv("TREND_ENTRY_HALT", "true").lower() == "true"   # 기본�
 # 예탁금이 여기서 크게 벗어나면 기동 시 경고한다 — 사람이 기억할 일이 아니다.
 VALIDATED_EQUITY = float(os.getenv("TREND_VALIDATED_EQUITY", "3852844"))
 INVEST_PER_TRADE = float(os.getenv("TREND_INVEST_PER_TRADE", "500000"))
-# 포지션 사이징: risk=예탁 RISK_PCT% ÷ 손절폭(거래별 리스크 균등·터틀식, 백테스트 MAR 0.87→2.34 검증)
+# 포지션 사이징. risk 모드(예탁 RISK_PCT% ÷ 손절폭)는 **폴백으로만 남는다** —
+# 2026-07-13 채택 근거(MAR 0.87→2.34)는 검증구간 결함(멜트업 9개월) 아래 산출된 값이고,
+# 12년 재측정에서 재현되지 않았다(동일 노출에서 notional 이 MDD 더 낮음). 운용값은 pct_equity.
 #   / pct_equity=예탁 POSITION_PCT% notional / fixed=INVEST_PER_TRADE 고정.
 # 사이징(2026-08-28 재채택). 구 risk 1.5% 는 결함 구간(멜트업 9개월)에서 정한 값이고,
 # 12년 재측정에서 notional 이 동일 노출에서 MDD 가 더 낮았다. 워크포워드는 notional 로 검증했다.
@@ -187,15 +189,17 @@ ROUNDTRIP_COST_PCT = _costs.roundtrip_pct(TAX_BPS, FEE_BPS, SLIPPAGE_BPS)
 FORCE_PHASE = os.getenv("TREND_FORCE_PHASE", "false").lower() == "true"
 # 일일 최대손실 서킷브레이커: 당일 실현손실(net)이 예탁자산의 이 %p 초과 시 신규 진입 중단. 0=off.
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("TREND_DAILY_LOSS_LIMIT_PCT", "2") or 0)
-# 피라미딩(승자 불타기, 검증=backtest equity게이트): 보유 종목이 진입+ k×STEP_R×R 도달 시 1유닛 추가.
-# equity-curve 게이트(최근 LOOKBACK 청산 net 평균>MIN_NET 일 때만)로 횡보장 증폭손실 차단. 0=off(기본).
-PYRAMID_ADDS = int(os.getenv("TREND_PYRAMID_ADDS", "0") or 0)          # 종목당 최대 추가 유닛 수(0=off)
-PYRAMID_STEP_R = float(os.getenv("TREND_PYRAMID_STEP_R", "1.0"))       # 추가 트리거 간격(R배수)
-PYRAMID_LOOKBACK = int(os.getenv("TREND_PYRAMID_LOOKBACK", "20"))      # equity 게이트 청산거래 표본 수
-PYRAMID_MIN_NET = float(os.getenv("TREND_PYRAMID_MIN_NET", "0") or 0)  # 게이트 임계(최근 평균 net% >)
-# Equity-curve 게이트 우회(MOCK 파일럿/테스트용). true 시 청산이력 무관 즉시 OPEN — 횡보장 증폭손실 위험.
-# 실전 전환 시 반드시 false 복귀. PRODUCTION 모드 + 이 값 true 면 LIVE-GUARD 경고 발화.
-PYRAMID_BYPASS_GATE = os.getenv("TREND_PYRAMID_BYPASS_GATE", "false").lower() == "true"
+# ── 피라미딩(승자 불타기) — **영구 비활성** (2026-08-28) ────────────────────────
+# 환경변수를 더 이상 읽지 않는다. `.env` 에 TREND_PYRAMID_ADDS=2 를 적어도 켜지지 않는다.
+# 근거: ① 2026-06-22 피라미딩 1회성 사고가 그 시점 전체 손실의 67% ② 12년 시점별 표본에서
+# 어떤 게이트(무조건/레짐/양봉일)로도 살아나지 않았다 — off -0.28% vs 추가1유닛 -0.55%.
+# 재활성하려면 설정을 되살리는 게 아니라 **워크포워드 격자(walkforward_trend.GRID)에 후보로
+# 넣어 OOS 로 검증**할 것. 그게 이 프로젝트가 채택에 요구하는 절차다.
+PYRAMID_ADDS = 0
+PYRAMID_STEP_R = 1.0
+PYRAMID_LOOKBACK = 20
+PYRAMID_MIN_NET = 0.0
+PYRAMID_BYPASS_GATE = False
 # 시장 breadth 게이트(2026-06-24): KOSPI 업종지수 universe 양봉비율 < 이 값 일 때 신규진입 차단.
 # 06-23 사고(9종 동시 hard stop) 재발 방지. 백테스트(largecap): 0.4=P10-7.99%·PF1.52, 0.5=P10-7.07%·PF1.65. 0=off.
 BREADTH_MIN_PCT = float(os.getenv("TREND_BREADTH_MIN_PCT", "0.4") or 0)

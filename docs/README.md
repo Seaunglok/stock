@@ -14,6 +14,8 @@
 | 5 | [2026-08-28-walkforward.md](2026-08-28-walkforward.md) | 워크포워드 하니스 + 사전선언 기준 + 노출 프론티어 |
 | 6 | [2026-08-28-adoption.md](2026-08-28-adoption.md) | 채택 구성 적용 · 라이브 재개 · 실계좌 예탁금 재검증 |
 
+| 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
+
 부수: [2026-08-28-rs-definition-ab.md](2026-08-28-rs-definition-ab.md)(RS 정의 A/B — 막다른 길),
 [trend_follow_strategy.md](trend_follow_strategy.md)(전략 상세),
 [shadow_ledger.md](shadow_ledger.md)(그림자 원장),

@@ -320,6 +320,7 @@ async def phase_screen() -> list[dict]:
     lines = [f"🔭 추세추종 스크리닝 [{datetime.now().strftime('%m/%d %H:%M')}] 모드:{UNIVERSE_MODE}"]
     lines += [_scr_line(c) for c in cands[:8]] or ["진입 후보 없음"]
     await notify("\n".join(lines))
+    _mark_done("screen")   # 놓친 phase 판정용 — 과거엔 entry 만 기록해 screen 미실행을 알 수 없었다
     return cands
 
 
@@ -1284,6 +1285,7 @@ async def phase_exit() -> None:
         shadow_update()
     except Exception as e:
         logger.warning("[SHADOW] 원장 갱신 실패(무시): %s", str(e)[:120])
+    _mark_done("exit")     # 놓친 phase 판정용
 
 
 # ─── 데몬 ──────────────────────────────────────────────────────────────────
@@ -1296,6 +1298,40 @@ def _is_market_hours(dt: datetime) -> bool:
         return False
     m = dt.hour * 60 + dt.minute
     return 9 * 60 <= m <= 15 * 60 + 20
+
+
+# 놓친 phase 복구 유예 — "이 시각까지는 늦게라도 하는 편이 낫다"의 경계.
+# phase 마다 '늦음'의 의미가 다르다:
+#   screen  진입 전까지만 쓸모 있다(후보는 entry 가 소비한다)
+#   entry   기존 '하락보류 → 반등 진입' 마감과 같은 선 — 그보다 늦은 진입은 검증 밖이다
+#   exit    phase_exit 자체의 지연 경고선과 맞춘다. 그 뒤 매도는 rc 505217(장종료)로 거부된다
+_CATCHUP_DEADLINE = {"screen": ENTRY_TIME, "entry": ENTRY_CUTOFF, "exit": "15:28"}
+_MISSED_SUFFIX = "!missed"   # '실행됨'과 구분되는 표식 — 반복 알림만 막고 사실을 왜곡하지 않는다
+
+
+def _hm(t: str, base: datetime) -> datetime:
+    h, m = (int(x) for x in t.split(":"))
+    return base.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def _missed_phases(now: datetime) -> list:
+    """오늘 슬롯이 지났는데 실행되지 않은 phase → [(phase, 슬롯시각, 유예내)].
+
+    2026-09-09: watchdog 이 08:50:22 에 데몬을 재기동했고 새 데몬이 08:50:27 에 떴다.
+    `_next_run(8,50)` 이 **27초 차이로** 슬롯을 내일로 넘겨 그날 스크린이 사라졌다.
+    중복 실행 가드(`_phase_done_today`)는 있었는데 그 반대 — 미실행 — 를 메우는 장치가
+    없었고, 건너뛴 사실을 알리지도 않았다. watchdog 이 장 시작 무렵 데몬을 재기동하는
+    것은 매일 있는 일이라(밤샘 절전 → 08:40 MCP 복구) 언제든 재발한다.
+    """
+    out = []
+    for h, m, phase in SCHEDULE:
+        slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now < slot:
+            continue                                    # 아직 안 왔다 — 정상 대기
+        if _phase_done_today(phase) or _phase_done_today(phase + _MISSED_SUFFIX):
+            continue                                    # 실행됐거나, 이미 포기하고 알렸다
+        out.append((phase, slot, now < _hm(_CATCHUP_DEADLINE[phase], now)))
+    return out
 
 
 def _next_run(h: int, m: int) -> datetime:
@@ -1396,6 +1432,35 @@ async def scheduler_daemon() -> None:
         now = datetime.now()
         if not _is_weekday(now):
             await asyncio.sleep(1800); continue
+        # ── 놓친 phase 복구 ─────────────────────────────────────────
+        # `_next_run` 은 슬롯이 1초라도 지나면 내일로 넘긴다. 재기동이 슬롯을 넘겨
+        # 끝나면 그날 그 phase 가 통째로 사라진다(2026-09-09 스크린 소실).
+        for _ph, _slot, _in_grace in _missed_phases(now):
+            _late = (now - _slot).total_seconds() / 60
+            _t = _slot.strftime("%H:%M")
+            if _in_grace:
+                logger.warning("[DAEMON] %s 미실행 감지(슬롯 %s · %.0f분 경과) → 지금 복구",
+                               _ph, _t, _late)
+                await notify(
+                    f"⏱️ <b>{_ph} 놓침 → 복구 실행</b>" + chr(10)
+                    + f"예정 {_t} · 현재 {now.strftime("%H:%M")} ({_late:.0f}분 지연)" + chr(10)
+                    + "데몬 재기동이 슬롯을 넘겼습니다.")
+                try:
+                    await funcs[_ph]()
+                except Exception as e:
+                    logger.error("[DAEMON] %s 복구 실패 %s", _ph, e, exc_info=True)
+                    await notify(f"❌ {_ph} 복구 실패: {e}", critical=True)
+            else:
+                # 유예를 넘겼다 — 늦게 하는 편이 더 위험하다(검증 밖 진입·장종료 매도거부).
+                logger.error("[DAEMON] %s 미실행 · 복구 유예(%s) 경과 → 오늘은 건너뜀",
+                             _ph, _CATCHUP_DEADLINE[_ph])
+                await notify(
+                    f"🚨 <b>{_ph} 오늘 미실행</b>" + chr(10)
+                    + f"예정 {_t} · 복구 유예 {_CATCHUP_DEADLINE[_ph]} 경과 ({_late:.0f}분 지연)" + chr(10)
+                    + "늦은 실행이 더 위험해 건너뜁니다. watchdog 재기동 이력을 확인하세요.",
+                    critical=True)
+                _mark_done(_ph + _MISSED_SUFFIX)   # 반복 알림만 막는다(실행됨으로 위장하지 않음)
+        now = datetime.now()        # 복구에 시간이 걸렸을 수 있다 — 다시 읽는다
         items = sorted([(_next_run(h, m), p) for h, m, p in SCHEDULE], key=lambda x: x[0])
         nxt, phase = items[0]
         logger.info("[DAEMON] 다음: %s @ %s (%.0f분)", phase, nxt.strftime("%m/%d %H:%M"),

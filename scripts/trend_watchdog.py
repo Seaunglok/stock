@@ -50,6 +50,12 @@ DAEMON_OUT = LOG_DIR / "daemon_stdout.log"
 UNIVERSE = os.environ.get("TREND_UNIVERSE", "largecap")
 # 데몬이 실제로 쓰는 필수 MCP 포트(주문/시세/정보/투자자/포트폴리오)
 ESSENTIAL_PORTS = [8030, 8031, 8032, 8033, 8034]
+# MCP 기동 후 포트 바인딩 대기 — 고정 sleep 이 아니라 **뜰 때까지 폴링**한다.
+# 2026-09-04~09: 고정 8초가 trading-domain(8030) 에 때때로 부족해 매일 오탐이 떴다.
+# 실제로는 이후 정상 연결되는데도 '재기동 후에도 down' 이 찍혀, 진짜 장애와 구분이 안 됐다.
+# 상한은 watchdog 주기(5분) 안에 stop+start+대기가 끝나도록 잡는다.
+MCP_BIND_TIMEOUT = 45      # 초 — 이 안에 못 뜨면 진짜 이상
+MCP_BIND_POLL = 2          # 초
 
 
 def log(msg: str) -> None:
@@ -75,6 +81,22 @@ def port_up(port: int, host: str = "127.0.0.1", timeout: float = 1.5) -> bool:
             return True
     except OSError:
         return False
+
+
+def wait_ports(ports: list, timeout: int = MCP_BIND_TIMEOUT) -> tuple:
+    """모든 포트가 뜰 때까지 폴링 → (아직 안 뜬 포트, 소요초).
+
+    고정 대기와 달리 빠르면 즉시 끝나고 느리면 기다린다. 소요시간을 함께 돌려주는
+    이유는 '얼마나 걸리는지'를 로그에 남겨야 상한(MCP_BIND_TIMEOUT)이 맞는지
+    나중에 판단할 수 있기 때문이다 — 지금은 그 분포를 모른다.
+    """
+    t0 = time.monotonic()
+    while True:
+        down = [p for p in ports if not port_up(p)]
+        elapsed = time.monotonic() - t0
+        if not down or elapsed >= timeout:
+            return down, elapsed
+        time.sleep(MCP_BIND_POLL)
 
 
 def daemon_alive() -> bool:
@@ -131,7 +153,7 @@ def _detached_kwargs() -> dict:
     return kw
 
 
-def start_servers() -> None:
+def start_servers() -> list:
     log("[MCP] 필수 포트 다운 → stop(정리) 후 start (중복 세트 누적 방지)")
     try:
         # 먼저 추적 중인(죽었을 수 있는) PID 정리 → 중복 서버 세트 누적 방지
@@ -141,7 +163,12 @@ def start_servers() -> None:
                        cwd=str(ROOT), timeout=120)
     except Exception as e:
         log(f"[MCP] start 예외: {e}")
-    time.sleep(8)  # 포트 바인딩 대기
+    down, took = wait_ports(ESSENTIAL_PORTS)
+    if down:
+        log(f"[MCP] ⚠️ {took:.0f}s 대기 후에도 down={down}")
+    else:
+        log(f"[MCP] 전 포트 정상 ({took:.0f}s)")
+    return down
 
 
 def start_daemon() -> None:
@@ -165,10 +192,7 @@ def main() -> None:
     down = [p for p in ESSENTIAL_PORTS if not port_up(p)]
     if down:
         log(f"[MCP] down={down}")
-        start_servers()
-        down2 = [p for p in ESSENTIAL_PORTS if not port_up(p)]
-        if down2:
-            log(f"[MCP] ⚠️ 재기동 후에도 down={down2}")
+        start_servers()          # 폴링 후 결과를 자체 로깅한다
 
     if not daemon_alive():
         start_daemon()

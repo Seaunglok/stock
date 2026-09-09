@@ -102,3 +102,45 @@ def test_start_servers_returns_down_list():
     """main 이 결과를 쓸 수 있어야 한다 — 반환이 없으면 중복 확인이 되살아난다."""
     import inspect
     assert "-> list" in inspect.getsource(W.start_servers).split(chr(10))[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 장중 재부팅 감지 (2026-09-09)
+#
+# Windows Update 가 08:45 에 재시작을 걸어 MCP·데몬이 전멸했다. 활성시간이 08~17 로
+# 설정돼 있었는데도 우회됐다(긴급 업데이트는 활성시간을 무시한다).
+# watchdog 로그엔 "다 죽었다"만 남아, 원인을 찾으려면 Windows 이벤트 로그를 뒤져야 했다.
+# 부팅 시각은 한 줄이면 알 수 있고, 그게 있으면 다음엔 로그만 보고 끝난다.
+# ═══════════════════════════════════════════════════════════════════════════
+def test_boot_time_is_readable():
+    """부팅 경과를 못 읽으면 -1 — 감지가 조용히 죽지 않도록 값으로 구분한다."""
+    v = W.recent_boot_sec()
+    assert v == -1.0 or v >= 0, f"이상한 반환: {v}"
+
+
+def test_boot_detection_window_covers_watchdog_interval():
+    """★ watchdog 은 5분마다 돈다. 창이 그보다 짧으면 재부팅을 놓친다.
+
+    2026-09-09 실제: 08:46:32 부팅 → 08:50:10 watchdog(≈216초 경과)에 잡혀야 했다.
+    """
+    assert W.REBOOT_RECENT_SEC >= 5 * 60, "watchdog 한 주기도 못 덮는다"
+    assert W.REBOOT_RECENT_SEC <= 30 * 60, "너무 길면 무관한 기동에도 재부팅이라 우긴다"
+    assert 216 <= W.REBOOT_RECENT_SEC, "09-09 실제 사례(216초)를 못 잡는다"
+
+
+def test_boot_failure_returns_sentinel(monkeypatch):
+    """psutil 이 없거나 실패해도 watchdog 이 죽지 않고 -1 로 비켜간다."""
+    import builtins
+    real = builtins.__import__
+
+    def boom(name, *a, **k):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert W.recent_boot_sec() == -1.0
+
+
+def test_sentinel_is_not_treated_as_recent_boot():
+    """★ -1 이 '최근 부팅'으로 판정되면 매번 재부팅이라고 오보한다."""
+    assert not (0 <= -1.0 <= W.REBOOT_RECENT_SEC)

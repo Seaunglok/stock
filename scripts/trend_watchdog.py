@@ -56,6 +56,8 @@ ESSENTIAL_PORTS = [8030, 8031, 8032, 8033, 8034]
 # 상한은 watchdog 주기(5분) 안에 stop+start+대기가 끝나도록 잡는다.
 MCP_BIND_TIMEOUT = 45      # 초 — 이 안에 못 뜨면 진짜 이상
 MCP_BIND_POLL = 2          # 초
+# 최근 부팅 판정 — 이 안에 부팅했으면 '재부팅 직후'로 본다(watchdog 주기 5분의 2배 여유).
+REBOOT_RECENT_SEC = 600
 
 
 def log(msg: str) -> None:
@@ -81,6 +83,21 @@ def port_up(port: int, host: str = "127.0.0.1", timeout: float = 1.5) -> bool:
             return True
     except OSError:
         return False
+
+
+def recent_boot_sec() -> float:
+    """마지막 부팅 이후 경과 초. 조회 불가면 -1.
+
+    2026-09-09: Windows Update 가 장중(08:45)에 재시작을 걸어 MCP·데몬이 전멸했다.
+    활성시간이 08~17 로 설정돼 있었는데도 우회됐다(긴급 업데이트는 활성시간을 무시한다).
+    watchdog 로그엔 '다 죽었다'만 남아 원인을 찾으려면 Windows 이벤트 로그를 뒤져야 했다.
+    부팅 시각을 함께 찍어두면 다음엔 로그 한 줄로 끝난다.
+    """
+    try:
+        import psutil
+        return time.time() - psutil.boot_time()
+    except Exception:
+        return -1.0
 
 
 def wait_ports(ports: list, timeout: int = MCP_BIND_TIMEOUT) -> tuple:
@@ -192,6 +209,11 @@ def main() -> None:
     down = [p for p in ESSENTIAL_PORTS if not port_up(p)]
     if down:
         log(f"[MCP] down={down}")
+        _boot = recent_boot_sec()
+        if 0 <= _boot <= REBOOT_RECENT_SEC:
+            # 서버가 죽은 게 아니라 **머신이 재부팅**된 것 — 원인 추적을 여기서 끝낸다.
+            log(f"[SYS] ⚠️ 부팅 후 {_boot / 60:.0f}분 — 장중 재부팅으로 전멸한 것으로 보인다"
+                f" (Windows Update 자동 재시작 등). 놓친 phase 는 데몬이 복구한다.")
         start_servers()          # 폴링 후 결과를 자체 로깅한다
 
     if not daemon_alive():

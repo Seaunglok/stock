@@ -12,13 +12,18 @@ from src.mcp_servers.trend_mcp.market_data import get_kospi_closes, get_ohlcv  #
 from src.mcp_servers.trend_mcp.signals import analyze_gate_funnel  # noqa: E402
 from trend_kiwoom_io import get_universe  # noqa: E402  (데몬용 config 주입 wrapper)
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # cp949 콘솔에서 한글이 깨졌다
+
 kospi = get_kospi_closes()
 uni = get_universe()
 held = set()
 try:
-    held = {p["symbol"] for p in json.load(open("data/trend_follow/state.json")).get("positions", [])}
-except Exception:
-    pass
+    # 인코딩을 명시해야 한다. 기본(cp949)으로 열면 한글 종목명에서 실패하는데, 예전엔 그 실패를
+    # 조용히 삼켜 보유 종목이 퍼널에 섞였다 — 출력은 "보유 0 제외"로 정상처럼 보였다(2026-09-14).
+    with open("data/trend_follow/state.json", encoding="utf-8") as f:
+        held = {p["symbol"] for p in json.load(f).get("positions", [])}
+except Exception as e:
+    print(f"⚠️ state.json 읽기 실패 — 보유 종목 제외 없이 진행: {e}", file=sys.stderr)
 
 result = analyze_gate_funnel(uni, kospi, CFG, held=held, ohlcv_loader=get_ohlcv)
 

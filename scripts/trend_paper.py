@@ -111,8 +111,26 @@ def main() -> int:
           f"하드손절 {k['hard_stop']:g}% · 슬롯 {k['max_pos']}×{k['position_pct']:g}% "
           f"(노출 {exposure:.0f}%) · 랭킹 {k['rank_mode']} · 레짐 MA{k['regime_ma']}")
     print("-" * 88)
+    base = {"ts": datetime.now().isoformat(timespec="seconds"),
+            "asof": dates[-1], "start": args.start, "days": res.n_days,
+            "exits": list(k["exits"]), "max_pos": k["max_pos"],
+            "position_pct": k["position_pct"]}
+
+    def _log(row: dict) -> None:
+        if args.no_log:
+            return
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"  기록: {LOG_FILE.name}")
+
     if not m.get("n"):
         print("  아직 자산곡선 없음")
+        # 빈 장부도 **기록한다**(2026-09-14). 안 남기면 '안 돌았다'와 '기록할 게 없었다'가
+        # 로그에서 똑같이 보인다 — 예약작업이 09-11·14 연속 실패(0x80070002)했는데 진입 0건
+        # 구간이라 로그 공백이 정상처럼 보였고, 그래서 아무도 몰랐다.
+        _log({**base, "total_pct": None, "mdd_pct": None,
+              "entries": len(res.entry_dates), "closed": len(res.closed), "note": "자산곡선 없음"})
         return 0
     print(f"  누적 {m['total']:+.2f}%   MDD {m['mdd']:.2f}%   진입 {m['entries']}건   "
           f"청산 {len(res.closed)}건   평균동시보유 {m['avg_conc']:.1f}")
@@ -133,17 +151,8 @@ def main() -> int:
     print("  ※ 슬리피지·부분체결·호가공백은 여기서 검증되지 않는다 —")
     print("     그게 라이브 실체결과 이 장부를 대조하는 이유다.")
 
-    if not args.no_log:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        row = {"ts": datetime.now().isoformat(timespec="seconds"),
-               "asof": dates[-1], "start": args.start, "days": res.n_days,
-               "total_pct": round(m["total"], 4), "mdd_pct": round(m["mdd"], 4),
-               "entries": m["entries"], "closed": len(res.closed),
-               "exits": list(k["exits"]), "max_pos": k["max_pos"],
-               "position_pct": k["position_pct"]}
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"  기록: {LOG_FILE.name}")
+    _log({**base, "total_pct": round(m["total"], 4), "mdd_pct": round(m["mdd"], 4),
+          "entries": m["entries"], "closed": len(res.closed)})
     return 0
 
 

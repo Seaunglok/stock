@@ -325,11 +325,21 @@ async def phase_screen() -> list[dict]:
 
 
 # ─── Phase: 진입 ────────────────────────────────────────────────────────────
-def _phase_done_today(label: str) -> bool:
-    if FORCE_PHASE:
-        return False
+def _marked_today(label: str) -> bool:
+    """state 에 오늘 이 표식이 있나 — **사실 조회**다. FORCE_PHASE 와 무관하다.
+
+    놓친 phase 판정(`_missed_phases`)은 이걸 써야 한다. FORCE_PHASE 에 가려지면 지난 phase 가
+    전부 '미실행'으로 보여 스케줄 루프마다 다시 돈다.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     return label in (get_state("done", {}).get(today) or [])
+
+
+def _phase_done_today(label: str) -> bool:
+    """phase 내부 중복 실행 가드. TREND_FORCE_PHASE=true 면 수동 재실행을 위해 무시한다."""
+    if FORCE_PHASE:
+        return False
+    return _marked_today(label)
 
 
 def _mark_done(label: str) -> None:
@@ -1307,11 +1317,32 @@ def _is_market_hours(dt: datetime) -> bool:
 #   exit    phase_exit 자체의 지연 경고선과 맞춘다. 그 뒤 매도는 rc 505217(장종료)로 거부된다
 _CATCHUP_DEADLINE = {"screen": ENTRY_TIME, "entry": ENTRY_CUTOFF, "exit": "15:28"}
 _MISSED_SUFFIX = "!missed"   # '실행됨'과 구분되는 표식 — 반복 알림만 막고 사실을 왜곡하지 않는다
+_RAN_SUFFIX = "@ran"         # 스케줄러가 phase 를 **호출하는 순간** 남기는 표식(state.json 에 영속)
+
+# '실행됐다'의 판정 기준 — phase 마다 다르다(2026-09-14 교정).
+#   entry·exit  주문 phase. **호출됐으면** 실행된 것이다. 도중 실패·중단을 재실행하면 응답 불명
+#               주문(브로커는 접수, 잔고엔 아직 미반영)을 다시 보낼 수 있다 — 08-17 에 없앤
+#               재전송이 phase 단위로 되살아난다.
+#   screen      주문이 없어 재실행이 안전하다 → **완료 표식**이 있어야 실행된 것. hang 으로
+#               watchdog 에 죽은 screen 을 재기동 뒤 복구하던 09-09 동작을 유지한다.
+# phase 자체의 done 표식(`_mark_done(phase)`)만으로 판정하면 안 된다. entry 의 그것은
+# '주문/게이트 판정이 났다'는 뜻이라 후보 0·슬롯 만석·서킷 날엔 안 찍힌다 — 09-14 오탐의 원인.
+_RETRY_SAFE = frozenset({"screen"})
 
 
 def _hm(t: str, base: datetime) -> datetime:
     h, m = (int(x) for x in t.split(":"))
     return base.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+async def _run_phase(label: str, fn) -> None:
+    """스케줄러의 **유일한** phase 호출 경로 — 호출 **전에** `<phase>@ran` 을 남긴다.
+
+    전에 찍는 이유: phase 도중 예외가 나거나 watchdog 이 프로세스를 죽여도 주문 phase 는
+    '실행됨'으로 남아 복구가 다시 돌리지 않는다. 예외는 그대로 올려 호출자가 처리한다.
+    """
+    _mark_done(label + _RAN_SUFFIX)
+    await fn()
 
 
 def _missed_phases(now: datetime) -> list:
@@ -1322,14 +1353,20 @@ def _missed_phases(now: datetime) -> list:
     중복 실행 가드(`_phase_done_today`)는 있었는데 그 반대 — 미실행 — 를 메우는 장치가
     없었고, 건너뛴 사실을 알리지도 않았다. watchdog 이 장 시작 무렵 데몬을 재기동하는
     것은 매일 있는 일이라(밤샘 절전 → 08:40 MCP 복구) 언제든 재발한다.
+
+    2026-09-14: phase 자체의 done 표식으로 판정하다 오탐이 났다. 후보 0건으로 정상 종료한
+    entry 를 '미실행'으로 보고 2초 뒤 한 번 더 돌렸고, 15:20 에 critical 알림까지 냈다.
+    이제 스케줄러 호출 표식(@ran)으로 판정한다 — 위 `_RETRY_SAFE` 주석 참조.
     """
     out = []
     for h, m, phase in SCHEDULE:
         slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if now < slot:
             continue                                    # 아직 안 왔다 — 정상 대기
-        if _phase_done_today(phase) or _phase_done_today(phase + _MISSED_SUFFIX):
-            continue                                    # 실행됐거나, 이미 포기하고 알렸다
+        if _marked_today(phase) or _marked_today(phase + _MISSED_SUFFIX):
+            continue                                    # 완료 표식이 있거나, 이미 포기하고 알렸다
+        if phase not in _RETRY_SAFE and _marked_today(phase + _RAN_SUFFIX):
+            continue                                    # 주문 phase 는 호출됐으면 끝 — 재실행 금지
         out.append((phase, slot, now < _hm(_CATCHUP_DEADLINE[phase], now)))
     return out
 
@@ -1441,12 +1478,14 @@ async def scheduler_daemon() -> None:
             if _in_grace:
                 logger.warning("[DAEMON] %s 미실행 감지(슬롯 %s · %.0f분 경과) → 지금 복구",
                                _ph, _t, _late)
+                _why = ("시작됐으나 완료 기록이 없습니다(중단/실패) — 주문이 없는 phase 라 다시 실행합니다."
+                        if _marked_today(_ph + _RAN_SUFFIX) else "데몬 재기동이 슬롯을 넘겼습니다.")
                 await notify(
                     f"⏱️ <b>{_ph} 놓침 → 복구 실행</b>" + chr(10)
                     + f"예정 {_t} · 현재 {now.strftime("%H:%M")} ({_late:.0f}분 지연)" + chr(10)
-                    + "데몬 재기동이 슬롯을 넘겼습니다.")
+                    + _why)
                 try:
-                    await funcs[_ph]()
+                    await _run_phase(_ph, funcs[_ph])
                 except Exception as e:
                     logger.error("[DAEMON] %s 복구 실패 %s", _ph, e, exc_info=True)
                     await notify(f"❌ {_ph} 복구 실패: {e}", critical=True)
@@ -1483,7 +1522,7 @@ async def scheduler_daemon() -> None:
                     logger.error("[DAEMON] intraday %s", e)
         if _is_weekday(datetime.now()):
             try:
-                await funcs[phase]()
+                await _run_phase(phase, funcs[phase])   # 호출 표식을 남기는 유일한 경로
             except StateCorrupted as e:
                 # 보유 포지션을 알 수 없다 — 추측으로 거래를 이어가면 안 된다(무방비 방치/이중매도).
                 logger.critical("[DAEMON] state 손상 — %s", e, exc_info=True)

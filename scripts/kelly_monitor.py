@@ -125,22 +125,34 @@ def assess(returns: list[float], exposure: float) -> dict:
 
 
 # ── 표본 수집 ───────────────────────────────────────────────────────────────
-def adopted_returns() -> list[float]:
-    """채택 구성 시행일 이후 **실제 청산**된 거래의 net%(소수).
+def adopted_returns(since: str = ADOPTED_SINCE) -> list[float]:
+    """채택 구성 시행일 이후 **실제 청산**된 거래의 net 수익률(소수) — 거래 1건당 표본 1개.
 
-    이전 거래는 청산 사다리가 달라(트레일·부분익절 포함) 분포 자체가 다르다.
-    섞으면 지금 안 쓰는 규칙의 f* 를 감시하게 된다.
+    읽는 형식은 데몬이 쓰는 그대로다(trend_follow 의 청산 `journal_append`):
+        {"ts": ..., "type": "exit", "id": <거래 id>, "qty": ..., "net_pct": ...}
+
+    2026-09-29 정정: 09-09 판독 로직은 `closed`·`exit_date` 필드를 찾았는데 실제 기록엔 둘 다
+    없다. 운영 저널의 청산 22건 중 0건을 읽었다 — 첫 청산이 나와도 "0/50" 으로 남을 뻔했다.
+    **선언된 기준(위 상수)은 바뀌지 않았다.** 읽는 방법만 고쳤다.
+
+    한 거래를 나눠 팔았으면(구 사다리의 부분익절) **수량 가중 1건**으로 합친다 — 켈리의 베팅
+    단위는 거래다. 날짜는 그 거래의 마지막 청산일. 이전 거래는 청산 사다리가 달라(트레일·
+    부분익절 포함) 분포 자체가 다르다 — 섞으면 지금 안 쓰는 규칙의 f* 를 감시하게 된다.
     """
     from trend_runtime import read_journal
-    out: list[float] = []
+    trades: dict[str, dict] = {}
     for r in read_journal():
-        if not isinstance(r, dict) or not r.get("closed"):
+        if not isinstance(r, dict) or r.get("type") != "exit":
             continue
-        when = str(r.get("exit_date") or r.get("date") or "")[:10]
-        net = r.get("net_pct")
-        if when >= ADOPTED_SINCE and isinstance(net, (int, float)):
-            out.append(float(net) / 100.0)
-    return out
+        net, qty = r.get("net_pct"), r.get("qty")
+        if not isinstance(net, (int, float)) or not isinstance(qty, (int, float)) or qty <= 0:
+            continue
+        # id 가 없으면 ts 로 구분한다 — 서로 다른 거래를 한 건으로 합치지 않도록.
+        t = trades.setdefault(str(r.get("id") or r.get("ts")), {"w": 0.0, "q": 0.0, "last": ""})
+        t["w"] += float(net) * float(qty)
+        t["q"] += float(qty)
+        t["last"] = max(t["last"], str(r.get("ts") or "")[:10])
+    return [t["w"] / t["q"] / 100.0 for t in trades.values() if t["last"] >= since]
 
 
 def live_exposure() -> float:
@@ -160,10 +172,14 @@ def main() -> int:
         return 0
 
     rets = adopted_returns()
+    all_trades = len(adopted_returns(since=""))
     exp = live_exposure()
     a = assess(rets, exp)
     print("=" * 74)
     print(f"켈리 과베팅 감시 — 채택 구성({ADOPTED_SINCE}~) 청산 {a['n']}건 · 총노출 {exp*100:.0f}%")
+    # 판독이 살아 있다는 증거를 함께 찍는다(2026-09-29). 읽기가 다시 깨지면 '전체'가 0 으로
+    # 드러난다 — 과거엔 판독 실패와 '아직 청산 없음'이 똑같이 "0건" 으로 보였다.
+    print(f"  (저널 판독: 전체 {all_trades}거래 · 채택 이전 {all_trades - a['n']}거래 제외)")
     print("=" * 74)
     if a["verdict"] == "표본부족":
         print(f"  판정 보류 — 청산 {a['n']}/{a['need']}건.")

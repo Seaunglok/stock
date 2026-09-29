@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -149,3 +150,92 @@ def test_adopted_since_matches_exit_ladder_change():
     assert K.ADOPTED_SINCE == "2026-08-28"
     doc = (_ROOT / "docs" / "2026-08-28-adoption.md").read_text(encoding="utf-8")
     assert "ma,hold" in doc, "채택일 근거 문서가 사라졌다"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 저장 형식 경계 (2026-09-29)
+#
+# 09-09 판독 로직은 `closed`·`exit_date` 필드를 찾았는데, 데몬이 쓰는 청산 기록엔 둘 다 없다
+# (`type: "exit"` + `ts`). 운영 저널의 청산 22건 중 **0건**을 읽었다 — 첫 청산이 나와도 "0/50"
+# 으로 남았을 것이다. 위 테스트들은 가짜 리스트로 계산만 검증해 경계를 한 번도 지나지 않았다.
+# 여기서는 데몬과 같은 쓰기 함수(journal_append)로 기록하고 같은 읽기 함수로 읽는다.
+# ═══════════════════════════════════════════════════════════════════════════
+@pytest.fixture
+def journal(monkeypatch, tmp_path):
+    """저널을 임시 파일로 — 운영 journal.json 을 건드리지 않는다."""
+    import trend_runtime as RT
+    f = tmp_path / "journal.json"
+    monkeypatch.setattr(RT, "JOURNAL_FILE", f)
+    return f
+
+
+def _exit_rec(jid: str, net: float, qty: int = 3) -> dict:
+    """trend_follow 의 청산 journal_append 와 같은 모양(ts 는 journal_append 가 붙인다)."""
+    return {"type": "exit", "id": jid, "symbol": "000000", "name": "테스트", "qty": qty,
+            "entry_price": 10000.0, "exit_price": round(10000.0 * (1 + net / 100), 2),
+            "decided_at": 0.0, "pnl_pct": net, "net_pct": net, "pnl_amount": 0,
+            "rr_realized": None, "reason": "MA120 이평선 하방돌파", "hold_days": 2}
+
+
+def _write_at(f: Path, ts: str, rec: dict) -> None:
+    """과거 시각의 기록 — journal_append 는 ts 를 현재로 찍으므로 날짜 필터 검증용으로 직접 쓴다."""
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": ts, **rec}, ensure_ascii=False) + "\n")
+
+
+def test_reads_exit_written_by_daemon_writer(journal):
+    """★ 데몬의 쓰기 함수로 남긴 청산을 켈리 감시가 읽어야 한다 — 09-29 결함의 직접 재현."""
+    import trend_runtime as RT
+    RT.journal_append(_exit_rec("a1", -4.21))
+    assert K.adopted_returns(since="2000-01-01") == pytest.approx([-0.0421])
+
+
+def test_ignores_non_exit_records(journal):
+    """진입·피라미딩·메모는 청산이 아니다."""
+    for rec in ({"type": "entry", "id": "a1", "qty": 3, "entry_price": 10000.0},
+                {"type": "pyramid", "id": "a1", "qty": 1},
+                {"type": "note", "id": "a1", "psych": "조급함"}):
+        _write_at(journal, "2026-09-28T11:00:00", rec)
+    assert K.adopted_returns(since="2000-01-01") == []
+
+
+def test_partial_exits_are_one_trade_qty_weighted(journal):
+    """한 거래를 나눠 팔았으면(구 사다리의 부분익절) 켈리 표본은 **1건** — 수량 가중 수익률.
+
+    켈리의 베팅 단위는 거래다. 청산 기록 단위로 세면 부분익절한 승자가 표본을 두 번 차지한다.
+    """
+    _write_at(journal, "2026-09-30T10:00:00", _exit_rec("t1", 30.0, qty=1))
+    _write_at(journal, "2026-10-02T15:20:00", _exit_rec("t1", -10.0, qty=2))
+    assert K.adopted_returns(since="2000-01-01") == pytest.approx([(30.0 * 1 - 10.0 * 2) / 3 / 100])
+
+
+def test_exits_before_adoption_are_excluded(journal):
+    """채택일 이전 청산은 다른 사다리의 분포다 — 날짜는 청산 시각(ts) 기준."""
+    _write_at(journal, "2026-08-25T15:20:26", _exit_rec("old", -1.09))
+    _write_at(journal, "2026-09-30T15:20:00", _exit_rec("new", -4.0))
+    assert K.adopted_returns() == pytest.approx([-0.04])
+
+
+def test_writer_schema_still_has_fields_reader_needs():
+    """★ 데몬의 청산 기록 형식이 바뀌면 여기서 깨진다 — 읽는 쪽이 조용히 0건이 되는 것을 막는다."""
+    src = (_ROOT / "scripts" / "trend_follow.py").read_text(encoding="utf-8")
+    i = src.index('journal_append({"type": "exit"')
+    call = src[i:src.index("})", i)]
+    for key in ('"id"', '"qty"', '"net_pct"'):
+        assert key in call, f"청산 기록에 {key} 가 없다 — 켈리 감시가 읽을 수 없다"
+    rt = (_ROOT / "scripts" / "trend_runtime.py").read_text(encoding="utf-8")
+    assert '{"ts": datetime.now()' in rt, "journal_append 가 ts 를 붙이지 않는다 — 날짜 필터가 무력화된다"
+
+
+def test_live_journal_exits_are_readable():
+    """★ 운영 저널에 청산 기록이 있으면 판독 결과도 0 이 아니어야 한다.
+
+    2026-09-29: 청산 22건이 있는데 0건으로 읽혔다. 운영 데이터가 없는 환경에선 건너뛴다.
+    """
+    import trend_runtime as RT
+    if not RT.JOURNAL_FILE.exists():
+        pytest.skip("운영 저널 없음")
+    n_exit = sum(1 for r in RT.read_journal() if r.get("type") == "exit")
+    if n_exit == 0:
+        pytest.skip("운영 저널에 청산 기록 없음")
+    assert K.adopted_returns(since="2000-01-01"), f"청산 기록 {n_exit}건이 있는데 하나도 못 읽는다"

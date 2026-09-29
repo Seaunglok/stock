@@ -724,12 +724,26 @@ async def _prices_for(codes: list[str]) -> list[float]:
     return out
 
 
+def _log_gates_pass(payload: dict) -> None:
+    """게이트를 **통과한** 순간의 값 기록 — 실패해도 절대 예외를 올리지 않는다.
+
+    2026-09-29: 레짐·breadth 값은 막힌 날만 events 에 남았다. 통과한 날의 11:00 breadth 는
+    장중 스냅샷(ka20003)이라 나중에 복원도 못 한다. 임계(40%)를 검증하려면 양쪽 값이 필요하다.
+    원격측정 한 줄이 디스크 오류로 진입을 끊으면 안 되므로 여기서 삼킨다.
+    """
+    try:
+        log_event("gates_pass", payload)
+    except Exception as e:
+        logger.warning("[GATES] 통과값 기록 실패(무시): %s", str(e)[:120])
+
+
 async def _market_gates(cands: list[dict]) -> list[dict] | None:
     """진입 전 시장 게이트 3종 — 레짐 → 서킷 → breadth. 통과 시 후보, 차단 시 None.
 
     순서에 의미가 있다: 레짐(지수 추세, 하루 단위 판정)이 가장 넓은 그물이라 먼저 걸러
     아래 게이트의 조회 비용을 아낀다. breadth 만 '보류'(장중 회복 시 재시도)이고 나머지는 종착.
     """
+    gate_vals: dict = {}          # 통과 시 기록할 값 — 막힌 날은 각 *_block 이벤트가 이미 남긴다
     # 레짐 — KOSPI 가 자기 MA 아래면 하락장 → 신규진입 전면 차단(보유분 관리는 계속).
     # breadth 가 '당일 상승종목 비율'만 보는 것과 달리 **지수 추세**를 본다(상호보완).
     # 2026-08-03 도입: 실전 진입 11건 중 10건이 KOSPI<MA60 일 발생 → 실현손실 -33.3%p 회피 추정.
@@ -747,6 +761,8 @@ async def _market_gates(cands: list[dict]) -> list[dict] | None:
             await notify(f"🚫 시장 레짐 게이트 — 신규 진입 차단 (KOSPI {kospi[-1]:,.0f} < MA{REGIME_MA} {kma:,.0f})\n"
                          f"하락장 신규진입 중단 · 후보 {len(cands)}종 스킵 (보유분 청산규칙은 정상 작동)")
             return None
+        else:
+            gate_vals.update(kospi=round(kospi[-1], 1), ma=round(kma, 1), ma_n=REGIME_MA)
     broken, why = await _circuit_broken()
     if broken:
         log_event("circuit_break", {"phase": "entry", "reason": why})
@@ -769,6 +785,10 @@ async def _market_gates(cands: list[dict]) -> list[dict] | None:
                 await notify(f"🚫 시장 breadth 게이트 — 신규 진입 보류 (양봉비율 {breadth:.1%} < {BREADTH_MIN_PCT:.0%})\n"
                              f"회복(≥{BREADTH_MIN_PCT:.0%}) + 후보 반등 시 진입 재시도 (~{ENTRY_CUTOFF})")
                 return None
+            gate_vals["breadth"] = round(breadth, 3) if breadth is not None else None
+        else:
+            gate_vals["breadth"] = None      # 업종지수 미확보 → fail-open 통과. '값 없이 통과'도 남긴다
+    _log_gates_pass({**gate_vals, "breadth_min": BREADTH_MIN_PCT, "candidates": len(cands)})
     return cands
 
 
@@ -912,6 +932,7 @@ async def _try_pending() -> None:
         return
     # 시장 breadth 재확인 — 약세장이면 진입 보류 유지(회복 대기). 09:30 차단분·하락보류분 공통.
     # 회복해야 진입 → '약한 출발→회복' 장 포착하면서 약세 지속 시엔 06-23식 방어 유지.
+    breadth_now = None                # 체결 시 기록할 값(2026-09-29) — 통과한 순간의 breadth
     if BREADTH_MIN_PCT > 0:
         rows = await _sector_index_rows()
         if rows:
@@ -920,6 +941,7 @@ async def _try_pending() -> None:
                 logger.info("[PENDING] 시장 breadth %.1f%% < %.0f%% — 진입 보류 유지(회복 대기)",
                             breadth * 100, BREADTH_MIN_PCT * 100)
                 return
+            breadth_now = breadth
     mode_tag = "🧪 MOCK" if MOCK_MODE else "💰 REAL"
     still, bought = [], []
     try:
@@ -948,6 +970,10 @@ async def _try_pending() -> None:
         done = {p["symbol"] for p in bought} | {c["symbol"] for c in still}
         still += [c for c in pending if c["symbol"] not in done]
         logger.error("[PENDING] %s", e)
+    if bought:   # 산 폴링만 남긴다 — 반등 없는 10분 폴링까지 쌓으면 잡음이다. 헬퍼는 예외를 삼킨다.
+        _log_gates_pass({"phase": "pending", "breadth_min": BREADTH_MIN_PCT,
+                         "breadth": round(breadth_now, 3) if breadth_now is not None else None,
+                         "symbols": [p["symbol"] for p in bought]})
     # ★ 아래 3줄은 예외 여부와 무관하게 실행돼야 한다. 과거엔 except 에서 return 해버려
     #   이미 매수한 종목이 pending 에 남았고, 다음 intraday 폴링이 그대로 재매수했다.
     bought, positions = await _verify_buy_fills(bought, positions)

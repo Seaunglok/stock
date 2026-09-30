@@ -123,9 +123,8 @@ async def _premarket_snapshot(symbol: str) -> dict | None:
             "gap_pct": round((exp - base) / base * 100, 2)}
 
 
-async def _broker_holdings() -> list[dict]:
-    """계좌 보유종목 [{symbol,name,qty,avg,cur}]. get_account_evaluation 파싱."""
-    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
+def _parse_holdings(d: dict) -> list[dict]:
+    """get_account_evaluation data → [{symbol,name,qty,avg,cur}] (보유 0 초과만)."""
     out = []
     for r in (d.get("stk_acnt_evlt_prst") or []):
         code = str(r.get("stk_cd", "")).lstrip("A")
@@ -135,6 +134,67 @@ async def _broker_holdings() -> list[dict]:
         out.append({"symbol": code, "name": r.get("stk_nm", code), "qty": qty,
                     "avg": _kint(r.get("avg_prc", 0)), "cur": _kint(r.get("cur_prc", 0))})
     return out
+
+
+async def _broker_holdings() -> list[dict]:
+    """계좌 보유종목 [{symbol,name,qty,avg,cur}]. get_account_evaluation 파싱.
+
+    ⚠️ 조회 실패도 [] 를 돌려준다 — '보유 0' 과 구분되지 않는다. '계좌에 없음'을 근거로
+    판단해야 하면 `_broker_holdings_checked` 를 쓸 것.
+    """
+    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
+    return _parse_holdings(d)
+
+
+async def _broker_holdings_checked() -> list[dict] | None:
+    """`_broker_holdings` 와 같되 **조회 실패·불완전 응답이면 None**. [] 는 '보유 0 이 확인됨'.
+
+    2026-09-30: 장부 대조는 '계좌에 없음'을 근거로 유령을 판단한다. 조회 실패의 빈 응답을
+    '없음'으로 믿으면 실제 보유분을 전부 유령으로 오판한다(8050 IP 장애일 같은 날).
+    성공 응답엔 return_code 와 보유목록 키가 항상 있다(빈 계좌라도 빈 리스트).
+    """
+    d = await _kiwoom_call("portfolio-domain", PORTFOLIO_URL, "evaluation", {})
+    if not isinstance(d, dict) or str(d.get("return_code")) != "0" or "stk_acnt_evlt_prst" not in d:
+        return None
+    return _parse_holdings(d)
+
+
+def _parse_sell_orders(payload: Any, symbol: str,
+                       since_hhmmss: str = "000000") -> tuple[int, int, float] | None:
+    """체결내역(get_order_executions, ka10076) → 이 종목 **매도** 주문의 (주문수량, 체결수량, 평균체결가).
+
+    응답이 이상하면(파싱 불가·success=false·return_code≠0) **None** — '주문 없음'과 구분한다.
+    since_hhmmss 이후 주문만 센다(당일 앞선 다른 주문을 이번 것으로 오인하지 않게).
+    취소·정정·거부 주문은 뺀다. 체결가는 체결수량 가중 평균(체결 0 이면 0.0).
+    2026-09-30 응답 불명 매도 확인용(_confirm_unknown_sell).
+    """
+    try:
+        p = json.loads(payload) if isinstance(payload, str) else payload
+    except Exception:
+        return None
+    if not isinstance(p, dict) or p.get("success") is False:
+        return None
+    d = p.get("data", p)
+    if not isinstance(d, dict) or str(d.get("return_code", "0")) != "0":
+        return None
+    rows = d.get("cntr")
+    if not isinstance(rows, list):
+        return None
+    ordered = filled = 0
+    amount = 0.0
+    for r in rows:
+        if not isinstance(r, dict) or str(r.get("stk_cd", "")).lstrip("A") != symbol:
+            continue
+        side, status = str(r.get("io_tp_nm", "")), str(r.get("ord_stt", ""))
+        if "매도" not in side or any(x in side + status for x in ("취소", "정정", "거부")):
+            continue
+        if str(r.get("ord_tm", "")).zfill(6) < since_hhmmss:
+            continue
+        cq = abs(_kint(r.get("cntr_qty", 0)))
+        ordered += abs(_kint(r.get("ord_qty", 0)))
+        filled += cq
+        amount += cq * _num(r, "cntr_pric", abs_val=True)
+    return ordered, filled, (amount / filled if filled else 0.0)
 
 
 async def _account_equity() -> tuple[float, float]:

@@ -45,7 +45,8 @@ from trend_config import (                  # noqa: E402  env·상수·logger·C
     _ROOT, logger, setup_daemon_runtime,
 )
 from trend_kiwoom_io import (               # noqa: E402
-    _account_equity, _broker_holdings, _cur_and_open, _foreign_net_5d,
+    _account_equity, _broker_holdings, _broker_holdings_checked, _cur_and_open, _foreign_net_5d,
+    _parse_sell_orders,
     _is_unknown, _order_accepted, _place, _premarket_snapshot, _realtime_price, _sector_index_rows,
     get_universe, kospi_closes as _kospi_closes,
 )
@@ -53,7 +54,7 @@ from shadow_ledger import record as shadow_record  # noqa: E402  차단 후보 �
 from trend_journal import write_daily_journal      # noqa: E402  일별 매매일지 md(보고 계층)
 from trend_runtime import (                        # noqa: E402  알림·상태·락·이벤트(인프라 계층)
     StateCorrupted, acquire_lock, get_state, journal_append, journal_note, load_state,
-    log_event, notify, release_lock, save_state,
+    log_event, notify, read_journal, release_lock, save_state,
 )
 from src.mcp_servers.trend_mcp.market_data import get_ohlcv, same_issuer  # noqa: E402
 
@@ -68,6 +69,57 @@ from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
 # 설정·상수·CFG·paths·logger·SCHEDULE 는 trend_config 로 이동 (import * 로 노출)
 
 
+LEDGER_ORPHAN_LOOKBACK_DAYS = 7    # 이 기간 안에 봇이 청산 기록한 종목만 '고아'로 본다
+
+
+async def _check_ledger_vs_broker() -> None:
+    """장부(state) ↔ 실제 계좌 대조 — **알림만** 한다. 장부를 자동으로 고치지 않는다(2026-09-30).
+
+    유령: 장부엔 있는데 계좌에 없다(또는 수량이 적다). 09-30 삼성E&A — 응답 불명 매도가 실제로
+          체결됐는데 state 에 3주가 남았다. 그대로 두면 없는 주식을 또 팔려 하고 첫 청산이 기록에서 빠진다.
+    고아: 최근 봇이 청산으로 기록했는데 계좌에 남아 있다 — 실제로는 안 팔렸다. 손절 관리 밖의 보유다.
+          봇 기록이 없는 보유분은 HTS 수동 매수라 알리지 않는다(ADOPT_MODE=off 의 존재 이유).
+
+    자동 수정하지 않는 이유: 조회 장애일에 빈 응답을 믿으면 실제 보유분을 버리게 된다. 그래서
+    조회 실패(None)면 판단 자체를 건너뛴다. 같은 날 같은 불일치는 한 번만 알린다(하루 두 번 돈다).
+    """
+    holdings = await _broker_holdings_checked()
+    if holdings is None:
+        logger.warning("[LEDGER] 계좌 조회 실패/불완전 — 장부 대조 건너뜀")
+        return
+    broker = {h["symbol"]: h for h in holdings}
+    mine = {p["symbol"]: p for p in get_state("positions", [])}
+    since = (datetime.now() - timedelta(days=LEDGER_ORPHAN_LOOKBACK_DAYS)).isoformat(timespec="seconds")
+    recently_closed = {str(r.get("symbol")) for r in read_journal()
+                       if r.get("type") == "exit" and str(r.get("ts", "")) >= since}
+    found = []
+    for sym, p in mine.items():
+        bq = int(broker.get(sym, {}).get("qty", 0))
+        if bq < int(p["qty"]):
+            found.append(("ghost", sym, p.get("name", sym),
+                          f"🚨 <b>장부 불일치 — 계좌에 없음</b> {p.get('name', sym)}({sym}) "
+                          f"장부 {p['qty']}주 · 계좌 {bq}주\n"
+                          "응답 불명 매도가 실제로 체결됐거나 HTS 에서 직접 팔았을 수 있습니다.\n"
+                          "→ 자동 수정하지 않습니다. HTS 체결내역 확인 후 장부 정정 필요"
+                          "(그대로 두면 봇이 없는 주식을 매도 시도)"))
+    for sym, h in broker.items():
+        if sym not in mine and sym in recently_closed:
+            found.append(("orphan", sym, h.get("name", sym),
+                          f"🚨 <b>장부 불일치 — 청산 기록됐는데 계좌에 남음</b> {h.get('name', sym)}({sym}) "
+                          f"{h['qty']}주\n매도가 실제로는 체결되지 않았을 수 있습니다 — 이 보유분은 "
+                          "손절·청산 관리 밖입니다.\n→ HTS 확인 후 수동 대응"))
+    for kind, sym, name, msg in found:
+        key = f"ledger!{kind}:{sym}"
+        if _marked_today(key):
+            continue
+        _mark_done(key)
+        log_event("ledger_mismatch", {"kind": kind, "symbol": sym, "name": name,
+                                      "state_qty": int(mine.get(sym, {}).get("qty", 0)),
+                                      "broker_qty": int(broker.get(sym, {}).get("qty", 0))})
+        logger.error("[LEDGER] %s %s(%s) — 장부↔계좌 불일치", kind, name, sym)
+        await notify(msg, critical=True)
+
+
 async def phase_reconcile() -> None:
     """계좌 보유분 중 데몬 미추적분을 추세 청산규칙 관리 대상으로 편입(adopt).
 
@@ -78,6 +130,12 @@ async def phase_reconcile() -> None:
     실전에선 HTS 수동매수/장기보유분이 trend 청산룰로 강제처분되지 않도록 off/watchlist 권장.
     """
     log_event("phase_start", {"phase": "reconcile", "adopt_mode": ADOPT_MODE})
+    # 장부 대조는 ADOPT_MODE 와 무관하게 돈다(2026-09-30) — off 일 때 reconcile 이 계좌를 아예
+    # 안 봐서 유령 포지션이 방치됐다. 알림 기능이 청산 phase 를 막으면 안 되므로 예외는 삼킨다.
+    try:
+        await _check_ledger_vs_broker()
+    except Exception as e:
+        logger.warning("[LEDGER] 장부 대조 실패(무시): %s", str(e)[:120])
     if ADOPT_MODE == "off":
         logger.info("[RECONCILE] ADOPT_MODE=off — broker 보유분 편입 생략")
         return
@@ -531,6 +589,52 @@ async def _confirm_unknown_buy(sym: str, want_qty: int) -> tuple[float, float]:
     await notify(f"🚨 <b>체결 확인 불가</b> {sym} {want_qty}주 — 주문 응답도 잔고 조회도 실패\n"
                  f"→ HTS 로 보유 여부 직접 확인 필요(미추적 보유 가능성)", critical=True)
     return 0.0, 0.0
+
+
+# 응답 불명 매도의 접수 확인 (2026-09-30) — 봇이 포기한 15:20:29 의 3초 뒤에야 증권사에 등록됐다.
+UNKNOWN_SELL_POLLS = 4             # 체결내역 조회 횟수
+UNKNOWN_SELL_POLL_SEC = 10.0       # 조회 간격 — 합계 ~40초. 등록 지연을 기다린다
+UNKNOWN_SELL_SLACK_SEC = 120       # 주문시각 비교 여유(PC↔증권사 시계차 · 등록 지연)
+
+
+async def _confirm_unknown_sell(mcp, sym: str, sell_qty: int,
+                                sent_at: datetime) -> tuple[str, float | None, int]:
+    """응답 불명 매도가 실제로 **증권사에 접수됐는지** 주문·체결내역으로 확인 → (판정, 체결가, 수량).
+
+    판정:
+      filled     체결 확인 — 실제 체결가를 돌려준다
+      accepted   접수됐으나 미체결 — 15:20~15:30 종가 동시호가면 정상(15:30 에 체결된다)
+      absent     조회는 됐는데 이번 주문이 끝까지 안 보인다 — 미접수로 판단
+      unverified 조회 자체가 실패 — 모른다
+
+    **재전송하지 않는다.** 사실만 확인한다. 잔고(`_broker_holdings`)는 근거로 쓰지 않는다 —
+    조회 실패도 빈 리스트라 '팔림'과 구분이 안 되고, 동시호가 중엔 체결 전이라 잔고가 그대로다.
+    가정: 봇은 한 종목을 하루에 한 번만 판다(1종목 1진입 · 부분익절 제거) — sent_at 기준
+    SLACK 이전 주문은 이번 것이 아니다.
+    """
+    since = (sent_at - timedelta(seconds=UNKNOWN_SELL_SLACK_SEC)).strftime("%H%M%S")
+    day = sent_at.strftime("%Y%m%d")
+    seen = False
+    for attempt in range(UNKNOWN_SELL_POLLS):
+        await asyncio.sleep(UNKNOWN_SELL_POLL_SEC)
+        try:
+            raw = await mcp.call_tool("get_order_executions",
+                                      {"account_no": ACCOUNT_NO, "start_date": day, "end_date": day})
+        except Exception as e:
+            logger.warning("[ORDER] %s 체결내역 조회 실패 %d/%d: %s", sym, attempt + 1, UNKNOWN_SELL_POLLS, e)
+            continue
+        got = _parse_sell_orders(raw, sym, since)
+        if got is None:
+            logger.warning("[ORDER] %s 체결내역 응답 이상 %d/%d", sym, attempt + 1, UNKNOWN_SELL_POLLS)
+            continue
+        seen = True
+        ordered, filled, avg = got
+        if filled >= sell_qty:
+            return "filled", avg, filled
+        if ordered >= sell_qty:
+            return "accepted", None, ordered
+        # 아직 안 보일 수 있다(등록 지연) — 다시 본다
+    return ("absent" if seen else "unverified"), None, 0
 
 
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
@@ -1209,14 +1313,36 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             ma_ref=sig.get("ma_ref"), exits=EXITS)
         if not action:
             remaining.append(pos); return
+        sent_at = datetime.now()
         resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
+        confirmed_fill = None
+        advice = "→ HTS 수동매도 검토"
+        if not ok and _is_unknown(resp):
+            # ★ 2026-09-30 삼성E&A: 응답이 10초를 넘겨 '거부'로 처리했는데 실제로는 접수·체결됐다
+            #   (봇 포기 15:20:29 → 증권사 등록 15:20:32 → 15:30 동시호가 체결). state 에 유령 3주가
+            #   남았고 텔레그램엔 '매도 거부 → 수동매도 검토'가 갔다. 매수엔 있던 회수 경로
+            #   (_confirm_unknown_buy)가 매도엔 없었다. 재전송은 여전히 안 한다 — 사실만 확인한다.
+            verdict, px, _n = await _confirm_unknown_sell(mcp, sym, sell_qty, sent_at)
+            log_event("sell_unknown_resolved", {"phase": when, "symbol": sym, "qty": sell_qty,
+                                                "verdict": verdict, "fill": px})
+            if verdict in ("filled", "accepted"):
+                ok = True
+                confirmed_fill = px if verdict == "filled" else None
+                reason = f"{reason} [응답 불명 → 증권사 {'체결' if verdict == 'filled' else '접수'} 확인]"
+                logger.warning("[ORDER] %s %s 응답 불명 → 증권사 내역에서 %s 확인 — 청산 처리",
+                               when, sym, verdict)
+            else:
+                why = f"{why} · 증권사 내역: {'주문 없음(미접수 판단)' if verdict == 'absent' else '조회 실패'}"
+                # 이미 팔렸을 수 있는데 '수동매도'를 권하면 이중매도를 부추긴다.
+                advice = ("→ 미접수로 판단 — 다음 cycle 재판정" if verdict == "absent"
+                          else "→ <b>재매도 전에</b> HTS 주문내역부터 확인(이미 팔렸을 수 있음)")
         if not ok:
             logger.error("[REJECT] %s %s 매도 거부 (재시도 후에도 실패) — %s", when, sym, why)
             log_event("order_reject", {"phase": when, "symbol": sym, "qty": sell_qty,
                                        "reason": reason, "why": why, "raw": resp})
             # 매도 거부는 시장 노출 직결 → critical alert (개별 알림)
             await notify(f"🚨 <b>매도 거부</b> [{when}] {pos['name']}({sym}) {sell_qty}주 "
-                         f"@{cur:,.0f} 사유:{reason}\n원인:{why}\n→ HTS 수동매도 검토",
+                         f"@{cur:,.0f} 사유:{reason}\n원인:{why}\n{advice}",
                          critical=True)
             sell_failures.append({"symbol": sym, "name": pos["name"], "qty": sell_qty,
                                   "reason": reason, "why": why})
@@ -1225,7 +1351,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
         # 시장가 주문은 그 뒤 종가 근처에서 체결되므로 둘이 다르다(2026-08-25 KB금융:
         # 판정 164,900 / 체결 166,400 → net -1.98% 로 기록됐으나 실제는 -1.09%).
         # 사유 문자열에는 판정 근거가 된 가격이 그대로 남아 있어 대조 가능하다.
-        fill = _fill_price(resp, cur)
+        fill = confirmed_fill or _fill_price(resp, cur)   # 증권사 체결내역 가격이 있으면 그것을
         pnl_pct = round((fill - entry) / entry * 100, 2)
         if action == "PARTIAL":
             pos["partial_done"] = True; pos["qty"] = qty - sell_qty

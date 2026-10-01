@@ -65,6 +65,26 @@ def test_exit_row_shape():
     assert "MA120" in row["매매이유"]
 
 
+def test_exit_row_carries_entry_date_and_holding_days():
+    """★ 매도 행엔 원진입일·보유기간이 필수(2026-06-19 회고 — 한 행에서 보유기간을 봐야 한다).
+
+    진입이 창 밖(오래전)이어도 전체 기록에서 찾아 붙인다.
+    """
+    recs = [_entry(ts="2026-07-31T09:31:00"),
+            {**_exit(49850.0, 3, -4.74), "hold_days": 61}]
+    row = [r for r in N.notion_rows(recs, "2026-09-24") if r["매매구분"] == "매도"][0]
+    assert row["매수일자"] == "2026-07-31" and row["매도일자"] == "2026-09-30"
+    assert row["보유기간(일)"] == 61
+
+
+def test_sell_month_is_the_sell_date_not_the_buy_date():
+    """매도 행에 매수일자가 붙어도 결산 대상월은 매도일 기준이다."""
+    recs = [_entry(ts="2026-08-28T11:00:00"), {**_exit(49850.0, 3, -4.74, ts="2026-10-01T15:20:00"),
+                                               "hold_days": 34}]
+    p = N.build_payload(recs, datetime(2026, 10, 2, 16, 10))
+    assert p["months"] == ["2026-10"], "매도 행의 매수일자로 지난달을 결산 대상에 넣었다"
+
+
 def test_only_entries_and_exits_since_window():
     recs = [_entry(ts="2026-09-20T11:00:00"),                      # 창 밖
             _entry(sym="003490", name="대한항공", px=31400.0, qty=6),  # 창 안

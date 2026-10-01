@@ -48,8 +48,11 @@ def notion_rows(records: list[dict], since: str) -> list[dict]:
       총체결금액 = 체결단가 × 수량
       실현손익   = 진입금액(진입가 × 수량) × net% — 비용 반영. 예) 삼성E&A 149,550 × -4.74% = -7,089
     청산 기록은 증권사 체결가로 정정된 값(corrected)이 이미 반영돼 있다 — 그대로 쓴다.
+    매도 행엔 원진입일(`매수일자`)·`보유기간(일)`을 붙인다(2026-06-19 회고: 한 행에서 보유기간을
+    봐야 한다). 진입이 창 밖이어도 records 전체에서 거래 id 로 찾는다.
     부분익절·피라미딩·메모는 넣지 않는다(현 구성에서 꺼져 있다).
     """
+    entry_day = {str(r.get("id")): str(r.get("ts", ""))[:10] for r in records if r.get("type") == "entry"}
     rows: list[dict] = []
     for r in records:
         kind, day = r.get("type"), str(r.get("ts", ""))[:10]
@@ -69,17 +72,27 @@ def notion_rows(records: list[dict], since: str) -> list[dict]:
                          "매매이유": "🤖 추세추종 신규 진입" + (f" ({detail})" if detail else "")})
         else:
             px, net = float(r["exit_price"]), float(r["net_pct"])
-            rows.append({"key": f"{sym}|매도|{day}", "종목명": name, "매매구분": "매도", "매도일자": day,
-                         "체결단가": round(px), "체결수량": qty, "총체결금액": round(px * qty),
-                         "실현손익": round(float(r["entry_price"]) * qty * net / 100), "수익률(%)": net,
-                         "매매이유": f"🤖 추세추종 청산 — {r.get('reason', '')}".rstrip(" —")})
+            row = {"key": f"{sym}|매도|{day}", "종목명": name, "매매구분": "매도", "매도일자": day,
+                   "체결단가": round(px), "체결수량": qty, "총체결금액": round(px * qty),
+                   "실현손익": round(float(r["entry_price"]) * qty * net / 100), "수익률(%)": net,
+                   "매매이유": f"🤖 추세추종 청산 — {r.get('reason', '')}".rstrip(" —")}
+            if entry_day.get(str(r.get("id"))):
+                row["매수일자"] = entry_day[str(r.get("id"))]
+            if r.get("hold_days") is not None:
+                row["보유기간(일)"] = int(r["hold_days"])
+            rows.append(row)
     return rows
+
+
+def _trade_month(row: dict) -> str:
+    """결산 대상월 — 매도 행은 **매도일** 기준(매수일자가 함께 붙어 있어도)."""
+    return (row["매도일자"] if row["매매구분"] == "매도" else row["매수일자"])[:7]
 
 
 def build_payload(records: list[dict], today: datetime, lookback: int = LOOKBACK_DAYS) -> dict:
     since = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
     rows = notion_rows(records, since)
-    months = sorted({(r.get("매수일자") or r.get("매도일자"))[:7] for r in rows} | {today.strftime("%Y-%m")})
+    months = sorted({_trade_month(r) for r in rows} | {today.strftime("%Y-%m")})
     return {"generated_at": today.isoformat(timespec="seconds"), "since": since,
             "lookback_days": lookback, "months": months, "rows": rows}
 

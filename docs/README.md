@@ -15,6 +15,7 @@
 | 6 | [2026-08-28-adoption.md](2026-08-28-adoption.md) | 채택 구성 적용 · 라이브 재개 · 실계좌 예탁금 재검증 |
 
 | 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
+| 8 | [2026-10-12-strategy-review.md](2026-10-12-strategy-review.md) | 전략 타당성 점검 — 월별·금리 국면·FOMC·켈리·구루 원칙 비교(설명용, 채택 아님) |
 
 부수: [2026-08-28-rs-definition-ab.md](2026-08-28-rs-definition-ab.md)(RS 정의 A/B — 막다른 길),
 [trend_follow_strategy.md](trend_follow_strategy.md)(전략 상세),

@@ -38,6 +38,12 @@ class TrendConfig:
     # A/B(2025-01~2026-08, 라이브 미러): 하한없음 +3.09%/PF1.77 → MA20이상 +3.62%/PF1.99.
     # ※ 0.0 과 None 을 구분해야 한다 — 0.0 은 '딱 MA20 이상', None 이 '검사 안 함'이다.
     pullback_min_pct: float | None = None
+    # 진입 타점(2026-10-12 추가 — docs/2026-10-12-breakout-entry-declaration.md, 측정 전 선언).
+    #   pullback   : MA20 ≤ 가격 ≤ MA20×(1+pullback_pct%) — 현행(채택)
+    #   breakout20 : 종가 > 직전 20일 최고가(터틀 S1 · Donchian) — 눌림 밴드 없음
+    #   breakout55 : 종가 > 직전 55일 최고가(터틀 S2)
+    # 추세(MA60·MA120)·RS·거래량 게이트는 모든 모드 공통 — **타점만** 바꾼다.
+    entry_mode: str = "pullback"
     rs_days: int = 60               # 상대강도 비교 기간
     vol_mult: float = 2.0           # 거래량 ≥ 20일평균 × vol_mult
     body_pct: float = 4.0           # 장대양봉 몸통 % (gainers)
@@ -50,6 +56,16 @@ class TrendConfig:
     rr: float = 3.0                 # 손익비(목표 = 손절폭 × rr)
     partial_pct: float = 30.0       # 첫 목표 도달 시 일부 익절 비율(%) — 나머지는 트레일
     max_hold: int = 60              # 백테스트 보유 상한(영업일) — 추세 안 끝나도 강제 마감
+
+    def __post_init__(self) -> None:
+        # 모르는 모드를 조용히 눌림으로 처리하면 '돌파를 검증했다'는 결과가 실제론 눌림의 것이 된다.
+        if self.entry_mode not in ENTRY_MODES:
+            raise ValueError(f"entry_mode={self.entry_mode!r} — {ENTRY_MODES} 중 하나여야 한다")
+
+
+# 진입 타점 → 돌파 기준 기간(pullback 은 기간 없음). TrendConfig.entry_mode 의 허용값.
+BREAKOUT_DAYS = {"breakout20": 20, "breakout55": 55}
+ENTRY_MODES = ("pullback", *BREAKOUT_DAYS)
 
 
 # ─── 지표 헬퍼 ──────────────────────────────────────────────────────────────
@@ -295,6 +311,18 @@ def is_consolidation(ohlcv: list[dict], lookback: int, max_range_pct: float) -> 
     return (hi - lo) / lo * 100.0 <= max_range_pct
 
 
+def donchian_breakout(ohlcv: list[dict], days: int) -> bool:
+    """종가 > 직전 days 봉의 최고가(당일 제외). 터틀 S1(20)·S2(55)의 종가 확정판.
+
+    터틀은 장중에 그 가격을 '찍는 순간' 샀지만, 이 시스템은 종가로 신호를 보고 다음 날 사므로
+    종가 돌파만 센다. 당일 고가를 창에 넣으면 종가가 자기 고가를 넘을 수 없어 영원히 False 다.
+    """
+    if days < 1 or len(ohlcv) < days + 1:
+        return False
+    prior_high = max(_g(d, "high") for d in ohlcv[-days - 1:-1])
+    return prior_high > 0 and _g(ohlcv[-1], "close") > prior_high
+
+
 def volume_surge_ok(ohlcv: list[dict], mult: float) -> bool:
     if len(ohlcv) < 21:
         return False
@@ -401,10 +429,16 @@ def entry_signal(
         gates["price>MA60"] = ma_f is not None and price > ma_f
         gates["price>MA120"] = ma_w is not None and price > ma_w
         gates["RS>0"] = rs_pass if rs_pass is not None else (relative_strength(closes, kospi_closes, cfg.rs_days) > 0)
-        gates["pullback"] = (ma_p is not None
-                             and price <= ma_p * (1 + cfg.pullback_pct / 100.0)
-                             and (cfg.pullback_min_pct is None
-                                  or price >= ma_p * (1 - cfg.pullback_min_pct / 100.0)))
+        if cfg.entry_mode == "pullback":
+            gates["pullback"] = (ma_p is not None
+                                 and price <= ma_p * (1 + cfg.pullback_pct / 100.0)
+                                 and (cfg.pullback_min_pct is None
+                                      or price >= ma_p * (1 - cfg.pullback_min_pct / 100.0)))
+        elif cfg.entry_mode in BREAKOUT_DAYS:
+            n = BREAKOUT_DAYS[cfg.entry_mode]
+            gates[f"breakout{n}"] = donchian_breakout(ohlcv, n)
+        else:   # 생성 후 속성 대입은 __post_init__ 검사를 우회한다 — 여기서 다시 막는다
+            raise ValueError(f"entry_mode={cfg.entry_mode!r} — {ENTRY_MODES} 중 하나여야 한다")
         gates["vol_up"] = volume_surge_ok(ohlcv, 1.0)
 
     passed = all(gates.values())

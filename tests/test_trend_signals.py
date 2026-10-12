@@ -5,6 +5,7 @@ from src.mcp_servers.trend_mcp.signals import (
     TrendConfig,
     atr,
     classify_zone,
+    donchian_breakout,
     levels,
     entry_signal,
     exit_decision,
@@ -97,6 +98,67 @@ def test_entry_largecap_fail_downtrend():
 def test_entry_insufficient_data():
     sig = entry_signal(_rising(30), [100.0] * 30, TrendConfig(mode="largecap"))
     assert sig.passed is False and "데이터 부족" in sig.reason
+
+
+# ── 진입 타점: 눌림 vs 돌파 (2026-10-12) ─────────────────────────────────────
+
+def _flat_then(last_close, n=130, base=100.0, v_last=2000):
+    """완만한 상승 뒤 마지막 봉만 last_close. 거래량은 마지막 봉이 평균 이상."""
+    bars = _rising(n - 1, base, base * 1.3)
+    bars.append(_bar(last_close - 0.1, last_close + 0.1, last_close - 0.2, last_close, v=v_last))
+    return bars
+
+
+def test_donchian_breakout_excludes_today_high():
+    """★ 당일 고가를 창에 넣으면 종가가 자기 고가를 못 넘어 영원히 False — 당일 제외를 잠근다."""
+    bars = [_bar(100, 101, 99, 100) for _ in range(20)] + [_bar(100, 103, 100, 102)]
+    assert donchian_breakout(bars, 20) is True          # 102 > 직전 20일 고가 101
+    bars[-1] = _bar(100, 102, 100, 101)                  # 종가 = 직전 고가 → 돌파 아님
+    assert donchian_breakout(bars, 20) is False
+
+
+def test_donchian_breakout_needs_enough_bars():
+    assert donchian_breakout([_bar(100, 101, 99, 100)] * 20, 20) is False
+
+
+def test_breakout_mode_buys_extended_stock_pullback_rejects():
+    """MA20 +12% 밖으로 치솟은 신고가 — 눌림은 거절(추격 금지), 돌파는 진입."""
+    ohlcv, kospi = _flat_then(150.0), [100.0] * 130
+    assert entry_signal(ohlcv, kospi, TrendConfig(mode="largecap", pullback_pct=12)).passed is False
+    sig = entry_signal(ohlcv, kospi, TrendConfig(mode="largecap", entry_mode="breakout20"))
+    assert sig.passed is True, sig.gates
+    assert "pullback" not in sig.gates and sig.gates["breakout20"] is True
+
+
+def test_pullback_inside_band_is_not_a_breakout():
+    """직전 고가 아래의 눌림 — 눌림은 진입, 돌파는 거절."""
+    ohlcv, kospi = _flat_then(127.0), [100.0] * 130      # 직전 고가 ~130.1 아래, MA20 근처
+    assert entry_signal(ohlcv, kospi, TrendConfig(mode="largecap", pullback_pct=12)).passed is True
+    assert entry_signal(ohlcv, kospi, TrendConfig(mode="largecap", entry_mode="breakout20")).passed is False
+
+
+def test_breakout_keeps_trend_and_rs_gates():
+    """돌파는 **타점만** 바꾼다 — 하락 추세에서 반등 돌파해도 MA·RS 게이트가 막아야 한다."""
+    bars = _rising(129, 130, 100)
+    bars.append(_bar(104, 106, 103, 105, v=5000))      # 직전 20일 고가 위 종가, 그러나 MA120 아래
+    sig = entry_signal(bars, [100.0] * 130, TrendConfig(mode="largecap", entry_mode="breakout20"))
+    assert sig.gates["breakout20"] is True
+    assert sig.passed is False and sig.gates["price>MA120"] is False
+
+
+def test_default_entry_mode_is_pullback():
+    """기본값이 바뀌면 라이브 진입이 조용히 바뀐다."""
+    assert TrendConfig().entry_mode == "pullback"
+
+
+def test_unknown_entry_mode_is_rejected():
+    """★ 모르는 모드를 눌림으로 처리하면 '돌파를 검증했다'가 거짓이 된다 — 두 경로 모두 막는다."""
+    with pytest.raises(ValueError):
+        TrendConfig(entry_mode="breakout30")
+    cfg = TrendConfig(mode="largecap")
+    cfg.entry_mode = "breakout30"                        # 생성 후 대입은 __post_init__ 우회
+    with pytest.raises(ValueError):
+        entry_signal(_rising(130), [100.0] * 130, cfg)
 
 
 # ── 청산 신호 ───────────────────────────────────────────────────────────────

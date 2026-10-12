@@ -281,6 +281,102 @@ def test_exposure_default_is_full():
     assert W.EXPOSURE == 1.0
 
 
+# ─── 진입 타점 A/B (2026-10-12 선언) ──────────────────────────────────────────
+def test_entry_ab_baseline_is_the_live_grid():
+    """★ 기준점 A 가 GRID 와 다르면 '현행보다 낫다'의 기준이 현행이 아니게 된다."""
+    assert W.ENTRY_PROCEDURES[W.ENTRY_BASELINE] is W.GRID
+    assert all(c.entry == "pullback" for c in W.GRID), "GRID 에 돌파가 섞였다 — 연간 재선택이 바뀐다"
+
+
+def test_entry_ab_breakout_menus_change_only_the_entry():
+    """돌파 메뉴는 GRID 의 청산·슬롯을 그대로 복제하고 진입만 바꿔야 한다(다른 변수 고정)."""
+    for menu, mode in ((W.GRID_B20, "breakout20"), (W.GRID_B55, "breakout55")):
+        assert len(menu) == len(W.GRID)
+        for base, c in zip(W.GRID, menu):
+            assert c.entry == mode
+            assert (c.exits, c.max_pos, c.position_pct, c.exit_ma, c.hard_stop, c.max_hold) == \
+                   (base.exits, base.max_pos, base.position_pct, base.exit_ma, base.hard_stop, base.max_hold)
+
+
+def test_entry_ab_menu_b_is_union_and_labels_unique():
+    b = W.ENTRY_PROCEDURES["B"]
+    assert set(b) == set(W.GRID) | set(W.GRID_B20) | set(W.GRID_B55)
+    labels = [c.label for c in b]
+    assert len(labels) == len(set(labels)), "라벨 중복 — 절차별 선택 집계가 어긋난다"
+
+
+def test_candidate_entry_reaches_the_simulator_config():
+    """★ Candidate.entry 가 TrendConfig 까지 전달되지 않으면 '돌파' 4개 절차가 전부 눌림을 잰다."""
+    assert W._cfg(W.GRID_B20[0]).entry_mode == "breakout20"
+    assert W._cfg(W.GRID_B55[0]).entry_mode == "breakout55"
+    assert W._cfg(W.GRID[0]).entry_mode == "pullback"
+
+
+def test_select_accepts_procedure_grid():
+    """B 메뉴의 후보는 GRID 에 없다 — 선택이 GRID.index 로 터지면 안 되고, 동점은 그 메뉴 순서."""
+    b = W.ENTRY_PROCEDURES["B"]
+    x, y = b[-1], b[0]
+    assert W.select([(x, {"n": 5, "mar": 0.9}), (y, {"n": 5, "mar": 0.1})], "mar", b)[0] is x
+    assert W.select([(x, {"n": 5, "mar": 0.5}), (y, {"n": 5, "mar": 0.5})], "mar", b)[0] is y
+
+
+def test_entry_ab_criteria_are_declared_constants():
+    """★ 측정 전 선언값 — 바뀌면 git 이력에 남는다."""
+    assert (W.ENTRY_MAR_MARGIN, W.ENTRY_MDD_SLACK_PP, W.ENTRY_MIN_FOLD_WIN_RATIO) == (0.10, 3.0, 0.60)
+
+
+_BENCH = {"mdd": 45.0, "mar": 0.58}
+_BASE = {"mdd": 18.0, "mar": 0.96, "wins": 7}
+_BASE_FOLDS = [10.0, 20.0, -5.0, 30.0, 15.0, 5.0, 25.0, 12.0]
+
+
+def _good_challenger():
+    return {"mdd": 19.0, "mar": 1.10, "wins": 7}, [f + 2.0 for f in _BASE_FOLDS]
+
+
+def test_judge_entry_passes_a_clear_improvement():
+    chal, folds = _good_challenger()
+    rows = W.judge_entry(_BASE, chal, _BENCH, _BASE_FOLDS, folds)
+    assert all(ok for _, ok, _ in rows), rows
+
+
+@pytest.mark.parametrize("breaker, failed", [
+    (lambda c, f: (dict(c, mar=1.05), f), "② MAR 개선"),              # 개선 폭 0.09 < 0.10
+    (lambda c, f: (dict(c, mdd=21.5), f), "③ MDD 상한"),              # 18 + 3 초과
+    (lambda c, f: (c, [b + (2.0 if i < 4 else -1.0) for i, b in enumerate(_BASE_FOLDS)]), "④ 폴드 우위"),
+    (lambda c, f: (dict(c, mdd=23.0, mar=1.10), f), "① 절대 기준"),   # 벤치 MDD 절반(22.5) 초과
+    (lambda c, f: (dict(c, wins=4), f), "① 절대 기준"),               # 플러스 4/8 < 60%
+])
+def test_judge_entry_each_criterion_actually_fails(breaker, failed):
+    """★ 규칙 3 — 기준을 하나씩 **일부러 깨뜨려** 그 기준이 실제로 떨어지는지 확인한다."""
+    chal, folds = breaker(*_good_challenger())
+    rows = {name: ok for name, ok, _ in W.judge_entry(_BASE, chal, _BENCH, _BASE_FOLDS, folds)}
+    assert rows[failed] is False, rows
+
+
+def test_judge_entry_fold_win_requires_strictly_better():
+    """A 와 같은 수익인 폴드는 '나은 폴드'가 아니다."""
+    chal, _ = _good_challenger()
+    rows = {n: ok for n, ok, _ in W.judge_entry(_BASE, chal, _BENCH, _BASE_FOLDS, list(_BASE_FOLDS))}
+    assert rows["④ 폴드 우위"] is False
+
+
+def test_judge_entry_rejects_mismatched_folds():
+    chal, folds = _good_challenger()
+    with pytest.raises(ValueError):
+        W.judge_entry(_BASE, chal, _BENCH, _BASE_FOLDS, folds[:-1])
+
+
+def test_curve_stats_matches_summary_math():
+    """_entry_ab 의 지표가 기존 _summary 와 같은 공식이어야 A 가 독립 실행과 같은 숫자가 된다."""
+    curve = [100.0, 150.0, 75.0, 200.0]
+    s = W._curve_stats(curve, 504)
+    assert s["mdd"] == pytest.approx(W._mdd(curve))
+    assert s["cagr"] == pytest.approx(W._cagr(curve, 504))
+    assert s["mar"] == pytest.approx(s["cagr"] / s["mdd"])
+    assert s["total"] == pytest.approx(100.0)
+
+
 # ─── 하니스 기본값이 안전한 쪽인가 (2026-08-28 리팩터) ────────────────────────
 def test_pit_universe_is_default_on():
     """★ 생존편향은 +0.4~0.6%p 로 **측정된** 값이다. 기본이 편향된 쪽이면 안 된다."""

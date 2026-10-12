@@ -37,8 +37,9 @@ in-sample 최적값은 "그 구간에서 뭐가 좋았나"를 말할 뿐, "다�
 from __future__ import annotations
 
 import argparse
+import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -102,6 +103,7 @@ class Candidate:
     exit_ma: int = 120
     hard_stop: float = 10.0
     max_hold: int = 60
+    entry: str = "pullback"          # TrendConfig.entry_mode — 진입 타점 A/B(2026-10-12)
 
 
 GRID: tuple[Candidate, ...] = (
@@ -117,10 +119,11 @@ GRID: tuple[Candidate, ...] = (
 )
 
 
-def select(scored: list[tuple[Candidate, dict]], metric: str) -> tuple[Candidate, dict]:
+def select(scored: list[tuple[Candidate, dict]], metric: str,
+           grid: tuple[Candidate, ...] = GRID) -> tuple[Candidate, dict]:
     """학습구간 성적으로 후보 하나를 **기계적으로** 고른다.
 
-    사람이 개입하지 않는다는 것이 요점이다. 동점이면 GRID 순서(= 사전 선언 순서)를 따르므로
+    사람이 개입하지 않는다는 것이 요점이다. 동점이면 grid 순서(= 사전 선언 순서)를 따르므로
     결과가 재현 가능하다. 학습구간에서 전부 손실이어도 규칙대로 '가장 덜 나쁜' 것을 고른다 —
     실제 운용에서 그 시점에 할 수 있는 판단이 그것뿐이기 때문이다.
     """
@@ -131,8 +134,82 @@ def select(scored: list[tuple[Candidate, dict]], metric: str) -> tuple[Candidate
         v = m.get(metric)
         if v is None or v != v or v in (float("inf"), float("-inf")):
             v = -1e17
-        return (v, -GRID.index(cand))
+        return (v, -grid.index(cand))
     return max(scored, key=key)
+
+
+# ── 진입 타점 A/B — **결과를 보기 전에 선언한다** (2026-10-12) ──────────────────
+#
+# 질문: 눌림(MA20~+12%) 대신 구루 다수가 쓰는 **돌파**로 사면 나은가.
+# 근거 문서: docs/2026-10-12-breakout-entry-declaration.md
+#
+# 측정 전 사실(성과 미열람): 현행 진입 3,161건 중 28.2% 가 이미 20일 고가 돌파일,
+# 57.5% 가 20일 고가 3% 이내였다 — 이름만큼 다른 규칙이 아니다.
+#
+# 절차 4개를 **같은 실행에서** 잰다. 각 절차는 자기 메뉴에서 매년 학습구간으로 하나를 고른다.
+#   A   현행 — GRID(눌림 7종). 기준점
+#   B   메뉴 추가 — 눌림 7 + 돌파20 7 + 돌파55 7. "고를 수 있게 하면 나은가"
+#   C20 교체 — 돌파20 7종. "바꾸면 나은가"(사용자 질문 그대로)
+#   C55 교체 — 돌파55 7종
+# 돌파 메뉴는 GRID 의 청산·슬롯 구성을 **그대로** 복제하고 진입만 바꾼다(다른 변수 고정).
+def _with_entry(grid: tuple[Candidate, ...], entry: str, tag: str) -> tuple[Candidate, ...]:
+    return tuple(replace(c, label=f"{c.label}·{tag}", entry=entry) for c in grid)
+
+
+GRID_B20 = _with_entry(GRID, "breakout20", "돌파20")
+GRID_B55 = _with_entry(GRID, "breakout55", "돌파55")
+ENTRY_BASELINE = "A"
+ENTRY_PROCEDURES: dict[str, tuple[Candidate, ...]] = {
+    "A": GRID,
+    "B": GRID + GRID_B20 + GRID_B55,
+    "C20": GRID_B20,
+    "C55": GRID_B55,
+}
+ENTRY_PROC_LABEL = {"A": "현행(눌림)", "B": "메뉴추가(눌림+돌파)",
+                    "C20": "교체(돌파20)", "C55": "교체(돌파55)"}
+
+# 도전자 X 가 A 를 대체하려면 아래를 **전부** 충족해야 한다.
+#   ① 기존 절대 기준(MDD_RATIO · MAR≥벤치마크 · MIN_WIN_YEARS) — 08-28 선언 그대로
+#   ② MAR(X) ≥ MAR(A) + ENTRY_MAR_MARGIN            ← 개선이 '오차 수준'이 아닐 것
+#   ③ MDD(X) ≤ MDD(A) + ENTRY_MDD_SLACK_PP          ← 위험을 의미 있게 늘리지 않을 것
+#   ④ 검증연도 수익이 A 보다 높은 폴드 ≥ ENTRY_MIN_FOLD_WIN_RATIO  ← 한두 해 몰림 배제
+#   ⑤ PIT 가드 — `backtest_trend.py --entrytest`(시점별 유니버스 12년 거래당)에서 X 가 쓰는
+#      돌파 규칙의 기대값·PF 가 눌림 이상일 것. 이 하니스의 유니버스는 **현재** 시총 상위라
+#      생존편향이 있는데, 강세를 사는 돌파가 그 편향의 수혜를 더 받을 수 있다. ①~④만으로는
+#      '돌파가 낫다'와 '생존자가 돌파를 많이 했다'를 가르지 못한다.
+# 여럿이 통과하면 OOS MAR 이 가장 높은 것 — 이 선택 자체가 OOS 를 보는 것이므로 채택 수치는
+# 낙관 편향을 갖는다고 함께 적는다. 하나도 통과 못 하면 현행 유지, 돌파 기간을 바꿔 다시 재지 않는다.
+#
+# ※ 8폴드로는 MAR 차이 0.1 의 통계적 유의성을 보일 수 없다(연 변동 ~20% → MAR 표준오차 ~0.4).
+#   이 기준은 '유의한 개선'이 아니라 '바꿀 만한 근거가 있는가'의 최소선이다.
+ENTRY_MAR_MARGIN = 0.10
+ENTRY_MDD_SLACK_PP = 3.0
+ENTRY_MIN_FOLD_WIN_RATIO = 0.60
+
+
+def judge_entry(base: dict, chal: dict, bench: dict,
+                base_folds: list[float], chal_folds: list[float]) -> list[tuple[str, bool, str]]:
+    """도전자 판정 ①~④ — [(기준, 통과, 설명)]. ⑤(PIT)는 별도 스크립트라 여기 없다.
+
+    base/chal/bench: _stats() 결과(mdd·mar·wins·n). *_folds: 폴드별 검증 수익(%) — 같은 순서.
+    """
+    if len(base_folds) != len(chal_folds) or not base_folds:
+        raise ValueError("폴드 수가 다르거나 0 — 같은 실행에서 잰 절차끼리만 비교한다")
+    n = len(chal_folds)
+    abs_ok = (chal["mdd"] <= bench["mdd"] * MDD_RATIO and chal["mar"] >= bench["mar"]
+              and chal["wins"] >= n * MIN_WIN_YEARS)
+    fold_wins = sum(1 for b, c in zip(base_folds, chal_folds) if c > b)
+    need_folds = math.ceil(n * ENTRY_MIN_FOLD_WIN_RATIO)
+    return [
+        ("① 절대 기준", abs_ok,
+         f"MDD {chal['mdd']:.1f}% ≤ {bench['mdd'] * MDD_RATIO:.1f}% · MAR {chal['mar']:.2f} ≥ "
+         f"{bench['mar']:.2f} · 플러스 {chal['wins']}/{n}"),
+        ("② MAR 개선", chal["mar"] >= base["mar"] + ENTRY_MAR_MARGIN,
+         f"{chal['mar']:.2f} ≥ {base['mar']:.2f} + {ENTRY_MAR_MARGIN:g}"),
+        ("③ MDD 상한", chal["mdd"] <= base["mdd"] + ENTRY_MDD_SLACK_PP,
+         f"{chal['mdd']:.1f}% ≤ {base['mdd']:.1f}% + {ENTRY_MDD_SLACK_PP:g}%p"),
+        ("④ 폴드 우위", fold_wins >= need_folds, f"A 보다 나은 폴드 {fold_wins}/{n} ≥ {need_folds}"),
+    ]
 
 
 # ── 검증 어서션 — 조용한 오측정을 구조적으로 막는다 ─────────────────────────
@@ -171,6 +248,7 @@ def _cfg(c: Candidate) -> TrendConfig:
     t.pullback_pct, t.pullback_min_pct = LIVE.pullback_pct, LIVE.pullback_min_pct
     t.atr_k, t.stop_pct, t.rr, t.partial_pct = LIVE.atr_k, LIVE.stop_pct, LIVE.rr, LIVE.partial_pct
     t.max_hold = c.max_hold
+    t.entry_mode = c.entry
     return t
 
 
@@ -220,6 +298,8 @@ def main() -> int:
                     help="연간 재선택 — 직전 train-years 로 올해 쓸 규칙 하나를 고르고 .env 형식으로 출력")
     ap.add_argument("--exposure", type=float, default=1.0,
                     help="전 후보 노출 배수(1.0=만기투자). 운영 결정이지 학습 대상이 아니다")
+    ap.add_argument("--entry-ab", action="store_true",
+                    help="진입 타점 A/B — 눌림 vs 돌파 절차 4개를 같은 폴드에서 비교(2026-10-12 선언)")
     args = ap.parse_args()
     global EXPOSURE
     EXPOSURE = args.exposure
@@ -231,6 +311,8 @@ def main() -> int:
     dates, bars, _closes, _ordered = P._load(DATA_START, DATA_END, TOP_N)
     if args.select_now:
         return _select_now(dates, costs, secmap, args.train_years, args.metric)
+    if args.entry_ab:
+        return _entry_ab(dates, bars, costs, secmap, args.train_years, args.test_years, args.metric)
     folds = _folds(dates, args.train_years, args.test_years)
     _assert_folds(folds)
 
@@ -321,6 +403,121 @@ def _select_now(dates: list[str], costs: Costs, secmap: dict,
     print("  ※ 이 출력을 그대로 반영할 것. 결과를 보고 다른 후보를 고르면 워크포워드가 무효가 된다.")
     print("  ※ 반영 후 `pytest tests/test_trend_config.py` 스냅샷도 함께 갱신한다.")
     return 0
+
+
+def _entry_ab(dates: list[str], bars: dict, costs: Costs, secmap: dict,
+              train_years: int, test_years: int, metric: str) -> int:
+    """진입 타점 A/B — 사전 선언된 절차(ENTRY_PROCEDURES)를 **같은 폴드**에서 잰다.
+
+    후보의 학습 성적은 폴드당 한 번만 잰다. B 의 메뉴는 A·C20·C55 의 합집합이라 그 결과를
+    그대로 나눠 쓴다(같은 후보를 절차마다 다시 돌리면 시간만 4배). 선택·판정 규칙은 모듈
+    상수 — 결과를 본 뒤 바꾸면 이 검증은 무효다.
+    """
+    folds = _folds(dates, train_years, test_years)
+    _assert_folds(folds)
+    menu: list[Candidate] = []
+    for grid in ENTRY_PROCEDURES.values():
+        menu.extend(c for c in grid if c not in menu)
+
+    print("=" * 112)
+    print(f"진입 타점 A/B — 학습 {train_years}년 / 검증 {test_years}년 롤링 · 선택기준 {metric.upper()} · "
+          f"후보 {len(menu)}개 · 폴드 {len(folds)}개 · 노출 {EXPOSURE:.0%}")
+    print(f"데이터 {dates[0]}~{dates[-1]} ({len(dates)} 영업일) · 유니버스 시총상위 {TOP_N}")
+    print("  절차: " + " · ".join(f"{k}={ENTRY_PROC_LABEL[k]}({len(g)})"
+                                for k, g in ENTRY_PROCEDURES.items()))
+    print("=" * 112)
+
+    per = {k: {"rets": [], "curves": [], "picks": [], "days": 0} for k in ENTRY_PROCEDURES}
+    bench_rets, bench_curves = [], []
+    for tr_lo, tr_hi, te_lo, te_hi in folds:
+        train = {}
+        for cand in menu:
+            m = _run(cand, tr_lo, tr_hi, costs, secmap)
+            _assert_window(m["_res"], tr_lo, tr_hi, dates, f"학습 {tr_lo[:4]} {cand.label}")
+            train[cand] = m
+        # ── 검증: 모든 절차의 선택이 끝난 **뒤에만** 이 구간을 만진다 ──
+        picks = {k: select([(c, train[c]) for c in g], metric, g)[0]
+                 for k, g in ENTRY_PROCEDURES.items()}
+        tested = {}
+        for cand in dict.fromkeys(picks.values()):
+            te = _run(cand, te_lo, te_hi, costs, secmap)
+            _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]} {cand.label}")
+            _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]} {cand.label}")
+            tested[cand] = te
+        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi)
+        bench_curves.append(bcurve)
+        bench_rets.append((bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0)
+        line = []
+        for k, cand in picks.items():
+            te, p = tested[cand], per[k]
+            p["rets"].append(te["total"])
+            p["curves"].append(te["_res"].equity_curve)
+            p["picks"].append(cand.label)
+            p["days"] += te["_res"].n_days
+            line.append(f"{k}:{te['total']:+6.1f}%")
+        print(f"  {te_lo[:4]}  " + "  ".join(line) + f"  벤치 {bench_rets[-1]:+6.1f}%")
+        for k, cand in picks.items():
+            print(f"         {k:3} ← {cand.label}")
+
+    days = {p["days"] for p in per.values()}
+    if len(days) != 1:
+        raise AssertionError(f"절차별 검증 영업일이 다르다 {days} — 같은 구간 비교가 아니다")
+    oos_days = days.pop()
+    bstat = _curve_stats(_stitch(bench_curves), oos_days)
+    stats = {}
+    for k, p in per.items():
+        stats[k] = {**_curve_stats(_stitch(p["curves"]), oos_days),
+                    "wins": sum(1 for r in p["rets"] if r > 0), "n": len(p["rets"])}
+
+    print("  " + "-" * 100)
+    print(f"  OOS 이어붙인 자산곡선 ({oos_days} 영업일, {oos_days / 252:.1f}년)")
+    print(f"    {'':22}{'누적':>10}{'CAGR':>9}{'MDD':>9}{'MAR':>8}{'플러스':>8}")
+    for k, s in stats.items():
+        print(f"    {k + ' ' + ENTRY_PROC_LABEL[k]:22}{s['total']:>+9.1f}%{s['cagr']:>+8.1f}%"
+              f"{s['mdd']:>8.1f}%{s['mar']:>8.2f}{s['wins']:>5}/{s['n']}")
+    print(f"    {'벤치마크':22}{bstat['total']:>+9.1f}%{bstat['cagr']:>+8.1f}%"
+          f"{bstat['mdd']:>8.1f}%{bstat['mar']:>8.2f}")
+    for k, p in per.items():
+        uniq: dict[str, int] = {}
+        for lb in p["picks"]:
+            uniq[lb] = uniq.get(lb, 0) + 1
+        print(f"    {k:3} 선택: " + " · ".join(f"{lb}×{v}" for lb, v in
+                                           sorted(uniq.items(), key=lambda x: -x[1])))
+
+    print()
+    print("  판정 — 기준은 **결과를 보기 전에** 선언됨(ENTRY_* 상수, 2026-10-12 커밋)")
+    base = stats[ENTRY_BASELINE]
+    passed = []
+    for k in ENTRY_PROCEDURES:
+        if k == ENTRY_BASELINE:
+            continue
+        rows = judge_entry(base, stats[k], bstat, per[ENTRY_BASELINE]["rets"], per[k]["rets"])
+        ok = all(r[1] for r in rows)
+        print(f"    {k} {ENTRY_PROC_LABEL[k]} → {'①~④ 충족' if ok else '미충족'}")
+        for name, good, text in rows:
+            print(f"      [{'O' if good else 'X'}] {name}: {text}")
+        if ok:
+            passed.append(k)
+    print()
+    if passed:
+        best = max(passed, key=lambda k: stats[k]["mar"])
+        print(f"  → ①~④ 통과: {', '.join(passed)} · 후보 {best}. **⑤ PIT 가드가 남았다** — "
+              "`backtest_trend.py --entrytest` 에서 돌파 규칙 기대값·PF ≥ 눌림이어야 채택.")
+        if len(passed) > 1:
+            print("    ※ 여럿 중 OOS MAR 로 고른 것이라 그 수치는 낙관 편향을 갖는다.")
+    else:
+        print("  → 통과한 도전자 없음 — 현행(눌림) 유지. 돌파 기간을 바꿔 다시 재지 않는다(선언).")
+    print("  ※ 유니버스 생존편향은 절차들이 공유하지만, 돌파가 그 수혜를 더 받을 수 있다 → ⑤ 필수.")
+    return 0
+
+
+def _curve_stats(curve: list[float], n_days: int) -> dict:
+    """이어붙인 자산곡선 → 누적·CAGR·MDD·MAR. 곡선이 2점 미만이면 0."""
+    if len(curve) < 2:
+        return {"total": 0.0, "cagr": 0.0, "mdd": 0.0, "mar": 0.0}
+    mdd, cagr = _mdd(curve), _cagr(curve, n_days)
+    return {"total": (curve[-1] / curve[0] - 1) * 100, "cagr": cagr, "mdd": mdd,
+            "mar": cagr / mdd if mdd > 0 else float("inf")}
 
 
 def _benchmark_curve(bars: dict, dates: list[str], lo: str, hi: str) -> list[float]:

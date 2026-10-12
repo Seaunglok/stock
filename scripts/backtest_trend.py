@@ -39,6 +39,7 @@ from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용
 from src.mcp_servers.trend_mcp.signals import (  # noqa: E402
     residual_momentum,
     TrendConfig, entry_signal, atr, levels, moving_average, relative_strength,
+    BREAKOUT_DAYS, ENTRY_MODES,
 )
 
 MIN_VALUE_KRW = 1_000 * 10**8   # 거래대금 floor 1,000억
@@ -713,6 +714,48 @@ def report_pullback(mode: str, start: str, end: str, watch: list[str], costs: Co
     print("  ※ 폭↑ → 추격매수(MA20 멀리서 진입) 늘어남 → P10 악화/기대값 저하 시 현행 3% 유지가 정답.")
 
 
+def report_entrytest(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig,
+                     label: str) -> dict[str, dict]:
+    """진입 타점 A/B 의 ⑤ PIT 가드 — 눌림 vs 돌파20/55 거래당 성과(시점별 유니버스).
+
+    워크포워드 하니스는 **현재** 시총 상위 유니버스라 생존편향이 있다. 강세를 사는 돌파가 그
+    편향의 수혜를 더 받으면 워크포워드에서만 좋아 보일 수 있다. 시점별 유니버스(V_PIT_UNIVERSE)
+    에서도 돌파의 기대값·PF 가 눌림 이상이어야 채택 — 기준은 측정 전 선언
+    (docs/2026-10-12-breakout-entry-declaration.md). 진입 외 조건은 전부 라이브 미러 그대로.
+    """
+    orig = cfg.entry_mode
+    print("\n" + "=" * 96)
+    print(f"진입 타점 PIT 가드 — {label} · 시점별 유니버스 {'ON' if V_PIT_UNIVERSE else 'OFF ⚠️'} (비용 차감 후)")
+    print("=" * 96)
+    print(f"  {'진입':12} {'진입수':>6} {'승률':>6} {'기대값':>8} {'중앙':>8} {'손익비':>7} {'PF':>6} {'P10':>8} {'P90':>8}")
+    out: dict[str, dict] = {}
+    try:
+        for em in ENTRY_MODES:
+            cfg.entry_mode = em
+            m = metrics([n for _, n in run(mode, start, end, watch, costs, cfg)])
+            out[em] = m
+            if not m.get("n"):
+                print(f"  {em:12} 진입 0건"); continue
+            po = "inf" if m["payoff"] == float("inf") else f"{m['payoff']:.2f}"
+            pf = "inf" if m["profit_factor"] == float("inf") else f"{m['profit_factor']:.2f}"
+            print(f"  {em:12} {m['n']:>6} {m['win']:>5.1f}% {m['avg']:>+7.2f}% {m['median']:>+7.2f}% "
+                  f"{po:>7} {pf:>6} {m['p10']:>+7.2f}% {m['p90']:>+7.2f}%")
+    finally:
+        cfg.entry_mode = orig
+    base = out.get("pullback", {})
+    print()
+    print("  ⑤ 판정 — 돌파의 기대값 ≥ 눌림 **그리고** PF ≥ 눌림 (측정 전 선언)")
+    for em in BREAKOUT_DAYS:
+        m = out.get(em, {})
+        ok = (bool(m.get("n")) and bool(base.get("n"))
+              and m["avg"] >= base["avg"] and m["profit_factor"] >= base["profit_factor"])
+        detail = (f"기대값 {m['avg']:+.2f}% vs {base['avg']:+.2f}% · PF {m['profit_factor']:.2f} vs "
+                  f"{base['profit_factor']:.2f}") if m.get("n") and base.get("n") else "표본 없음"
+        print(f"    [{'O' if ok else 'X'}] {em}: {detail}")
+    print("  ※ 거래당 백테스트는 신호일마다 1거래(같은 종목 연속 신호 중복 포함) — 포트폴리오 성과가 아니다.")
+    return out
+
+
 def report_breakeven(mode: str, start: str, end: str, watch: list[str], costs: Costs, cfg: TrendConfig, label: str) -> None:
     """Break-even 트리거 A/B — 진입 +X% 도달 시 stop 을 entry 로 끌어올림(손실 진입 방지).
 
@@ -771,6 +814,8 @@ def main():
                    help="시점별 유니버스 끄기 — 현재 스냅샷 소급(생존편향 포함, 구 동작 재현용)")
     p.add_argument("--pit-pool", type=int, default=350, help="시점별 모드 후보 풀 크기")
     p.add_argument("--regimetest", action="store_true", help="시장 레짐/변동성 필터 A/B(KOSPI>MA · 변동성 상한)")
+    p.add_argument("--entrytest", action="store_true",
+                   help="진입 타점 PIT 가드 — 눌림 vs 돌파20/55(2026-10-12 선언 ⑤)")
     p.add_argument("--legacy-defaults", action="store_true",
                    help="라이브 미러 없이 구 기본값(MA50·게이트 전부 off·눌림 3%%)으로 실행 — 과거 수치 재현용")
     args = p.parse_args()
@@ -808,6 +853,8 @@ def main():
         report_foreignexit(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     elif args.regimetest:
         report_regime(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
+    elif args.entrytest:
+        report_entrytest(args.mode, args.start, args.end, watch, costs, cfg, f"mode={args.mode} top_n={cfg_top}")
     else:
         trades = run(args.mode, args.start, args.end, watch, costs, cfg)
         nets = [net for _, net in trades]

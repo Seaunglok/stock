@@ -16,7 +16,7 @@
 
 | 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
 | 8 | [2026-10-12-strategy-review.md](2026-10-12-strategy-review.md) | 전략 타당성 점검 — 월별·금리 국면·FOMC·켈리·구루 원칙 비교(설명용, 채택 아님) |
-| 9 | [2026-10-12-breakout-entry-declaration.md](2026-10-12-breakout-entry-declaration.md) | 진입 타점 A/B 사전 선언 — 눌림 vs 돌파20/55, 판정 기준 ①~⑤ |
+| 9 | [2026-10-12-breakout-entry-declaration.md](2026-10-12-breakout-entry-declaration.md) | 진입 타점 A/B — 눌림 vs 돌파20/55. **미통과 → 눌림 유지**(돌파는 수익↑·MDD 18→29%·PF↓) |
 
 부수: [2026-08-28-rs-definition-ab.md](2026-08-28-rs-definition-ab.md)(RS 정의 A/B — 막다른 길),
 [trend_follow_strategy.md](trend_follow_strategy.md)(전략 상세),

@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -36,10 +36,15 @@ POS = {"symbol": "000001", "name": "테스트", "mode": "largecap", "qty": 3, "e
        "buy_date": "2026-09-28", "partial_done": False, "journal_id": "j1"}
 CUR = 95.0          # 15:20 판정가
 
+# 시계는 고정한다 — 실제 시각에 따라 동시호가 경로로 갈렸다 말았다 하면 테스트가 흔들린다.
+BASE = datetime.now().replace(hour=14, minute=0, second=0, microsecond=0)     # 연속매매 시간
+AUCTION = BASE.replace(hour=15, minute=20, second=20)                          # 종가 동시호가 중
+# 실제 증권사처럼 동작하는 가짜 시장 상태 — 15:30 체결 전에는 체결내역에 동시호가 주문이 없다.
+MARKET = {"after_close": False}
 
-def _now_tm(offset_sec: int = 0) -> str:
-    t = datetime.now().timestamp() + offset_sec
-    return datetime.fromtimestamp(t).strftime("%H%M%S")
+
+def _now_tm(offset_sec: int = 0, base: datetime = BASE) -> str:
+    return (base + timedelta(seconds=offset_sec)).strftime("%H%M%S")
 
 
 def _row(sym="000001", side="-매도", oq="3", cq="3", px="94", tm=None, stt="체결") -> dict:
@@ -56,12 +61,13 @@ def _execs(*rows) -> str:
 class _Broker:
     """MCPManager 대역 — 매도 주문 응답과 체결내역 응답을 시나리오대로 돌려준다."""
 
-    def __init__(self, exec_replies, place: str = "timeout"):
-        self.exec_replies = list(exec_replies)
-        self.place = place
+    def __init__(self, exec_replies, place="timeout"):
+        self.exec_replies = list(exec_replies)     # 각 원소: 응답 문자열 · 예외 · 호출 시점에 평가할 함수
+        self.place = place                         # 문자열(전 종목 공통) 또는 {종목: 모드}
         self.tools = [{"name": "place_sell_order"}, {"name": "get_order_executions"}]
         self.sells = 0
         self.exec_calls = 0
+        self.log: list[str] = []                   # 호출 순서 — '다른 종목 매도를 기다리게 하지 않는다' 검증용
 
     def __call__(self, *_a, **_k):
         return self
@@ -72,17 +78,22 @@ class _Broker:
     async def __aexit__(self, *_a):
         return False
 
-    async def call_tool(self, name, _args):
+    async def call_tool(self, name, args):
         if name == "place_sell_order":
             self.sells += 1
-            if self.place == "timeout":
+            self.log.append(f"sell:{args.get('stock_code')}")
+            mode = self.place.get(args.get("stock_code"), "ok") if isinstance(self.place, dict) else self.place
+            if mode == "timeout":
                 raise asyncio.TimeoutError()             # 응답 불명 — _place 가 unknown 으로 바꾼다
-            if self.place == "reject":
+            if mode == "reject":
                 return json.dumps({"success": True, "data": {"return_code": 20, "return_msg": "잔고부족"}})
             return json.dumps({"success": True, "data": {"return_code": 0, "ord_no": "1"}})
         if name == "get_order_executions":
             self.exec_calls += 1
+            self.log.append("executions")
             r = self.exec_replies[min(self.exec_calls, len(self.exec_replies)) - 1]
+            if callable(r):
+                r = r()
             if isinstance(r, Exception):
                 raise r
             return r
@@ -110,10 +121,16 @@ def env(monkeypatch, tmp_path):
         return {"ma_exit": 100.0, "ma_ref": 90.0}         # 완성 종가 90 < MA120 100 → 청산 신호
 
     real_sleep = asyncio.sleep
+    MARKET["after_close"] = False
+    MARKET["sleeps"] = []
 
-    async def _fast_sleep(_sec, *a, **k):
+    async def _fast_sleep(sec, *a, **k):
+        MARKET["sleeps"].append(sec)
+        if sec >= 300:                     # 15:30 이후까지 기다렸다 = 동시호가 체결이 끝났다
+            MARKET["after_close"] = True
         await real_sleep(0)
 
+    monkeypatch.setattr(TF, "_clock", lambda: BASE)
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(TF, "notify", _notify)
     monkeypatch.setattr(TF, "log_event", lambda ev, p=None: events.append((ev, p)))
@@ -242,3 +259,104 @@ def test_parse_sell_orders_rejects_bad_payload():
     assert IO._parse_sell_orders(json.dumps({"success": False, "error": "x"}), "000001") is None
     bad_rc = json.dumps({"success": True, "data": {"cntr": [], "return_code": 3, "return_msg": "8050"}})
     assert IO._parse_sell_orders(bad_rc, "000001") is None, "8050 같은 오류 응답을 '주문 없음'으로 읽었다"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 종가 동시호가(15:20~15:30) 응답 불명 매도 — 2026-10-12
+#
+# 하나금융 3주: 15:20:31 접수 → 15:30 체결 @124,400. 위 확인 로직이 15:20:30~15:21:24 동안
+# 체결내역을 4번 봤지만 **체결 전 동시호가 주문은 체결내역에 나오지 않아** '미접수'로 오판했다
+# (09-30 유령 재발). 가짜 증권사도 실제처럼 만든다 — 15:30 이전엔 비어 있고 이후에 나타난다.
+# ═══════════════════════════════════════════════════════════════════════════
+AUCTION_ROW_TM = _now_tm(11, AUCTION)          # 봇 발송 11초 뒤 접수(15:20:31)
+
+
+def _auction_execs(sym="000001", qty="3", px="94"):
+    """호출 시점의 가짜 시장 상태에 따라 — 체결 전엔 빈 내역, 15:30 이후엔 체결 행."""
+    return lambda: _execs(_row(sym=sym, oq=qty, cq=qty, px=px, tm=AUCTION_ROW_TM)) \
+        if MARKET["after_close"] else _execs()
+
+
+@pytest.fixture
+def auction(env, monkeypatch):
+    TF, notes, events = env
+    monkeypatch.setattr(TF, "_clock", lambda: AUCTION)
+    return TF, notes, events
+
+
+def test_auction_unknown_sell_settles_after_close(auction, monkeypatch):
+    """★ 10-12 재현 — 동시호가 중 응답 불명 매도는 15:30 체결 이후에 확정해야 한다."""
+    TF, notes, _ev = auction
+    broker = _Broker([_auction_execs(px="124400")])
+    _run(TF, broker, monkeypatch)
+    assert TF.get_state("positions") == [], "체결된 종목이 장부에 남았다 — 10-12 유령 재현"
+    ex = _exits(TF)
+    assert len(ex) == 1 and ex[0]["exit_price"] == 124400.0, "15:30 실제 체결가로 기록하지 않았다"
+    assert "15:30" in ex[0]["reason"]
+    assert broker.sells == 1, "응답 불명 매도를 재전송했다"
+    assert not _critical(notes), f"체결됐는데 경고를 보냈다: {_critical(notes)}"
+
+
+def test_auction_settle_waits_until_after_close(auction, monkeypatch):
+    """확정 조회는 15:30 체결 이후에 시작한다 — 15:20:20 발송이면 약 10분 기다린다."""
+    TF, _notes, _ev = auction
+    _run(TF, _Broker([_auction_execs()]), monkeypatch)
+    long_waits = [s for s in MARKET["sleeps"] if s >= 300]
+    assert long_waits and long_waits[0] == pytest.approx(610, abs=1)
+
+
+def test_auction_wait_does_not_delay_other_sells(auction, monkeypatch):
+    """★ 확정을 기다리느라 다른 종목 매도가 15:30 마감 뒤로 밀리면 전량 거부된다(rc 505217)."""
+    TF, _notes, _ev = auction
+    TF.save_state("positions", [dict(POS), {**POS, "symbol": "000002", "journal_id": "j2"}])
+    broker = _Broker([_auction_execs()], place={"000001": "timeout", "000002": "ok"})
+    _run(TF, broker, monkeypatch)
+    first_exec = broker.log.index("executions")
+    assert broker.log.index("sell:000002") < first_exec, "다른 종목 매도가 확정 대기 뒤로 밀렸다"
+    assert TF.get_state("positions") == []
+
+
+def test_auction_unfilled_keeps_position_and_alerts(auction, monkeypatch):
+    """15:30 이후에도 체결이 없으면 그때 미체결로 판단 — 보유 유지 + 알림."""
+    TF, notes, _ev = auction
+    broker = _Broker([_execs()])
+    _run(TF, broker, monkeypatch)
+    assert [p["symbol"] for p in TF.get_state("positions")] == ["000001"]
+    assert broker.exec_calls == TF.AUCTION_SETTLE_POLLS
+    crit = " ".join(_critical(notes))
+    assert "15:30 이후에도" in crit
+
+
+def test_auction_partial_fill_is_not_booked_as_full(auction, monkeypatch):
+    """일부만 체결되면 전량 청산으로 기록하지 않는다 — 장부 수량은 사람이 정정."""
+    TF, notes, _ev = auction
+    broker = _Broker([lambda: _execs(_row(oq="3", cq="1", px="124400", tm=AUCTION_ROW_TM))
+                      if MARKET["after_close"] else _execs()])
+    _run(TF, broker, monkeypatch)
+    assert [p["symbol"] for p in TF.get_state("positions")] == ["000001"]
+    assert _exits(TF) == []
+    assert "일부만 체결" in " ".join(_critical(notes))
+
+
+def test_auction_query_failure_does_not_advise_manual_sell(auction, monkeypatch):
+    TF, notes, _ev = auction
+    broker = _Broker([RuntimeError("체결내역 조회 실패")])
+    _run(TF, broker, monkeypatch)
+    assert [p["symbol"] for p in TF.get_state("positions")] == ["000001"]
+    crit = " ".join(_critical(notes))
+    assert "HTS 수동매도" not in crit and "주문" in crit
+
+
+def test_intraday_sell_never_waits_for_auction(auction, monkeypatch):
+    """★ 장중(intraday) 경로가 15:30 까지 기다리면 그 뒤 15:20 청산 phase 가 마감 뒤로 밀린다."""
+    TF, _notes, _ev = auction
+
+    async def _boom(*_a, **_k):
+        raise AssertionError("장중 경로가 동시호가 확정 대기에 들어갔다")
+
+    async def _crash(_sym):
+        return 85.0                                       # -15% → 하드손절(장중에도 판정)
+    monkeypatch.setattr(TF, "_settle_auction_sells", _boom)
+    monkeypatch.setattr(TF, "_realtime_price", _crash)
+    monkeypatch.setattr(TF, "MCPManager", _Broker([_execs()]))
+    asyncio.run(TF._manage(do_exit_signals=False, when="intraday"))

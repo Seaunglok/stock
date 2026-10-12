@@ -21,6 +21,7 @@ import os
 import sys
 import uuid
 from datetime import datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from typing import Any
 
@@ -591,6 +592,11 @@ async def _confirm_unknown_buy(sym: str, want_qty: int) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _clock() -> datetime:
+    """현재 시각 — 매도 발송 시각·동시호가 판정용. 테스트가 고정할 수 있게 한 곳으로 모은다."""
+    return datetime.now()
+
+
 # 응답 불명 매도의 접수 확인 (2026-09-30) — 봇이 포기한 15:20:29 의 3초 뒤에야 증권사에 등록됐다.
 UNKNOWN_SELL_POLLS = 4             # 체결내역 조회 횟수
 UNKNOWN_SELL_POLL_SEC = 10.0       # 조회 간격 — 합계 ~40초. 등록 지연을 기다린다
@@ -635,6 +641,76 @@ async def _confirm_unknown_sell(mcp, sym: str, sell_qty: int,
             return "accepted", None, ordered
         # 아직 안 보일 수 있다(등록 지연) — 다시 본다
     return ("absent" if seen else "unverified"), None, 0
+
+
+# 종가 동시호가(2026-10-12) — 15:20~15:30 에 낸 시장가 주문은 15:30 에 한꺼번에 체결되고,
+# 체결내역(ka10076)엔 **체결된 뒤에야** 나타난다. 그 사이엔 위 확인으로는 볼 수 없다.
+AUCTION_OPEN, AUCTION_CLOSE = dtime(15, 20), dtime(15, 30)
+AUCTION_SETTLE_AFTER_SEC = 30      # 15:30 + 30초부터 확인
+AUCTION_SETTLE_POLLS = 12          # 조회 횟수
+AUCTION_SETTLE_POLL_SEC = 20.0     # 간격 — 합계 ~4분(15:34 경까지)
+
+
+def _in_closing_auction(t: datetime) -> bool:
+    return AUCTION_OPEN <= t.time() < AUCTION_CLOSE
+
+
+async def _settle_auction_sells(pending: list[dict]) -> dict[str, tuple[str, float | None, int]]:
+    """동시호가 중 응답 불명이던 매도를 **15:30 체결 이후** 체결내역으로 확정 → {종목: (판정, 체결가, 체결수량)}.
+
+    판정: filled(전량 체결) · partial(일부만) · absent(조회는 되는데 체결 없음) · unverified(조회 실패)
+
+    ★ 2026-10-12 하나금융 3주: 15:20:31 접수 → 15:30 체결 @124,400. `_confirm_unknown_sell` 이
+      15:20:30~15:21:24 동안 체결내역을 4번 봤지만 체결 전 동시호가 주문은 거기 나오지 않아
+      '미접수'로 오판했다(09-30 유령 재발). 그래서 체결 시각이 지난 뒤에 본다.
+    미체결 조회(ka10075)는 쓰지 않는다 — 응답 형식을 실제로 확인한 적이 없다. 15:30 이후 체결내역에
+    체결 행이 나타나는 것은 09-30·10-12 실계좌로 확인한 사실이다.
+    재전송은 여전히 하지 않는다. 사실만 확인한다.
+    """
+    now = _clock()
+    settle_at = (now.replace(hour=AUCTION_CLOSE.hour, minute=AUCTION_CLOSE.minute, second=0, microsecond=0)
+                 + timedelta(seconds=AUCTION_SETTLE_AFTER_SEC))
+    if now < settle_at:
+        await asyncio.sleep((settle_at - now).total_seconds())
+    todo = {p["pos"]["symbol"]: p for p in pending}
+    partial: dict[str, tuple[int, float]] = {}
+    out: dict[str, tuple[str, float | None, int]] = {}
+    seen = False
+    day = pending[0]["sent_at"].strftime("%Y%m%d")
+    try:
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            for attempt in range(AUCTION_SETTLE_POLLS):
+                if attempt:
+                    await asyncio.sleep(AUCTION_SETTLE_POLL_SEC)
+                try:
+                    raw = await mcp.call_tool("get_order_executions",
+                                              {"account_no": ACCOUNT_NO, "start_date": day, "end_date": day})
+                except Exception as e:
+                    logger.warning("[ORDER] 동시호가 체결내역 조회 실패 %d/%d: %s",
+                                   attempt + 1, AUCTION_SETTLE_POLLS, e)
+                    continue
+                for sym, p in list(todo.items()):
+                    since = (p["sent_at"] - timedelta(seconds=UNKNOWN_SELL_SLACK_SEC)).strftime("%H%M%S")
+                    got = _parse_sell_orders(raw, sym, since)
+                    if got is None:
+                        continue
+                    seen = True
+                    _ordered, filled, avg = got
+                    if filled >= p["qty"]:
+                        out[sym] = ("filled", avg, filled)
+                        del todo[sym]
+                    elif filled > 0:
+                        partial[sym] = (filled, avg)
+                if not todo:
+                    break
+    except Exception as e:
+        logger.error("[ORDER] 동시호가 매도 확정 세션 실패: %s", e)
+    for sym in todo:
+        if sym in partial:
+            out[sym] = ("partial", partial[sym][1], partial[sym][0])
+        else:
+            out[sym] = ("absent" if seen else "unverified", None, 0)
+    return out
 
 
 async def _buy_one(mcp, c: dict, mode_tag: str) -> dict | None:
@@ -1277,6 +1353,25 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
     sell_failures: list[dict] = []   # phase 내 매도 거부 누적 (8005/거부/예외) — 임계 초과 시 critical alert
     price_fails: list[str] = []      # 시세조회 실패 종목 — exit phase 면 알림(무경고 HOLD 방지)
     eval_fails: list[str] = []       # 종목 단위 평가 실패 — 청산판정이 아예 안 된 종목
+    pending_auction: list[dict] = [] # 동시호가 중 응답 불명 매도 — 15:30 체결 이후 확정(2026-10-12)
+
+    def _book_exit(pos: dict, fill: float, cur: float, reason: str, sell_qty: int) -> None:
+        """청산 1건 기록(일지·이벤트·청산 알림 목록). 체결 직후와 동시호가 확정(15:30 이후) 공용."""
+        entry = pos["entry_price"]
+        pnl_pct = round((fill - entry) / entry * 100, 2)
+        hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
+        net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
+        rr_real = round((fill - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
+        pnl_amt = round((fill - entry) * sell_qty)
+        closed.append({"pos": pos, "cur": fill, "net": net, "reason": reason, "qty": sell_qty,
+                       "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
+        journal_append({"type": "exit", "id": pos["journal_id"], "symbol": pos["symbol"], "name": pos["name"],
+                        "qty": sell_qty, "entry_price": entry, "exit_price": fill, "decided_at": cur,
+                        "pnl_pct": pnl_pct, "net_pct": net, "pnl_amount": pnl_amt,
+                        "rr_realized": rr_real, "reason": reason, "hold_days": hold_days})
+        log_event("exit", {"symbol": pos["symbol"], "exit": fill, "decided_at": cur,
+                           "net_pct": net, "reason": reason})
+
     async def handle(mcp, idx: int, pos: dict) -> None:
         """포지션 1건: 트레일 갱신 → 청산판정 → 집행. 공유 리스트에 결과를 모은다."""
         sym, entry, qty = pos["symbol"], pos["entry_price"], int(pos["qty"])
@@ -1313,10 +1408,21 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
             ma_ref=sig.get("ma_ref"), exits=EXITS)
         if not action:
             remaining.append(pos); return
-        sent_at = datetime.now()
+        sent_at = _clock()
         resp, ok, why = await _sell_with_retry(mcp, when, sym, sell_qty)
         confirmed_fill = None
         advice = "→ HTS 수동매도 검토"
+        if not ok and _is_unknown(resp) and when == "exit" and _in_closing_auction(sent_at):
+            # ★ 2026-10-12 하나금융: 동시호가 주문은 15:30 체결 전엔 체결내역에 안 보인다. 지금 판정하면
+            #   '미접수'로 오판한다 → 보류하고 15:30 이후 확정(_settle_auction_sells). 다른 종목 매도는
+            #   기다리지 않고 계속 낸다 — 15:30 마감 전에 다 나가야 한다. 장중(intraday) 경로는 여기 오지
+            #   않는다: 거기서 기다리면 뒤이은 15:20 청산 phase 가 마감 뒤로 밀린다.
+            pending_auction.append({"pos": pos, "qty": sell_qty, "cur": cur, "reason": reason,
+                                    "sent_at": sent_at})
+            log_event("sell_auction_pending", {"symbol": sym, "qty": sell_qty,
+                                               "sent_at": sent_at.isoformat(timespec="seconds")})
+            logger.warning("[ORDER] %s %s 응답 불명(동시호가) — 15:30 체결 이후 확정", when, sym)
+            remaining.append(pos); return
         if not ok and _is_unknown(resp):
             # ★ 2026-09-30 삼성E&A: 응답이 10초를 넘겨 '거부'로 처리했는데 실제로는 접수·체결됐다
             #   (봇 포기 15:20:29 → 증권사 등록 15:20:32 → 15:30 동시호가 체결). state 에 유령 3주가
@@ -1364,18 +1470,7 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
                          f"({pnl_pct:+.2f}%) · 잔여 {pos['qty']}주 트레일 추종")
         else:
             save_state("positions", remaining + positions[idx + 1:])   # 매도 즉시 영속화(이중매도 방지)
-            hold_days = (datetime.now() - datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
-            net = round(pnl_pct - ROUNDTRIP_COST_PCT, 2)
-            rr_real = round((fill - entry) / (entry - pos["stop_price"]), 2) if entry > pos["stop_price"] else None
-            pnl_amt = round((fill - entry) * sell_qty)
-            closed.append({"pos": pos, "cur": fill, "net": net, "reason": reason, "qty": sell_qty,
-                           "pnl_amt": pnl_amt, "rr": rr_real, "hold": hold_days})
-            journal_append({"type": "exit", "id": pos["journal_id"], "symbol": sym, "name": pos["name"],
-                            "qty": sell_qty, "entry_price": entry, "exit_price": fill, "decided_at": cur,
-                            "pnl_pct": pnl_pct, "net_pct": net, "pnl_amount": pnl_amt,
-                            "rr_realized": rr_real, "reason": reason, "hold_days": hold_days})
-            log_event("exit", {"symbol": sym, "exit": fill, "decided_at": cur,
-                               "net_pct": net, "reason": reason})
+            _book_exit(pos, fill, cur, reason, sell_qty)
 
     processed = 0
     try:
@@ -1398,6 +1493,35 @@ async def _manage(do_exit_signals: bool, when: str) -> None:
         remaining += positions[processed:]
         await notify(f"🚨 <b>청산 세션 중단</b> [{when}] {processed}/{len(positions)}종 처리 후 실패\n"
                      f"{str(e)[:200]}\n→ 미처리분은 다음 cycle 재판정", critical=True)
+    # 동시호가 응답 불명 매도 확정(2026-10-12) — 모든 종목 매도를 낸 **뒤에** 15:30 체결을 기다려 확인한다.
+    if pending_auction:
+        try:
+            settled = await _settle_auction_sells(pending_auction)
+        except Exception as e:
+            logger.error("[ORDER] 동시호가 매도 확정 실패: %s", e, exc_info=True)
+            settled = {}
+        for p in pending_auction:
+            pos, sym = p["pos"], p["pos"]["symbol"]
+            verdict, fill, n = settled.get(sym, ("unverified", None, 0))
+            log_event("sell_auction_settled", {"phase": when, "symbol": sym, "qty": p["qty"],
+                                               "verdict": verdict, "fill": fill, "filled_qty": n})
+            if verdict == "filled":
+                remaining = [x for x in remaining if x is not pos]
+                _book_exit(pos, fill, p["cur"], f"{p['reason']} [응답 불명 → 15:30 체결 확인]", p["qty"])
+                logger.warning("[ORDER] %s %s 동시호가 체결 확인 %d주 @%.0f — 청산 처리", when, sym, n, fill)
+                continue
+            why = {"partial": f"일부만 체결({n}/{p['qty']}주 @{(fill or 0):,.0f}) — 장부 수량 수동 정정 필요",
+                   "absent": "15:30 이후에도 체결내역에 없음 — 미접수/미체결로 판단",
+                   }.get(verdict, "체결내역 조회 실패 — 확인 불가")
+            advice = ("→ 다음 cycle(익일 15:20) 재판정" if verdict == "absent"
+                      else "→ <b>재매도 전에</b> HTS 주문·체결내역부터 확인(이미 팔렸을 수 있음)")
+            logger.error("[REJECT] %s %s 동시호가 매도 미확정 — %s", when, sym, why)
+            log_event("order_reject", {"phase": when, "symbol": sym, "qty": p["qty"],
+                                       "reason": p["reason"], "why": f"응답 불명 · {why}"})
+            await notify(f"🚨 <b>매도 미확정</b> [{when}] {pos['name']}({sym}) {p['qty']}주 "
+                         f"사유:{p['reason']}\n원인: 주문 응답 불명 · {why}\n{advice}", critical=True)
+            sell_failures.append({"symbol": sym, "name": pos["name"], "qty": p["qty"],
+                                  "reason": p["reason"], "why": why})
     # ★ 아래 2줄은 예외 여부와 무관하게 실행돼야 한다. 과거엔 except 에서 return 해버려
     #   트레일 갱신이 폐기되고, 누적 매도거부 critical 알림도 발송되지 않았다.
     save_state("positions", remaining)

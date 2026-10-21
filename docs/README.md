@@ -17,6 +17,7 @@
 | 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
 | 8 | [2026-10-12-strategy-review.md](2026-10-12-strategy-review.md) | 전략 타당성 점검 — 월별·금리 국면·FOMC·켈리·구루 원칙 비교(설명용, 채택 아님) |
 | 9 | [2026-10-12-breakout-entry-declaration.md](2026-10-12-breakout-entry-declaration.md) | 진입 타점 A/B — 눌림 vs 돌파20/55. **미통과 → 눌림 유지**(돌파는 수익↑·MDD 18→29%·PF↓) |
+| 11 | [2026-10-21-candidate-data-comparison.md](2026-10-21-candidate-data-comparison.md) | **우리 전략은 KODEX200 단순보유에도 진다**(두 구간 모두). 구 벤치마크(상위100 동일가중)가 너무 쉬웠다. 추세 필터는 구간을 탄다 |
 | 10 | [2026-10-21-universe-refresh-revalidation.md](2026-10-21-universe-refresh-revalidation.md) | 유니버스 갱신만으로 MAR 0.96→0.66 → 워크포워드 **시점별 전환**(스냅샷 무관 확인). 신 정본 CAGR 7.6%·MDD 22.4%·MAR 0.34, ① 0.2%p 미달 → **신규진입 정지** |
 
 부수: [2026-08-28-rs-definition-ab.md](2026-08-28-rs-definition-ab.md)(RS 정의 A/B — 막다른 길),

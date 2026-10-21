@@ -47,6 +47,7 @@ from dart_fundamentals import OUT as FUND_PATH, latest_as_of  # noqa: E402
 EQUITY = 3_852_844.0
 FIN_SECTORS = frozenset({"금융", "증권", "보험"})
 MIN_VALUE_KRW = 5e8
+MIN_FUND_CODES = 250      # 재무 수집 종목 수 하한 — 정상 수집은 332(2026-10-22)
 
 D_ASSETS = ("069500", "133690", "148070", "132030", "138230")
 CASH_ETF = "153130"
@@ -294,6 +295,11 @@ def main() -> int:
     shares = P._SHARES[key]
     sectors = P._sector_map()
     fund = json.loads(FUND_PATH.read_text(encoding="utf-8"))
+    # 데이터 무결성 가드(2026-10-22): 중지했다고 생각한 수집 프로세스가 살아남아 파일을 84종목짜리로
+    # 덮어쓴 채 측정이 돌았다. 재무가 풀의 일부만 덮으면 '버핏식이 나쁘다'가 아니라 '데이터가 없다'다.
+    if len(fund) < MIN_FUND_CODES:
+        raise SystemExit(f"재무 {len(fund)}종목 < {MIN_FUND_CODES} — 수집이 불완전하다. "
+                         "python scripts/dart_fundamentals.py 를 다시 돌릴 것")
     stock_bars = {c: {d: {"open": b["open"], "close": b["close"], "value": b.get("value", 0)}
                       for d, b in bm.items()} for c, bm in sbars.items()}
     spx = Prices(stock_bars)

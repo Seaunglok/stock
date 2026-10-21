@@ -150,6 +150,25 @@ def test_leveraged_bars_doubles_daily_move():
     assert lev["2020-01-02"]["close"] == pytest.approx(120.0)
 
 
+def test_blend_grids_are_declared():
+    """★ 10-22 측정 전 선언."""
+    import lab_blend as G
+    assert G.G1_GRID == (0.3, 0.4, 0.5, 0.6, 0.7) and G.G1_DEFAULT == 0.5
+    assert G.G2_GRID == (0.2, 0.3, 0.4, 0.5) and G.G2_DEFAULT == 0.3
+
+
+def test_blend_reweights_latest_component_weights():
+    """한 구성요소만 새 비중을 내도 다른 구성요소의 **최신** 비중과 함께 재조합한다. 합 ≤ 1."""
+    import lab_blend as G
+    calls = {"a": [{"X": 1.0}, None, {"Y": 1.0}], "b": [{"Z": 1.0}, None, None]}
+    fa = lambda i, d: calls["a"][i]   # noqa: E731
+    fb = lambda i, d: calls["b"][i]   # noqa: E731
+    t = G.blend([(0.3, fa), (0.7, fb)])
+    assert t(0, "d0") == pytest.approx({"X": 0.3, "Z": 0.7})
+    assert t(1, "d1") is None                                  # 아무도 안 바뀌면 유지
+    assert t(2, "d2") == pytest.approx({"Y": 0.3, "Z": 0.7})   # b 는 직전 비중 유지
+
+
 def test_robustness_uses_median_not_best():
     """★ 가장 좋은 설정 하나가 아니라 중앙값으로 판정한다."""
     grid = [{"전체": _m(c, 15.0, -5.0), "박스권": _m(5.0), "강세장": _m(24.0)} for c in (5.0, 6.0, 40.0)]

@@ -75,6 +75,12 @@ SNAPSHOT = ""            # 풀을 뽑을 스냅샷(YYYYMMDD). 빈 값 = 최신
 PIT_ROBUST_MAR_TOL = 0.10
 PIT_ROBUST_MDD_TOL_PP = 2.0
 
+# ── 벤치마크 — KODEX200 단순보유 (2026-10-21 운용자 결정) ─────────────────────
+# 구 벤치마크(유니버스 동일가중)는 실제로 살 수 있는 시총가중 지수보다 훨씬 약했다
+# (2019~26 CAGR 11.0% vs KODEX200 23.2%). "벤치마크보다 낫다"는 판정이 쉬운 상대와의 비교였다.
+# "ew" 는 구 동작 재현용.
+BENCHMARK = "kodex200"
+
 
 # ── 재개 판정 기준 — **결과를 보기 전에 선언한다** (2026-08-28) ─────────────
 #
@@ -288,6 +294,29 @@ def _load_key() -> tuple:
     return (DATA_START, DATA_END, TOP_N, PIT_POOL, SNAPSHOT)
 
 
+def _bench_curve(bars: dict, dates: list[str], lo: str, hi: str) -> list[float]:
+    """검증구간 벤치마크 일별 곡선(시작=100) — 기본 KODEX200 단순보유, `ew` 면 구 동일가중."""
+    if BENCHMARK == "ew":
+        return _benchmark_curve(bars, dates, lo, hi, _bench_codes(bars, dates, lo, hi))
+    import strategy_lab as L
+    kb = L.load_bars(L.BENCH_CODE, "2014-01-01", DATA_END)
+    win = [d for d in dates if lo <= d <= hi]
+    curve, base, last = [], None, None
+    for d in win:
+        b = kb.get(d)
+        if b:
+            last = b["close"]
+        if last is None:
+            continue
+        if base is None:
+            base = last
+        curve.append(last / base * 100.0)
+    if curve and len(curve) != len(win):
+        # 앞머리에 KODEX 바가 없던 날은 첫 값으로 채운다(전략 곡선과 길이를 맞춰야 MDD 비교가 같다)
+        curve = [100.0] * (len(win) - len(curve)) + curve
+    return curve
+
+
 def _bench_codes(bars: dict, dates: list[str], lo: str, hi: str) -> frozenset[str] | None:
     """벤치마크 종목 — 시점별이면 **검증구간 첫날의** 시총 상위 TOP_N(그날 살 수 있던 것).
 
@@ -394,6 +423,7 @@ def _walk(dates: list[str], bars: dict, costs: Costs, secmap: dict,
     print("  " + "-" * 100)
     oos_returns, oos_bench, picks = [], [], []
     strat_curves, bench_curves = [], []
+    oos_dates: list[str] = []
     oos_days = 0
     for tr_lo, tr_hi, te_lo, te_hi in folds:
         scored = []
@@ -408,8 +438,9 @@ def _walk(dates: list[str], bars: dict, costs: Costs, secmap: dict,
         _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]}")
         _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]}")
 
-        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi, _bench_codes(bars, dates, te_lo, te_hi))
+        bcurve = _bench_curve(bars, dates, te_lo, te_hi)
         bench = (bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0
+        oos_dates.extend(d for d in dates if te_lo <= d <= te_hi)
         oos_returns.append(te["total"])
         oos_bench.append(bench)
         picks.append(best.label)
@@ -420,7 +451,8 @@ def _walk(dates: list[str], bars: dict, costs: Costs, secmap: dict,
         print(f"  {te_lo[:4]:11} {tr_lo[:7]}~{tr_hi[:7]:<15} {best.label:22} "
               f"{tr_mar:>8} {te['total']:>+8.1f}% {te['mdd']:>7.1f}% {bench:>+8.1f}%")
     print("  " + "-" * 100)
-    return (oos_returns, oos_bench, picks, _stitch(strat_curves), _stitch(bench_curves), oos_days)
+    return (oos_returns, oos_bench, picks, _stitch(strat_curves), _stitch(bench_curves), oos_days,
+            oos_dates)
 
 
 def judge_robust(a: dict, b: dict) -> list[tuple[str, bool, str]]:
@@ -561,7 +593,7 @@ def _entry_ab(dates: list[str], bars: dict, costs: Costs, secmap: dict,
             _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]} {cand.label}")
             _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]} {cand.label}")
             tested[cand] = te
-        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi, _bench_codes(bars, dates, te_lo, te_hi))
+        bcurve = _bench_curve(bars, dates, te_lo, te_hi)
         bench_curves.append(bcurve)
         bench_rets.append((bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0)
         line = []
@@ -706,8 +738,13 @@ def _cagr(curve: list[float], n_days: int) -> float:
 
 
 def _summary(rets: list[float], bench: list[float], picks: list[str],
-             strat: list[float], bmk: list[float], oos_days: int) -> dict:
-    """출력 + 판정 결과 반환 {s, b, wins, n, pass, picks, rets}. 곡선이 없으면 pass=False."""
+             strat: list[float], bmk: list[float], oos_days: int,
+             oos_dates: list[str] | None = None) -> dict:
+    """출력 + 판정 결과 반환 {s, b, wins, n, pass, lab_pass, picks, rets}. 곡선이 없으면 pass=False.
+
+    pass     = 08-28 재개 기준(①②③, 벤치마크 대비) — 10-21 운용 판정이 이걸로 내려졌다.
+    lab_pass = 10-22 운용자 잣대(`strategy_lab.judge`) — 이후 모든 채택 판정의 기준.
+    """
     n = len(rets)
     if not n or len(strat) < 2 or len(bmk) < 2:
         print("  폴드 없음 / 곡선 부족")
@@ -750,13 +787,34 @@ def _summary(rets: list[float], bench: list[float], picks: list[str],
         print("    → **조건 충족** — 다음 단계(모의운용 후 단계적 재개) 검토 가능")
     else:
         print("    → 조건 미충족 — 신규진입 정지 유지(TREND_ENTRY_HALT=true)")
+    lab_pass = False
+    if oos_dates and len(oos_dates) == len(strat) == len(bmk):
+        import strategy_lab as L
+        spans = {"전체": (oos_dates[0], oos_dates[-1]), **L.PERIODS}
+        sl = {k: L.metrics(*_window(oos_dates, strat, *v)) for k, v in spans.items()
+              if _window(oos_dates, strat, *v)[0]}
+        bl = {k: L.metrics(*_window(oos_dates, bmk, *v)) for k, v in spans.items()
+              if _window(oos_dates, bmk, *v)[0]}
+        rows = L.judge(sl, bl)
+        lab_pass = L.passed(rows)
+        print()
+        print(f"  신 잣대(2026-10-22 운용자 선언, 벤치 {BENCHMARK}) — strategy_lab.judge")
+        for name, ok, text in rows:
+            print(f"    [{'O' if ok else 'X'}] {name}: {text}")
+        print(f"    → {'충족' if lab_pass else '미충족'}"
+              + ("  (워크포워드 검증구간이 2019~ 라 박스권 구간은 여기서 판정할 수 없다)"
+                 if "박스권" not in sl else ""))
     print()
-    print("  ※ 유니버스 생존편향은 전략·벤치마크가 **공유**한다 → 상대 비교만 유효,")
-    print("     절대 수익률은 실제보다 부풀려져 있다.")
+    print("  ※ 시점별이어도 풀이 '현재' 상위 350 이라 편향이 남는다 — 절대 수익률은 부풀려져 있다.")
     return {"s": {"total": s_tot, "cagr": s_cagr, "mdd": s_mdd, "mar": s_mar},
             "b": {"total": b_tot, "cagr": b_cagr, "mdd": b_mdd, "mar": b_mar},
-            "wins": wins, "n": n, "pass": bool(c1 and c2 and c3),
+            "wins": wins, "n": n, "pass": bool(c1 and c2 and c3), "lab_pass": lab_pass,
             "picks": list(picks), "rets": list(rets)}
+
+
+def _window(dates: list[str], curve: list[float], lo: str, hi: str) -> tuple[list[str], list[float]]:
+    pts = [(d, v) for d, v in zip(dates, curve) if lo <= d <= hi]
+    return [d for d, _ in pts], [v for _, v in pts]
 
 
 if __name__ == "__main__":

@@ -183,6 +183,26 @@ def test_bench_codes_are_first_day_top(monkeypatch):
     assert W._bench_codes(bars, ds, "2020-01-01", "2020-12-31") == {"A"}
 
 
+def test_benchmark_is_kodex200_buy_and_hold(monkeypatch):
+    """★ 10-21 결정 — 벤치마크는 실제로 살 수 있는 KODEX200. 구 동일가중은 너무 쉬웠다."""
+    import strategy_lab as L
+    assert W.BENCHMARK == "kodex200"
+    ds = ["2020-01-02", "2020-01-03", "2020-01-06"]
+    monkeypatch.setattr(L, "load_bars", lambda code, s, e: {
+        "2020-01-03": {"open": 100.0, "close": 100.0}, "2020-01-06": {"open": 100.0, "close": 130.0}})
+    c = W._bench_curve({}, ds, ds[0], ds[-1])
+    assert len(c) == len(ds), "전략 곡선과 길이가 다르면 MDD·연도 비교가 어긋난다"
+    assert c[-1] == pytest.approx(130.0)
+
+
+def test_ew_benchmark_still_available(monkeypatch):
+    ds = ["2020-01-02", "2020-12-31"]
+    bars = {"A": {d: {"close": v} for d, v in zip(ds, [100.0, 150.0])}}
+    monkeypatch.setattr(W, "BENCHMARK", "ew")
+    monkeypatch.setattr(W, "PIT_POOL", 0)
+    assert W._bench_curve(bars, ds, ds[0], ds[1])[-1] == pytest.approx(150.0)
+
+
 def _res(mar, mdd, ok=True):
     return {"s": {"mar": mar, "mdd": mdd}, "pass": ok}
 

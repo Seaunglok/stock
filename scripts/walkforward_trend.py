@@ -58,6 +58,23 @@ DATA_START = "2015-01-01"
 DATA_END = "2026-08-25"
 TOP_N = 100
 
+# ── 유니버스 — 시점별(PIT) 이 기본 (2026-10-21 선언, 측정 전) ─────────────────
+#
+# 08-28 ~ 10-20 의 정본 수치는 **현재** 시총 상위 100 을 과거에 소급한 유니버스로 쟀다.
+# 10-21 스냅샷을 갱신해 경계 3종목(96~111위)만 바뀌었는데 MAR 0.96→0.66, 기준 ① 미달이 됐다
+# (docs/2026-10-21-universe-refresh-revalidation.md). 스냅샷마다 과거 성적이 바뀌는 하니스로는
+# 운용 판정을 할 수 없다. 현재 시총 상위 PIT_POOL 풀을 받아 두고 **매일 그날 종가 × 상장주식수로
+# 상위 TOP_N 을 다시 뽑는다**(backtest_trend.py 의 V_PIT_UNIVERSE 와 같은 방식).
+# 남는 편향: 풀이 '현재' 상위 350 이라 그 밖으로 떨어진 종목은 복원 안 됨 · 상장주식수 현재값 고정.
+PIT_POOL = 350           # 0 = 구 동작(소급 유니버스, `--no-pit`)
+SNAPSHOT = ""            # 풀을 뽑을 스냅샷(YYYYMMDD). 빈 값 = 최신
+
+# PIT 하니스의 **강건성** — 스냅샷을 바꿔도 결과가 거의 같아야 판정에 쓸 수 있다.
+# 소급 하니스는 08-28→10-21 에서 MAR 0.30 · MDD 4.0%p 움직였다. 그 1/3 수준 이내를 요구한다.
+# 미달이면 PIT 하니스로도 판정할 수 없다는 뜻이므로 **보수적으로 신규진입 정지**한다.
+PIT_ROBUST_MAR_TOL = 0.10
+PIT_ROBUST_MDD_TOL_PP = 2.0
+
 
 # ── 재개 판정 기준 — **결과를 보기 전에 선언한다** (2026-08-28) ─────────────
 #
@@ -260,10 +277,29 @@ def _run(c: Candidate, lo: str, hi: str, costs: Costs, secmap: dict) -> dict:
                      c.max_pos, 0, "partial" in c.exits, secmap,
                      hard_stop_pct=c.hard_stop, rank_mode=RANK_MODE,
                      regime_ma=REGIME_MA, breadth_min=BREADTH_MIN_PCT,
-                     exits=c.exits, sim_from=lo, sim_to=hi)
+                     exits=c.exits, sim_from=lo, sim_to=hi,
+                     pit_pool=PIT_POOL, snapshot=SNAPSHOT)
     m = P.pmetrics(res, res.n_days)
     m["_res"] = res
     return m
+
+
+def _load_key() -> tuple:
+    return (DATA_START, DATA_END, TOP_N, PIT_POOL, SNAPSHOT)
+
+
+def _bench_codes(bars: dict, dates: list[str], lo: str, hi: str) -> frozenset[str] | None:
+    """벤치마크 종목 — 시점별이면 **검증구간 첫날의** 시총 상위 TOP_N(그날 살 수 있던 것).
+
+    소급 모드(None)는 로드된 전 종목 = 현재 상위 TOP_N(구 동작). 시점별 모드에서 풀 350 전체를
+    벤치마크로 쓰면 전략(상위 100)과 다른 모집단을 비교하게 된다.
+    """
+    if not PIT_POOL:
+        return None
+    first = next((d for d in dates if lo <= d <= hi), None)
+    if first is None:
+        return frozenset()
+    return P.day_top(bars, P._SHARES[_load_key()], first, TOP_N, _load_key())
 
 
 def _folds(dates: list[str], train_years: int, test_years: int) -> list[tuple[str, str, str, str]]:
@@ -300,32 +336,62 @@ def main() -> int:
                     help="전 후보 노출 배수(1.0=만기투자). 운영 결정이지 학습 대상이 아니다")
     ap.add_argument("--entry-ab", action="store_true",
                     help="진입 타점 A/B — 눌림 vs 돌파 절차 4개를 같은 폴드에서 비교(2026-10-12 선언)")
+    ap.add_argument("--no-pit", action="store_true",
+                    help="소급 유니버스(현재 시총 상위를 과거에 적용) — 구 동작 재현용, 생존편향 포함")
+    ap.add_argument("--snapshot", default="",
+                    help="시점별 풀을 뽑을 유니버스 스냅샷 YYYYMMDD(기본 최신)")
+    ap.add_argument("--compare-snapshots", default="",
+                    help="A,B — 두 스냅샷으로 같은 절차를 돌려 강건성·운용 판정(2026-10-21 선언). "
+                         "판정은 마지막(B) 스냅샷 기준")
     args = ap.parse_args()
-    global EXPOSURE
+    global EXPOSURE, PIT_POOL, SNAPSHOT
     EXPOSURE = args.exposure
     if not 0.05 <= EXPOSURE <= 1.5:
         raise SystemExit(f"--exposure 범위 이상: {EXPOSURE}")
+    if args.no_pit:
+        PIT_POOL = 0
+    SNAPSHOT = args.snapshot
 
     costs = Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS)
     secmap = P._sector_map()
-    dates, bars, _closes, _ordered = P._load(DATA_START, DATA_END, TOP_N)
+    if args.compare_snapshots:
+        snaps = [s.strip() for s in args.compare_snapshots.split(",") if s.strip()]
+        if len(snaps) != 2 or not PIT_POOL:
+            raise SystemExit("--compare-snapshots 는 A,B 두 개 + 시점별 모드에서만")
+        return _compare_snapshots(snaps, costs, secmap, args.train_years, args.test_years, args.metric)
+    dates, bars, _closes, _ordered = P._load(*_load_key())
     if args.select_now:
         return _select_now(dates, costs, secmap, args.train_years, args.metric)
     if args.entry_ab:
         return _entry_ab(dates, bars, costs, secmap, args.train_years, args.test_years, args.metric)
     folds = _folds(dates, args.train_years, args.test_years)
     _assert_folds(folds)
+    _header("워크포워드 검증", dates, folds, args)
+    _summary(*_walk(dates, bars, costs, secmap, folds, args.metric))
+    return 0
 
+
+def _universe_label() -> str:
+    if not PIT_POOL:
+        return f"유니버스 소급(현재 시총상위 {TOP_N}) ⚠️ 생존편향"
+    return f"유니버스 시점별(풀 {PIT_POOL}·스냅샷 {SNAPSHOT or '최신'} → 매일 시총상위 {TOP_N})"
+
+
+def _header(title: str, dates: list[str], folds: list, args) -> None:
     print("=" * 112)
-    print(f"워크포워드 검증 — 학습 {args.train_years}년 / 검증 {args.test_years}년 롤링 · "
+    print(f"{title} — 학습 {args.train_years}년 / 검증 {args.test_years}년 롤링 · "
           f"선택기준 {args.metric.upper()} · 후보 {len(GRID)}개 · 폴드 {len(folds)}개 · "
           f"노출 {EXPOSURE:.0%}")
-    print(f"데이터 {dates[0]}~{dates[-1]} ({len(dates)} 영업일) · 유니버스 시총상위 {TOP_N}")
+    print(f"데이터 {dates[0]}~{dates[-1]} ({len(dates)} 영업일) · {_universe_label()}")
     print("=" * 112)
+
+
+def _walk(dates: list[str], bars: dict, costs: Costs, secmap: dict,
+          folds: list[tuple[str, str, str, str]], metric: str) -> tuple:
+    """GRID 로 폴드마다 고르고 검증 — `_summary` 인자 튜플을 돌려준다(폴드 표는 여기서 출력)."""
     print(f"  {'검증구간':11} {'학습구간':23} {'선택된 규칙':22} "
           f"{'학습MAR':>8} {'검증수익':>9} {'검증MDD':>8} {'벤치마크':>9}")
     print("  " + "-" * 100)
-
     oos_returns, oos_bench, picks = [], [], []
     strat_curves, bench_curves = [], []
     oos_days = 0
@@ -335,14 +401,14 @@ def main() -> int:
             m = _run(cand, tr_lo, tr_hi, costs, secmap)
             _assert_window(m["_res"], tr_lo, tr_hi, dates, f"학습 {tr_lo[:4]}")
             scored.append((cand, m))
-        best, tm = select(scored, args.metric)
+        best, tm = select(scored, metric)
 
         # ── 검증: 선택이 끝난 **뒤에만** 이 구간을 만진다 ──
         te = _run(best, te_lo, te_hi, costs, secmap)
         _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]}")
         _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]}")
 
-        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi)
+        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi, _bench_codes(bars, dates, te_lo, te_hi))
         bench = (bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0
         oos_returns.append(te["total"])
         oos_bench.append(bench)
@@ -353,10 +419,60 @@ def main() -> int:
         tr_mar = "inf" if tm["mar"] == float("inf") else f"{tm['mar']:.2f}"
         print(f"  {te_lo[:4]:11} {tr_lo[:7]}~{tr_hi[:7]:<15} {best.label:22} "
               f"{tr_mar:>8} {te['total']:>+8.1f}% {te['mdd']:>7.1f}% {bench:>+8.1f}%")
-
     print("  " + "-" * 100)
-    _summary(oos_returns, oos_bench, picks,
-             _stitch(strat_curves), _stitch(bench_curves), oos_days)
+    return (oos_returns, oos_bench, picks, _stitch(strat_curves), _stitch(bench_curves), oos_days)
+
+
+def judge_robust(a: dict, b: dict) -> list[tuple[str, bool, str]]:
+    """두 스냅샷 결과(_summary 반환값)의 차이가 선언 허용폭 이내인가 — [(기준, 통과, 설명)]."""
+    dm = abs(a["s"]["mar"] - b["s"]["mar"])
+    dd = abs(a["s"]["mdd"] - b["s"]["mdd"])
+    return [
+        ("MAR 차이", dm <= PIT_ROBUST_MAR_TOL,
+         f"|{a['s']['mar']:.2f} − {b['s']['mar']:.2f}| = {dm:.2f} ≤ {PIT_ROBUST_MAR_TOL:g}"),
+        ("MDD 차이", dd <= PIT_ROBUST_MDD_TOL_PP,
+         f"|{a['s']['mdd']:.1f} − {b['s']['mdd']:.1f}| = {dd:.1f}%p ≤ {PIT_ROBUST_MDD_TOL_PP:g}%p"),
+    ]
+
+
+def decide(robust_ok: bool, current_pass: bool) -> str:
+    """운용 판정(2026-10-21 선언). 강건성 미달이면 결과와 무관하게 정지 — 판정 근거가 없으므로."""
+    if not robust_ok:
+        return "HALT"
+    return "CONTINUE" if current_pass else "HALT"
+
+
+def _compare_snapshots(snaps: list[str], costs: Costs, secmap: dict,
+                       train_years: int, test_years: int, metric: str) -> int:
+    """같은 절차를 두 스냅샷의 시점별 풀로 돌려 강건성을 보고, **B(최신)** 결과로 운용을 판정한다."""
+    global SNAPSHOT
+    out = {}
+    for snap in snaps:
+        SNAPSHOT = snap
+        dates, bars, _c, _o = P._load(*_load_key())
+        folds = _folds(dates, train_years, test_years)
+        _assert_folds(folds)
+        ns = argparse.Namespace(train_years=train_years, test_years=test_years, metric=metric)
+        _header(f"워크포워드 [{snap}]", dates, folds, ns)
+        out[snap] = _summary(*_walk(dates, bars, costs, secmap, folds, metric))
+    a, b = out[snaps[0]], out[snaps[1]]
+    print("=" * 112)
+    print(f"강건성 — 스냅샷 {snaps[0]} vs {snaps[1]} (선언 허용폭: MAR ±{PIT_ROBUST_MAR_TOL:g} · "
+          f"MDD ±{PIT_ROBUST_MDD_TOL_PP:g}%p)")
+    rows = judge_robust(a, b)
+    for name, ok, text in rows:
+        print(f"    [{'O' if ok else 'X'}] {name}: {text}")
+    same = a["picks"] == b["picks"]
+    print(f"    (참고) 폴드별 선택 규칙 {'동일' if same else '다름'}")
+    robust_ok = all(ok for _, ok, _ in rows)
+    verdict = decide(robust_ok, b["pass"])
+    print()
+    if verdict == "CONTINUE":
+        print(f"  → 운용 지속 — 강건성 통과 + 최신 스냅샷({snaps[1]}) 기준 ①②③ 충족")
+    elif not robust_ok:
+        print("  → 신규진입 정지(TREND_ENTRY_HALT=true) — 시점별 하니스도 스냅샷에 흔들려 판정 근거가 없다")
+    else:
+        print(f"  → 신규진입 정지(TREND_ENTRY_HALT=true) — 최신 스냅샷({snaps[1]}) 기준 ①②③ 미충족")
     return 0
 
 
@@ -375,6 +491,7 @@ def _select_now(dates: list[str], costs: Costs, secmap: dict,
     n = sum(1 for d in dates if lo <= d <= hi)
     print("=" * 92)
     print(f"연간 재선택 — {yr}년에 쓸 규칙 (학습 {lo[:7]}~{hi[:7]}, {n} 영업일, 기준 {metric.upper()})")
+    print(f"  {_universe_label()}")
     print("=" * 92)
     if n < 250 * train_years * 0.8:
         print(f"  ⚠️ 학습 영업일이 부족하다({n}) — 데이터 범위(DATA_END={DATA_END})를 확인할 것")
@@ -444,7 +561,7 @@ def _entry_ab(dates: list[str], bars: dict, costs: Costs, secmap: dict,
             _assert_window(te["_res"], te_lo, te_hi, dates, f"검증 {te_lo[:4]} {cand.label}")
             _assert_no_leak(te["_res"], te_lo, te_hi, f"검증 {te_lo[:4]} {cand.label}")
             tested[cand] = te
-        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi)
+        bcurve = _benchmark_curve(bars, dates, te_lo, te_hi, _bench_codes(bars, dates, te_lo, te_hi))
         bench_curves.append(bcurve)
         bench_rets.append((bcurve[-1] / bcurve[0] - 1) * 100 if len(bcurve) > 1 else 0.0)
         line = []
@@ -520,17 +637,21 @@ def _curve_stats(curve: list[float], n_days: int) -> dict:
             "mar": cagr / mdd if mdd > 0 else float("inf")}
 
 
-def _benchmark_curve(bars: dict, dates: list[str], lo: str, hi: str) -> list[float]:
+def _benchmark_curve(bars: dict, dates: list[str], lo: str, hi: str,
+                     codes: frozenset[str] | None = None) -> list[float]:
     """같은 구간·같은 유니버스 동일가중 매수후보유의 **일별** 지수(시작=100).
 
     생존편향을 전략과 공유하므로 상대 비교가 유효하다. 일별로 만드는 이유는 MDD 를
     같은 기준으로 재기 위해서다 — 시작·끝 두 점만으로는 낙폭을 알 수 없다.
+    codes: 벤치마크 종목 제한(시점별 모드 — `_bench_codes`). None 이면 로드된 전 종목.
     """
     win = [d for d in dates if lo <= d <= hi]
     if not win:
         return []
     base = {}
     for code, dm in bars.items():
+        if codes is not None and code not in codes:
+            continue
         first = next((dm[d]["close"] for d in win if d in dm), None)
         if first and first > 0:
             base[code] = first
@@ -585,11 +706,13 @@ def _cagr(curve: list[float], n_days: int) -> float:
 
 
 def _summary(rets: list[float], bench: list[float], picks: list[str],
-             strat: list[float], bmk: list[float], oos_days: int) -> None:
+             strat: list[float], bmk: list[float], oos_days: int) -> dict:
+    """출력 + 판정 결과 반환 {s, b, wins, n, pass, picks, rets}. 곡선이 없으면 pass=False."""
     n = len(rets)
     if not n or len(strat) < 2 or len(bmk) < 2:
         print("  폴드 없음 / 곡선 부족")
-        return
+        return {"s": _curve_stats([], 0), "b": _curve_stats([], 0), "wins": 0, "n": n,
+                "pass": False, "picks": list(picks), "rets": list(rets)}
 
     s_tot = (strat[-1] / strat[0] - 1) * 100
     b_tot = (bmk[-1] / bmk[0] - 1) * 100
@@ -630,6 +753,10 @@ def _summary(rets: list[float], bench: list[float], picks: list[str],
     print()
     print("  ※ 유니버스 생존편향은 전략·벤치마크가 **공유**한다 → 상대 비교만 유효,")
     print("     절대 수익률은 실제보다 부풀려져 있다.")
+    return {"s": {"total": s_tot, "cagr": s_cagr, "mdd": s_mdd, "mar": s_mar},
+            "b": {"total": b_tot, "cagr": b_cagr, "mdd": b_mdd, "mar": b_mar},
+            "wins": wins, "n": n, "pass": bool(c1 and c2 and c3),
+            "picks": list(picks), "rets": list(rets)}
 
 
 if __name__ == "__main__":

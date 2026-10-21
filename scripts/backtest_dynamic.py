@@ -94,7 +94,7 @@ def get_broad_universe() -> list[str]:
 _PIT_POOL_CACHE: dict = {}
 
 
-def get_pit_pool(pool_n: int = 350) -> list[tuple[str, int]]:
+def get_pit_pool(pool_n: int = 350, snapshot: str = "") -> list[tuple[str, int]]:
     """시점별(point-in-time) 유니버스용 후보 풀 — [(code, 상장주식수)].
 
     `get_broad_universe()` 는 **오늘 시총 상위 150** 이라, 과거 구간에 소급 적용하면
@@ -105,11 +105,21 @@ def get_pit_pool(pool_n: int = 350) -> list[tuple[str, int]]:
     ⚠️ 완전한 제거는 아니다. 풀 자체가 **현재** 시총 상위 pool_n 이라, 과거엔 상위였다가
     지금은 pool_n 밖으로 떨어진 종목은 복원되지 않는다. 상장주식수도 현재값 고정이라
     증자/감자/액면분할은 반영하지 않는다. 남는 편향의 방향은 여전히 **수치를 부풀리는** 쪽이다.
+
+    snapshot: 'YYYYMMDD' 로 특정 스냅샷을 고정한다(빈 값=최신). 스냅샷 간 결과 비교(강건성
+    점검)용 — 없는 날짜면 조용히 최신으로 대체하지 않고 실패한다(대체하면 비교가 무의미해진다).
     """
-    if pool_n in _PIT_POOL_CACHE:
-        return _PIT_POOL_CACHE[pool_n]
-    snaps = sorted(Path(__file__).parent.parent.joinpath("docs_cache").glob("universe_kiwoom_*.json"),
-                   reverse=True)
+    key = (pool_n, snapshot)
+    if key in _PIT_POOL_CACHE:
+        return _PIT_POOL_CACHE[key]
+    cache_dir = Path(__file__).parent.parent.joinpath("docs_cache")
+    if snapshot:
+        snap = cache_dir / f"universe_kiwoom_{snapshot}.json"
+        if not snap.exists():
+            raise FileNotFoundError(f"스냅샷 없음: {snap.name}")
+        snaps = [snap]
+    else:
+        snaps = sorted(cache_dir.glob("universe_kiwoom_*.json"), reverse=True)
     if not snaps:
         raise RuntimeError("docs_cache/universe_kiwoom_*.json 없음")
     raw = json.loads(snaps[0].read_text(encoding="utf-8"))
@@ -118,7 +128,7 @@ def get_pit_pool(pool_n: int = 350) -> list[tuple[str, int]]:
              and s.get("market_cap", 0) > 0 and s.get("list_count", 0) > 0]
     kospi.sort(key=lambda s: -s["market_cap"])
     out = [(str(s["code"]).zfill(6), int(s["list_count"])) for s in kospi[:pool_n]]
-    _PIT_POOL_CACHE[pool_n] = out
+    _PIT_POOL_CACHE[key] = out
     return out
 
 

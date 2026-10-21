@@ -42,7 +42,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 with contextlib.redirect_stdout(io.StringIO()):
     import FinanceDataReader as fdr
 
-from backtest_dynamic import get_broad_universe, get_market_series, get_ohlcv  # noqa: E402
+from backtest_dynamic import get_broad_universe, get_market_series, get_ohlcv, get_pit_pool  # noqa: E402
 from backtest_walkforward import Costs                       # noqa: E402
 from src.mcp_servers.closing_bet_mcp.exit_rules import ratchet_stop  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as COSTS  # noqa: E402  거래비용 단일 소스
@@ -142,12 +142,25 @@ class Result:
 _CACHE: dict = {}
 
 
-def _load(start: str, end: str, top_n: int):
-    key = (start, end, top_n)
+def _load(start: str, end: str, top_n: int, pit_pool: int = 0, snapshot: str = ""):
+    """OHLCV 로드(캐시). pit_pool>0 이면 **시점별 유니버스**용 넓은 풀을 받는다.
+
+    pit_pool=0 : 현재 스냅샷 시총 상위 top_n 을 과거에 소급(구 동작 — 생존편향).
+    pit_pool=N : 현재 시총 상위 N 풀을 받아 두고, 매일 `종가 × 상장주식수` 로 다시 순위를
+                 매겨 그날의 상위 top_n 만 쓴다(`day_top`). 2026-10-21: 스냅샷을 바꿔 경계
+                 3종목만 교체했는데 워크포워드 MAR 이 0.96→0.66 으로 움직였다 — 소급 유니버스는
+                 스냅샷마다 과거 성적이 바뀐다.
+    """
+    key = (start, end, top_n, pit_pool, snapshot)
     if key in _CACHE:
         return _CACHE[key]
     dates, _mkt_close = get_market_series(start, end)
-    codes = get_broad_universe()[:top_n]
+    if pit_pool:
+        pool = get_pit_pool(pit_pool, snapshot)
+        codes = [c for c, _ in pool]
+        _SHARES[key] = dict(pool)
+    else:
+        codes = get_broad_universe()[:top_n]
     bars: dict[str, dict] = {}     # code → {date → bar}
     closes: dict[str, list] = {}   # code → date-ordered close list (동일 캘린더 정렬용)
     ordered: dict[str, list] = {}  # code → date-ordered date list
@@ -164,10 +177,38 @@ def _load(start: str, end: str, top_n: int):
         closes[code] = [b["close"] for b in h]
         if i % 40 == 0:
             print(f"  유니버스 로드 {i}/{len(codes)}")
-    print(f"  → {len(bars)}종목 로드 완료 · {len(dates)} 영업일")
+    print(f"  → {len(bars)}종목 로드 완료 · {len(dates)} 영업일"
+          + (f" · 시점별 풀 {pit_pool}(스냅샷 {snapshot or '최신'})" if pit_pool else ""))
     res = (dates, bars, closes, ordered)
     _CACHE[key] = res
     return res
+
+
+_SHARES: dict = {}     # _load 키 → {code: 상장주식수} (시점별 모드만)
+_DAY_TOP: dict = {}    # (_load 키, date) → 그날 시총 상위 top_n 코드 frozenset
+
+
+def day_top(bars: dict, shares: dict[str, int], date_str: str, top_n: int,
+            memo_key: tuple | None = None) -> frozenset[str]:
+    """그날 `종가 × 상장주식수` 상위 top_n — **그날 바가 있는 종목만**, 그날 종가로만 매긴다.
+
+    미래 정보를 쓰지 않는다: 순위에 쓰는 값은 date_str 당일 종가뿐이다(신호도 당일 종가로 내고
+    다음 날 시가에 사므로 같은 시점 정보). 상장주식수가 없거나 0 인 종목은 순위에서 뺀다.
+    """
+    k = (memo_key, date_str, top_n) if memo_key is not None else None
+    if k is not None and k in _DAY_TOP:
+        return _DAY_TOP[k]
+    caps = []
+    for code, dmap in bars.items():
+        b = dmap.get(date_str)
+        n = shares.get(code, 0)
+        if b and n > 0 and b["close"] > 0:
+            caps.append((b["close"] * n, code))
+    caps.sort(reverse=True)
+    out = frozenset(c for _, c in caps[:top_n])
+    if k is not None:
+        _DAY_TOP[k] = out
+    return out
 
 
 def _closes_upto(closes_list, date_list, date_str):
@@ -225,12 +266,24 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
              hard_stop_pct: float = 0.0, rank_mode: str = "composite",
              regime_ma: int = 0, breadth_min: float = 0.0,
              exits: tuple[str, ...] = ("partial", "trail", "ma", "hold"),
-             sim_from: str = "", sim_to: str = "") -> Result:
+             sim_from: str = "", sim_to: str = "",
+             pit_pool: int = 0, snapshot: str = "") -> Result:
     """일자별 포트폴리오 시뮬. sector_cap<=0 이면 상한 없음. partial_on=False 면 순수 트레일.
 
     hard_stop_pct: 진입가 -X% 하드손절(트레일 floor). 라이브 TREND_HARD_STOP_PCT 미러용.
+    pit_pool: >0 이면 시점별 유니버스 — 신호 후보와 breadth 를 **그날의** 시총 상위 top_n 으로
+              제한한다(`day_top`). 보유 포지션 관리는 유니버스와 무관(라이브와 같다).
     """
-    dates, bars, closes, ordered = _load(start, end, top_n)
+    dates, bars, closes, ordered = _load(start, end, top_n, pit_pool, snapshot)
+    load_key = (start, end, top_n, pit_pool, snapshot)
+    # ⚠️ 이름을 `shares` 로 하면 아래 진입부의 `shares = _target_shares(...)`(매수 주식수)가
+    #    이 dict 를 덮어써, 첫 매수 다음 날부터 순위 계산이 int.get 으로 터진다(테스트로 발견).
+    pit_shares = _SHARES.get(load_key, {}) if pit_pool else {}
+    if pit_pool and not pit_shares:
+        raise RuntimeError("시점별 모드인데 상장주식수가 없다 — 유니버스가 조용히 비게 된다")
+
+    def universe_on(date_str: str) -> frozenset[str] | None:
+        return day_top(bars, pit_shares, date_str, top_n, load_key) if pit_pool else None
     # 시뮬 구간 제한 — bars/closes 는 **전 구간을 그대로 둔다**. 이평·ATR·RS 워밍업은
     # 구간 이전 데이터에서 계속 계산되고, 매매 판단만 [sim_from, sim_to] 안에서 일어난다.
     # 워크포워드에서 폴드마다 데이터를 다시 로드하지 않기 위한 것이며, 동시에
@@ -348,8 +401,10 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
                 blocked = True
         if not blocked and breadth_min > 0:
             # 라이브는 업종지수 상승종목 비율을 쓰지만 하니스엔 없다 → 그날 유니버스 양봉비율로 근사
-            # (backtest_trend.py 의 V_BREADTH_MIN_PCT 와 동일 대용).
-            day = [dmap.get(date_str) for dmap in bars.values()]
+            # (backtest_trend.py 의 V_BREADTH_MIN_PCT 와 동일 대용). 시점별 모드면 풀 전체(350)가
+            # 아니라 **그날의 상위 top_n** 으로 잰다 — 풀로 재면 게이트 자체가 달라진다.
+            top = universe_on(date_str)
+            day = [dmap.get(date_str) for code, dmap in bars.items() if top is None or code in top]
             day = [b for b in day if b]
             if day:
                 rising = sum(1 for b in day if b["close"] > b["open"])
@@ -364,7 +419,10 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
         if di < len(dates) - 1 and len(positions) < max_pos:
             kospi_upto = None   # RS 는 종목 자체 시계열로 계산됨(entry_signal 내부) → KOSPI 필요분만
             cands = []
+            top = universe_on(date_str)
             for code, dmap in bars.items():
+                if top is not None and code not in top:
+                    continue
                 b = dmap.get(date_str)
                 if not b or b["value"] < MIN_VALUE_KRW:
                     continue

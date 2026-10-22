@@ -107,6 +107,28 @@ def test_parse_fills_buy_and_sell():
     assert FL.parse_fills({"success": False}, "488770", "매수") is None
 
 
+def test_trend_io_sell_parser_delegates_with_same_rules():
+    """trend_kiwoom_io._parse_sell_orders(= i3_fills.parse_fills 매도) — 보관한 test_unknown_sell 의 파서 검사를 옮겨 왔다.
+    부호 붙은 숫자·종목코드 앞 'A'·취소/거부 제외·시각 이후만·오류 응답은 None(8050 을 '주문 없음'으로 읽지 않는다)."""
+    import json
+    import trend_kiwoom_io as IO
+
+    def row(sym="000001", side="-매도", oq="3", cq="3", px="94", tm="152100", stt="체결"):
+        return {"stk_cd": sym, "io_tp_nm": side, "ord_qty": oq, "cntr_qty": cq, "cntr_pric": px,
+                "ord_stt": stt, "ord_tm": tm}
+
+    def execs(*rows):
+        return json.dumps({"success": True, "data": {"cntr": list(rows), "return_code": 0}}, ensure_ascii=False)
+    got = IO._parse_sell_orders(execs(row(sym="A000001", oq="+3", cq="2", px="-94", tm="152032"),
+                                      row(oq="1", cq="1", px="96", tm="152040"),
+                                      row(side="-매도취소", tm="152050"), row(stt="거부", tm="152055"),
+                                      row(tm="151000")), "000001", "152000")
+    assert got[0] == 4 and got[1] == 3 and got[2] == pytest.approx((2 * 94 + 1 * 96) / 3)
+    assert IO._parse_sell_orders("not json", "000001") is None
+    bad_rc = json.dumps({"success": True, "data": {"cntr": [], "return_code": 3, "return_msg": "8050"}})
+    assert IO._parse_sell_orders(bad_rc, "000001") is None
+
+
 def test_fill_record_slippage_sign():
     r = FL.fill_record("2026-10-23", "buy", "488770", 34, "지정가", 106_965, 105_905, (34, 34, 105_912.0))
     assert r["fill_price"] == 105_912.0 and r["slippage_bp"] == pytest.approx((105_912 / 105_905 - 1) * 1e4, abs=0.01)

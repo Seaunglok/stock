@@ -18,17 +18,20 @@ import pytest
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # 실거래·분석 경로. 여기 없는 파일은 검사되지 않는다는 뜻이니 새 모듈은 추가할 것.
+# 2026-10-22: 추세추종 데몬 묶음은 archive/ 로 보관 — 대신 실전 I3·리그 모듈을 넣었다.
 TARGETS = [
-    "scripts/trend_follow.py",
+    "scripts/i3_core.py",
+    "scripts/i3_live.py",
+    "scripts/i3_flows.py",
+    "scripts/i3_fills.py",
+    "scripts/i3_shadow.py",
+    "scripts/collect_i3_minutes.py",
+    "scripts/strategy_lab.py",
     "scripts/trend_runtime.py",
-    "scripts/trend_journal.py",
     "scripts/trend_kiwoom_io.py",
     "scripts/trend_config.py",
     "scripts/trend_lock.py",
     "scripts/trend_watchdog.py",
-    "scripts/trend_dashboard.py",
-    "scripts/shadow_ledger.py",
-    "scripts/collect_minute_bars.py",
     "scripts/backtest_trend.py",
     "scripts/backtest_trend_portfolio.py",
     "src/mcp_servers/trend_mcp/signals.py",

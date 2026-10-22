@@ -181,4 +181,6 @@ def test_collector_is_off_the_order_path():
     src = (_ROOT / "scripts" / "collect_foreign_flow.py").read_text(encoding="utf-8")
     for banned in ("_place", "place_buy", "place_sell", "save_state", "trend_kiwoom_io", "trading-domain"):
         assert banned not in src, f"주문/상태 경로({banned})를 건드린다"
-    assert "collect_foreign_flow" not in (_ROOT / "scripts" / "trend_follow.py").read_text(encoding="utf-8")
+    daemon = next(p for p in (_ROOT / "scripts" / "trend_follow.py", _ROOT / "archive" / "scripts" / "trend_follow.py")
+                  if p.exists())                     # 2026-10-22 추세추종 데몬은 archive/ 로 보관
+    assert "collect_foreign_flow" not in daemon.read_text(encoding="utf-8")

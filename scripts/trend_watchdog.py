@@ -193,6 +193,9 @@ def start_servers() -> list:
 
 
 def start_daemon() -> None:
+    if not (ROOT / "scripts" / "trend_follow.py").exists():   # 2026-10-22 추세추종 종료 → archive/ 로 보관
+        log("[DAEMON] 추세추종 데몬은 보관됨(archive/scripts) — 재기동하지 않음. TREND_WATCHDOG_DAEMON=off 를 유지할 것")
+        return
     log(f"[DAEMON] 다운 → 재기동 (모드={UNIVERSE}, detached)")
     env = dict(os.environ)
     env["TREND_UNIVERSE"] = UNIVERSE

@@ -27,7 +27,11 @@ from lab_dd_control import reentry_confirmed  # noqa: E402
 from lab_holdout import I3_BAND, I3_DEFAULT, I3_FLOOR_DD  # noqa: E402
 
 BASE = "069500"            # KODEX200
-CASH = "153130"            # KODEX 단기채권 — 현금 대용
+# 현금 자리 = KODEX 머니마켓액티브 (2026-10-22 운용자 승인, 구 153130 KODEX 단기채권).
+# 근거: docs/2026-10-22-etf-choice.md §5-C — 153130 보다 연 +0.6~0.8%p, 낙폭 ~0, I3 현금 비중 평균 39%.
+# 판단과 무관하다: 엔진은 이 코드를 이탈 신호의 이름표로만 쓴다(test_engine_ignores_cash_code 가 잠근다).
+# 검증(lab_holdout)은 153130 으로 했다 — 머니마켓은 2024-08 상장이라 2015~ 이력이 없다.
+CASH = "488770"
 REPLAY_START = "2015-07-28"
 ENGINE_X, ENGINE_N = 10, 20
 M, LOOKBACK = I3_DEFAULT   # (6, 252)
@@ -74,7 +78,7 @@ def budget_exposure(navs: list[float], m: float = M, lookback: int = LOOKBACK,
 
 def decide(engine: EngineState, navs: list[float], prev_w: float | None,
            band: float = BAND) -> tuple[float, bool, str]:
-    """(목표 KODEX200 비중, 매매 필요 여부, 사유). 나머지 비중은 단기채권 ETF."""
+    """(목표 KODEX200 비중, 매매 필요 여부, 사유). 나머지 비중은 현금 자리 ETF(CASH)."""
     e = budget_exposure(navs)
     w = e if engine.holding else 0.0
     if prev_w is None:

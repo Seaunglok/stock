@@ -32,7 +32,30 @@ def test_declared_constants_come_from_validated_lab():
     import lab_holdout as H
     assert (K.M, K.LOOKBACK) == H.I3_DEFAULT == (6, 252)
     assert K.FLOOR_DD == H.I3_FLOOR_DD == 18.0 and K.BAND == H.I3_BAND == 0.10
-    assert (K.BASE, K.CASH, K.REPLAY_START) == ("069500", "153130", "2015-07-28")
+    assert (K.BASE, K.REPLAY_START) == ("069500", "2015-07-28")
+
+
+def test_cash_leg_is_money_market():
+    """현금 자리 = KODEX 머니마켓액티브(10-22 운용자 승인). 검증용 153130 으로 되돌아가면 실패한다."""
+    assert K.CASH == "488770" and K.CASH != VALIDATED_CASH
+
+
+VALIDATED_CASH = "153130"    # lab_holdout 검증에 쓴 현금(KODEX 단기채권) — 2015~ 이력이 있는 쪽
+
+
+def test_engine_ignores_cash_code(monkeypatch):
+    """★ 현금 종목을 바꿔도 엔진 판단은 같다 — 실데이터로 코드만 바꿔 재생해 대조(일부러 바꿔 보기)."""
+    import strategy_lab as L
+    cache = _ROOT / "docs_cache" / "lab"
+    if not (cache / "069500_2026-08-24.json").exists() or not (cache / "IDX_KS11_2026-08-24.json").exists():
+        pytest.skip("검증 캐시 없음")
+    kodex = L.load_bars("069500", "2014-01-01", L.FULL[1])
+    ks = L.load_bars("^KS11", "1996-01-01", L.FULL[1])
+    probe = sorted(kodex)[-400::23]
+    now = [K.engine_state(kodex, ks, d) for d in probe]
+    monkeypatch.setattr(K, "CASH", VALIDATED_CASH)
+    old = [K.engine_state(kodex, ks, d) for d in probe]
+    assert now == old and any(not e.holding for e in now) and any(e.holding for e in now)
 
 
 def test_budget_exposure():
@@ -68,17 +91,17 @@ def test_live_decisions_match_validated_backtest_on_real_data():
     if not (cache / "069500_2026-08-24.json").exists() or not (cache / "IDX_KS11_2026-08-24.json").exists():
         pytest.skip("검증 캐시 없음")
     kodex = L.load_bars("069500", "2014-01-01", L.FULL[1])
-    cash = L.load_bars("153130", "2014-01-01", L.FULL[1])
+    cash = L.load_bars(VALIDATED_CASH, "2014-01-01", L.FULL[1])
     ks = L.load_bars("^KS11", "1996-01-01", L.FULL[1])
     dates = L.calendar(kodex, *L.FULL)
-    lab_t = H.i3(kodex, ks, K.BASE, K.CASH, *H.I3_DEFAULT)
+    lab_t = H.i3(kodex, ks, K.BASE, VALIDATED_CASH, *H.I3_DEFAULT)
     seen = []
 
     def probe(i, d, nav):
         w = lab_t(i, d, nav)
         seen.append((d, nav, None if w is None else w.get(K.BASE, 0.0)))
         return w
-    L.simulate({K.BASE: L.Asset(K.BASE, kodex), K.CASH: L.Asset(K.CASH, cash)}, dates, probe,
+    L.simulate({K.BASE: L.Asset(K.BASE, kodex), VALIDATED_CASH: L.Asset(VALIDATED_CASH, cash)}, dates, probe,
                3_852_844.0, pass_nav=True)
     navs, prev = [], None
     sample = set(range(0, len(seen), 37)) | {k for k, (_, _, w) in enumerate(seen) if w is not None}

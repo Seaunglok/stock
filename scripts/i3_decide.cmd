@@ -12,4 +12,8 @@ REM I3 challenger league (shadow, no orders) - runs after decide; its failure do
 echo ---- league %TIME% >> logs\i3\i3_task.log
 "D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\i3_shadow.py >> logs\i3\i3_task.log 2>&1
 echo league_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
+REM Minute bars (Kiwoom keeps only ~900 recent bars - collect daily or lose them). Does not change RC.
+echo ---- minutes %TIME% >> logs\i3\i3_task.log
+"D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\collect_i3_minutes.py >> logs\i3\i3_task.log 2>&1
+echo minutes_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
 exit /b %RC%

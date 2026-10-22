@@ -104,6 +104,58 @@ def test_history_is_one_row_per_day(tmp_path):
     assert [r["date"] for r in rows] == ["2026-10-21", "2026-10-22"] and rows[1]["i3_nav"] == "2"
 
 
+@pytest.fixture(scope="module")
+def league_data():
+    import strategy_lab as L
+    cache = _ROOT / "docs_cache" / "lab"
+    codes = {"069500": "2026-08-24", "133690": "2026-08-24", "114260": "2026-08-24", "148070": "2026-08-24",
+             "132030": "2026-08-24", "138230": "2026-08-24", "488770": "2026-10-21"}
+    if not all((cache / f"{c}_{e}.json").exists() for c, e in codes.items()) or \
+            not (cache / "IDX_KS11_2026-08-24.json").exists():
+        pytest.skip("검증 캐시 없음")
+    data = {c: L.load_bars(c, "2010-01-01", e) for c, e in codes.items()}
+    data[S.KOSPI] = L.load_bars("^KS11", "1996-01-01", "2026-08-24")
+    return data
+
+
+def test_every_member_starts_from_the_same_line(league_data):
+    """★ 공정한 경쟁 — 모든 멤버가 실전 시작일에 같은 자산으로 출발하고, 비중은 0~100% 안이다(실데이터)."""
+    eq = 3_640_000.0
+    members = tuple(m for m in S.MEMBERS if m.name != "추세추종")     # 종목형은 전 종목 로드라 별도
+    res = S.run_league(league_data, START, eq, UPTO, members)
+    for m in members:
+        r = res[m.name]
+        assert "error" not in r, f"{m.name}: {r.get('error')}"
+        assert r["curve"][0] == (START, round(eq)), f"{m.name} 출발선이 다르다"
+        assert all(v > 0 for _, v in r["curve"]) and len(r["curve"]) > 400
+        assert all(-1e-9 <= w <= 1 + 1e-9 for w in r["w_hist"].values()), f"{m.name} 비중 범위"
+    assert res["I3"]["curve"] == S.run_models(league_data["069500"], league_data[S.KOSPI], league_data["488770"],
+                                              START, eq, UPTO)["I3"]["curve"]
+
+
+def test_one_failing_member_does_not_stop_the_league(league_data):
+    def boom(*a):
+        raise RuntimeError("데이터 없음")
+    bad = S.Member("고장", "시험", "2026-10-22", "시험", "", ("069500",), boom)
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (bad, S.MEMBERS[0]))
+    assert "error" in res["고장"] and "curve" in res["I3"]
+
+
+def test_cash_fill_and_remap():
+    t = S.cash_fill(lambda i, d: {"069500": 0.6})
+    assert t(0, "d") == {"069500": 0.6, S.K.CASH: pytest.approx(0.4)}
+    assert S.cash_fill(lambda i, d: None)(0, "d") is None
+    r = S.remap(lambda i, d: {"153130": 0.3, "069500": 0.7}, {"153130": S.K.CASH})
+    assert r(0, "d") == {S.K.CASH: 0.3, "069500": 0.7}
+
+
+def test_summary_line_ranks_members():
+    rec = {"asof": "2026-10-23", "start": "2026-10-22", "live": {"ret": 0.1},
+           "models": {"I3": {"ret": 0.1}, "R1": {"ret": 0.5}, "고장": {"error": "x"}}}
+    line = S.summary_line(rec)
+    assert line.index("R1") < line.index("👑I3") and "오류 고장" in line
+
+
 def test_decide_task_runs_league_after_decide_and_keeps_its_exit_code():
     """리그는 판단 뒤에 돌고, 작업 결과 코드는 판단의 것이어야 한다(리그 실패가 판단 실패로 보이면 안 된다)."""
     txt = (_ROOT / "scripts" / "i3_decide.cmd").read_text(encoding="utf-8")

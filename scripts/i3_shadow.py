@@ -279,6 +279,28 @@ def _run_vbreak(data: dict, start: str, equity: float, upto: str) -> dict:
             "w": w_hist.get(d[-1], 0.0) if d else 0.0}
 
 
+def _run_factor(kind: str):
+    """AQR 팩터(lab_factors) — 대형주 100 은 '추세추종' 멤버와 같은 _load 키라 캐시를 같이 쓴다(추가 로드 0)."""
+    def run(data: dict, start: str, equity: float, upto: str) -> dict:
+        import contextlib
+        import io
+        import backtest_trend_portfolio as P
+        import lab_factors as F
+        import trend_paper as TP
+        with contextlib.redirect_stdout(io.StringIO()):
+            _d, bars, _c, _o = P._load(TP.DATA_START, upto, 100)
+        ends = month_ends_live(sorted(data[K.BASE]))
+        inner = (F.bab_target(bars, data[KOSPI], ends) if kind == "BAB"
+                 else F.qmj_target(bars, F.load_fund(), ends))
+        dates = _calendar(data, upto)
+        t = shadow_target(cash_fill(inner), start, equity, needs_nav=False)
+        assets = {c: L.Asset(c, b, True) for c, b in bars.items()}
+        assets[K.CASH] = L.Asset(K.CASH, data[K.CASH])
+        res = L.simulate(assets, dates, t, equity, pass_nav=True)
+        return _pack(res, t, start, equity)
+    return run
+
+
 @dataclass(frozen=True)
 class Member:
     name: str
@@ -330,6 +352,13 @@ MEMBERS = MEMBERS + (
     Member("골든크로스", "추세", _D, _CL, "50/200일선", (K.BASE, K.CASH, KOSPI), std_run(_b_classic("GCROSS"))),
     Member("변동성돌파", "단타", _D, _CL, "래리 윌리엄스 k=0.5, 돌파 매수 → 다음 날 시가 매도",
            (K.BASE, K.CASH, KOSPI, f"ohlc:{K.BASE}"), _run_vbreak),
+)
+_AQR = "리그 정책 ①(외부 알고리즘 원 출처 규칙 롱온리판, lab_factors 선언 8a69f6d) — 운용자 '남은 일 진행'(10-22)"
+MEMBERS = MEMBERS + (
+    Member("저베타", "펀드 팩터(AQR)", "2026-10-23", _AQR, "Frazzini·Pedersen(2014) BAB 롱온리 — 베타 하위 20종목",
+           (K.BASE, K.CASH, KOSPI), _run_factor("BAB")),
+    Member("퀄리티", "펀드 팩터(AQR)", "2026-10-23", _AQR, "Asness 외(2019) QMJ 롱온리 — 수익성·안전성 상위 20종목",
+           (K.BASE, K.CASH, KOSPI), _run_factor("QMJ")),
 )
 
 

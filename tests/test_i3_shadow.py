@@ -206,7 +206,7 @@ def test_audit_catches_source_mismatch():
 def test_every_member_starts_from_the_same_line(league_data):
     """★ 공정한 경쟁 — 모든 멤버가 실전 시작일에 같은 자산으로 출발하고, 비중은 0~100% 안이다(실데이터)."""
     eq = 3_640_000.0
-    members = tuple(m for m in S.MEMBERS if m.name != "추세추종")     # 종목형은 전 종목 로드라 별도
+    members = tuple(m for m in S.MEMBERS if m.name not in ("추세추종", "저베타", "퀄리티"))   # 종목형은 별도 시험
     res = S.run_league(league_data, START, eq, UPTO, members)
     for m in members:
         r = res[m.name]
@@ -227,6 +227,28 @@ def test_r6_member_is_the_declared_design_and_marked_as_exception(league_data):
     res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], r6))
     i3, x = res["I3"]["w_hist"], res["R6"]["w_hist"]
     assert x[START] == pytest.approx(i3[START])            # 출발일 판단은 같다(리셋은 재진입 때만)
+
+
+def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
+    """종목형 팩터 멤버(저베타·퀄리티) — 대형주 데이터는 합성으로 바꿔 끼워 배선만 시험: 같은 출발선, 월말에만 매매,
+    주식 비중 0~100%, 매도세 있는 자산으로 취급."""
+    import backtest_trend_portfolio as P
+    days = sorted(d for d in league_data["069500"] if "2023-01-01" <= d <= UPTO)
+    synth = {f"S{i:02d}": {d: {"open": 1000 + i + k * (0.1 + i / 100), "close": 1000 + i + k * (0.1 + i / 100)}
+                           for k, d in enumerate(days)} for i in range(25)}
+    monkeypatch.setattr(P, "_load", lambda *a, **k: (days, synth, {}, {}))
+    import lab_factors as F
+    monkeypatch.setattr(F, "load_fund", lambda: {c: {"2022": {"avail": "2023-03-01", "equity": 100 + i,
+                                                              "net_income": 10 + i, "assets": 300, "op_income": 12 + i,
+                                                              "liabilities": 100 - i}} for i, c in enumerate(synth)})
+    eq = 3_640_000.0
+    res = S.run_league(league_data, START, eq, UPTO, tuple(m for m in S.MEMBERS if m.name in ("저베타", "퀄리티")))
+    for name in ("저베타", "퀄리티"):
+        r = res[name]
+        assert "error" not in r, r.get("error")
+        assert r["curve"][0] == (START, round(eq)) and all(0 <= w <= 1 + 1e-9 for w in r["w_hist"].values())
+        assert r["trade_days"] and all(d == START or d in S.month_ends_live(sorted(league_data["069500"]))
+                                       for d in r["trade_days"])
 
 
 def test_one_failing_member_does_not_stop_the_league(league_data):

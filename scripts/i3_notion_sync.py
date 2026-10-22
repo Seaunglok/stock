@@ -6,9 +6,10 @@
   설계 근거는 docs/notion-guide.md.
 
     prep   최근 LOOKBACK_DAYS 일의 I3 기록을 Notion 행 모양으로 계산해 OUT_FILE 에 쓴다.
-             daily   — I3 일일 기록DB: 판단·자산·성과·매매·입출금·리그 (하루 1행)
-             trades  — 주식 매매일지DB: 체결 1건 = 1행(매매이유 "🛡️ I3 …"), 매도는 평균단가 기준 실현손익
-             months  — 월별 결산DB: "🛡️ I3 YYYY년 M월" 1행(매수·매도·실현손익·비용·월 수익률)
+             daily   — 일일 기록DB: 판단·자산·성과·매매·입출금·리그 (하루 1행)
+             trades  — 주식 매매일지DB: 체결 1건 = 1행(매매이유 MARK "🛡️ 방어형 ETF 자동매매(I3) …"), 매도는 평균단가 기준
+             months  — 월별 결산DB: "🛡️ 방어형 ETF 자동매매(I3) YYYY년 M월" 1행(매수·매도·실현손익·비용·월 수익률)
+             Notion 에 보이는 이름은 줄임말 단독 금지 — TRACK·DISPLAY(풀네임(줄임말), 운용자 10-22)
            에이전트는 파일과 DB 를 대조해 **없는 행만** 추가하고 월 행만 갱신한다 — 하루를 놓쳐도 다음 실행이 메운다.
            산수는 여기서 한다. LLM 이 계산하지 않게(추세추종 notion_sync 와 같은 원칙, 2026-10-01).
     check  에이전트 실행이 끝난 뒤 **이번 실행분 로그**에 결과 줄이 없거나 ❌ 면 텔레그램 critical + exit 1.
@@ -44,6 +45,21 @@ FEE_BPS = 1.5              # 편도 수수료(i3_flows.FEE_BPS 와 같은 값) �
 NAMES = {"069500": "KODEX 200", "488770": "KODEX 머니마켓액티브", "153130": "KODEX 단기채권"}
 WEEKDAY = "월화수목금토일"
 
+# Notion 에 보이는 이름 — 운용자(10-22): "노션에서는 줄임말을 풀네임(줄임말)로". 코드 식별자(I3·R1…)는 그대로 둔다.
+TRACK = "방어형 ETF 자동매매(I3)"
+MARK = f"🛡️ {TRACK}"       # 매매일지 매매이유·월별 결산 제목의 앞머리 = i3_notion_task.md 의 조회 키(바꾸면 같이 바꾼다)
+DISPLAY = {                 # 리그 멤버 이름이 영문 줄임말이면 여기 풀네임이 있어야 한다(테스트가 확인)
+    "I3": TRACK,
+    "R1": "재진입 리셋(R1)",
+    "R6": "1년 1회 리셋·250일선 상승 때만(R6)",
+    "I1a": "재진입 확인 엔진만(I1a)",
+    "MA60": "KOSPI 60일 이동평균(MA60)",
+    "Faber10": "파버 10개월 이동평균(Faber10)",
+    "TSMOM": "시계열 모멘텀(TSMOM)",
+    "RSI2": "2일 상대강도지수(RSI2)",
+    "D5a": "방어 자산 추세 현금 자리(D5a)",
+}
+
 
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
@@ -65,8 +81,9 @@ def _pct(a: float | None, b: float | None) -> float | None:
 
 
 # ── 리그 ────────────────────────────────────────────────────────────────────
-def league_text(rows: list[dict], day: str, slug_names: dict[str, str], champion: str = "I3") -> str | None:
-    """shadow_history.csv 의 그날 행 → '1위 X +a% · I3 n위/m · 실계좌 +b%'. 수익은 각 열의 첫 값 대비."""
+def league_text(rows: list[dict], day: str, slug_names: dict[str, str], champion: str = TRACK) -> str | None:
+    """shadow_history.csv 의 그날 행 → '1위 X +a% · 방어형 ETF 자동매매(I3) n위/m · 실계좌 +b%'.
+    수익은 각 열의 첫 값 대비. slug_names 는 열 이름 → Notion 표시 이름(champion 도 표시 이름)."""
     first: dict[str, float] = {}
     today = None
     for r in rows:
@@ -126,7 +143,7 @@ def trade_rows(fills: list[dict], since: str, plans: dict[str, dict], fee_bps: f
             why.append(f"지정가 {f['limit']:,.0f}")
         if f.get("slippage_bp") is not None:
             why.append(f"슬리피지 {f['slippage_bp']:+.1f}bp")
-        reason = f"🛡️ I3 {'매수' if side == 'buy' else '매도'}" + (" — " + " · ".join(why) if why else "")
+        reason = f"{MARK} {'매수' if side == 'buy' else '매도'}" + (" — " + " · ".join(why) if why else "")
         if side == "buy":
             if p["qty"] == 0:
                 p["since"] = day
@@ -178,7 +195,7 @@ def month_rows(fills: list[dict], trades_all: list[dict], navs: list[list], mont
             base = idx[prev[-1]] if prev else idx[in_m[0]]
             ret = _pct(idx[in_m[-1]], base)
         y, mo = m.split("-")
-        out.append({"key": m, "월": f"🛡️ I3 {y}년 {int(mo)}월 (💰 실거래)", "총 매수 금액": round(buy),
+        out.append({"key": m, "월": f"{MARK} {y}년 {int(mo)}월 (💰 실거래)", "총 매수 금액": round(buy),
                     "총 매도 금액": round(sell), "총 실현손익": round(pnl), "총 매매 비용": round(cost),
                     "월 수익률(%)": ret, "기준일": in_m[-1] if in_m else None})
     return out
@@ -230,7 +247,7 @@ def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], sin
                             "엔진": "보유" if dec.get("engine_holding") else "이탈",
                             "낙폭 예산(%)": round(dec["exposure"] * 100, 1),
                             "목표 KODEX200(%)": round(dec["w"] * 100, 1),
-                            "사유": dec.get("reason", ""), "I3 자산": dec.get("nav")})
+                            "사유": dec.get("reason", ""), "운용 자산": dec.get("nav")})
                 if close:
                     row["KODEX200 종가"] = close
                     row["KODEX200 일간(%)"] = _pct(close, prev_close)
@@ -309,7 +326,7 @@ def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = O
     st = json.loads((data_dir / "state.json").read_text(encoding="utf-8")) if (data_dir / "state.json").exists() else {}
     payload = build_payload(_read_jsonl(data_dir / "events.jsonl"), st.get("navs") or [],
                             _read_jsonl(data_dir / "fills.jsonl"), _league_rows(data_dir / "shadow_history.csv"),
-                            {S._slug(m.name): m.name for m in S.MEMBERS}, today or datetime.now())
+                            {S._slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now())
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")

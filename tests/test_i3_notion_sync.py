@@ -36,8 +36,8 @@ def test_trade_rows_average_cost_realized_pnl():
     assert sell["실현손익"] == round(120 * 5 * (1 - FEE) - avg * 5)
     assert sell["수익률(%)"] == round((120 * (1 - FEE) / avg - 1) * 100, 2)
     assert sell["매수일자"] == "2026-10-23" and sell["보유기간(일)"] == 10
-    assert sell["매매이유"] == "🛡️ I3 매도 — 목표 KODEX200 50% (예산 축소) · 슬리피지 -2.5bp"
-    assert rows[0]["매매이유"] == "🛡️ I3 매수 — 지정가 101" and rows[0]["종목명"] == "KODEX 200(069500)"
+    assert sell["매매이유"] == "🛡️ 방어형 ETF 자동매매(I3) 매도 — 목표 KODEX200 50% (예산 축소) · 슬리피지 -2.5bp"
+    assert rows[0]["매매이유"] == "🛡️ 방어형 ETF 자동매매(I3) 매수 — 지정가 101" and rows[0]["종목명"] == "KODEX 200(069500)"
 
 
 def test_trade_rows_window_keeps_cost_from_older_fills():
@@ -92,11 +92,31 @@ def test_league_text_ranks_from_each_first_value():
     rows = [{"date": "2026-10-22", "live_nav": "100", "i3_nav": "100", "tsmom_nav": "100", "저베타_nav": ""},
             {"date": "2026-10-23", "live_nav": "101", "i3_nav": "101", "tsmom_nav": "102", "저베타_nav": "100"},
             {"date": "2026-10-24", "live_nav": "102", "i3_nav": "102", "tsmom_nav": "101", "저베타_nav": "105"}]
-    names = {"i3": "I3", "tsmom": "TSMOM", "저베타": "저베타"}
-    assert N.league_text(rows, "2026-10-23", names) == "1위 TSMOM +2.00% · I3 2위/3 · 실계좌 +1.00%"
-    assert N.league_text(rows, "2026-10-24", names).startswith("1위 저베타 +5.00% · I3 2위/3")
+    names = {"i3": N.TRACK, "tsmom": N.DISPLAY["TSMOM"], "저베타": "저베타"}
+    assert (N.league_text(rows, "2026-10-23", names)
+            == "1위 시계열 모멘텀(TSMOM) +2.00% · 방어형 ETF 자동매매(I3) 2위/3 · 실계좌 +1.00%")
+    assert N.league_text(rows, "2026-10-24", names).startswith("1위 저베타 +5.00% · 방어형 ETF 자동매매(I3) 2위/3")
     assert N.league_text(rows, "2026-10-25", names) is None
-    assert N.league_text(rows, "2026-10-22", names) == "공동 1위 2개 +0.00% · I3 1위/2 · 실계좌 +0.00%"
+    assert N.league_text(rows, "2026-10-22", names) == "공동 1위 2개 +0.00% · 방어형 ETF 자동매매(I3) 1위/2 · 실계좌 +0.00%"
+
+
+def test_notion_names_have_no_bare_abbreviation():
+    """운용자(10-22): Notion 에선 줄임말을 「풀네임(줄임말)」로. 영문이 들어간 리그 멤버 이름은 전부 풀네임이 있어야 하고,
+    그 풀네임은 끝에 (원래 이름)을 단다 — 새 멤버를 등록하면서 빠뜨리면 여기서 걸린다."""
+    import re
+    import i3_shadow as S
+    for m in S.MEMBERS:
+        if re.search(r"[A-Za-z]", m.name):
+            assert m.name in N.DISPLAY, f"{m.name}: Notion 표시 풀네임 없음 — DISPLAY 에 추가"
+            assert N.DISPLAY[m.name].endswith(f"({m.name})"), N.DISPLAY[m.name]
+    assert N.DISPLAY[S.CHAMPION] == N.TRACK and N.MARK.endswith(N.TRACK)
+
+
+def test_task_file_queries_the_same_mark_as_the_code():
+    """★ 작업지시서의 조회 키 == 코드가 쓰는 앞머리. 어긋나면 에이전트가 기존 행을 못 찾아 **매일 중복 행**을 넣는다."""
+    txt = (_ROOT / "scripts" / "i3_notion_task.md").read_text(encoding="utf-8")
+    assert f"LIKE '{N.MARK}%'" in txt and f"`{N.MARK} YYYY년 M월`" in txt
+    assert "`운용 자산`" in txt and "I3 자산" not in txt
 
 
 def test_month_rows_return_uses_previous_month_end():
@@ -104,7 +124,7 @@ def test_month_rows_return_uses_previous_month_end():
     trades = [{"매매구분": "매도", "매도일자": "2026-11-02", "총체결금액": 500, "실현손익": 20, "매매비용": 1},
               {"매매구분": "매수", "매수일자": "2026-11-03", "총체결금액": 400, "매매비용": 1}]
     (m,) = N.month_rows([], trades, navs, ["2026-11"])
-    assert m["월"] == "🛡️ I3 2026년 11월 (💰 실거래)" and m["월 수익률(%)"] == 3.0
+    assert m["월"] == "🛡️ 방어형 ETF 자동매매(I3) 2026년 11월 (💰 실거래)" and m["월 수익률(%)"] == 3.0
     assert (m["총 매수 금액"], m["총 매도 금액"], m["총 실현손익"], m["총 매매 비용"]) == (400, 500, 20, 2)
 
 

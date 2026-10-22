@@ -150,14 +150,18 @@ class FakeMarket:
 
 class FakeBroker:
     def __init__(self, holdings=None, equity=(3_800_000.0, 3_600_000.0), allow_orders=True,
-                 responses=None, after=None):
+                 responses=None, after=None, prices=None, orderable=10_000_000.0):
         self._h = holdings if holdings is not None else []
         self._eq = equity
         self.allow = allow_orders
         self.placed = []
+        self.limits = []                      # 주문별 지정가(None = 시장가)
         self.responses = responses or {}
         self.after = after
         self.calls = 0
+        self._px = dict(PRICES) if prices is None else prices
+        self._cash = orderable
+        self.events = []                      # 호출 순서(wait/price/orderable/place)
 
     async def holdings(self):
         self.calls += 1
@@ -168,10 +172,20 @@ class FakeBroker:
     async def equity(self):
         return self._eq
 
-    async def place(self, side, code, qty):
+    async def price(self, code):
+        self.events.append(("price", code))
+        return self._px.get(code)
+
+    async def orderable(self, code, price):
+        self.events.append(("orderable", code, price))
+        return self._cash
+
+    async def place(self, side, code, qty, price=None):
         if not self.allow:
             raise AssertionError("모의 모드에서 주문이 나갔다")
+        self.events.append(("place", side, code))
         self.placed.append((side, code, qty))
+        self.limits.append(price)
         return self.responses.get((side, code), {"success": True, "data": {"return_code": 0}})
 
 
@@ -274,14 +288,81 @@ def test_real_trade_sells_first_then_waits_then_buys(paths):
     _seed(paths[0])
     hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
     b = FakeBroker(holdings=hold, equity=(3_400_000.0, 10_000.0))
-    order = []
 
     async def waited():
-        order.append(("wait",))
+        b.events.append(("wait",))
     r = run(LV.phase_trade(b, Notes(), NOW, PRICES, *paths, dry_run=False, wait_after_open=waited))
     seq = [p[0] for p in b.placed]
     assert seq and seq[0] == "sell" and seq[-1] == "buy"
     assert r["target"][K.BASE] == int(3_400_000 * 0.99 // 90_000)
+    ev = [e[0] for e in b.events]
+    assert ev.index("wait") > ev.index("place") and ev.index("price") > ev.index("wait")
+    # ★ 매도는 시장가, 매수는 현재가 +1% 지정가(5원 올림)
+    assert b.limits[0] is None and b.limits[-1] == LV.limit_price(90_000) == 90_900
+
+
+def test_limit_price_and_affordable():
+    assert LV.limit_price(105_902) == 106_965                        # 106,961.02 → 5원 올림
+    assert LV.limit_price(88_210) % 5 == 0 and LV.limit_price(88_210) >= 88_210 * 1.01
+    assert LV.affordable(3_647_805, 106_965) == 34
+    assert LV.affordable(0, 106_965) == 0 and LV.affordable(1e6, 0) == 0
+
+
+def test_buy_waits_for_open_even_without_sells(paths):
+    """첫 매수(전액 예수금) — 매도가 없어도 매수는 09:00 체결 뒤 현재가로 지정가."""
+    _seed(paths[0], w=0.0)
+    b = FakeBroker(holdings=[], equity=(3_647_805.0, 3_647_805.0))
+
+    async def waited():
+        b.events.append(("wait",))
+    r = run(LV.phase_trade(b, Notes(), NOW, PRICES, *paths, dry_run=False, wait_after_open=waited))
+    assert [e[0] for e in b.events][:2] == ["wait", "price"]
+    assert b.placed == [("buy", K.CASH, r["target"][K.CASH])] and b.limits == [LV.limit_price(PRICES[K.CASH])]
+
+
+def test_buy_qty_capped_by_orderable_cash(paths):
+    """★ 일부러 깨뜨리기 — 주문가능금액이 계획보다 적으면 살 수 있는 만큼만(거부 대신 축소)."""
+    _seed(paths[0])
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0), orderable=1_000_000.0)
+    r = run(LV.phase_trade(b, Notes(), NOW, PRICES, *paths, dry_run=False))
+    lim = LV.limit_price(PRICES[K.BASE])
+    assert r["buys"][K.BASE]["qty"] == LV.affordable(1_000_000.0, lim) == 10
+    assert ("buy", K.BASE, 10) in b.placed
+
+
+@pytest.mark.parametrize("kw, word", [({"prices": {}}, "현재가"), ({"orderable": None}, "주문가능금액")])
+def test_buy_skipped_when_price_or_cash_unknown(paths, kw, word):
+    """★ 현재가·주문가능금액을 못 읽으면 사지 않는다(추측 주문 금지) — 매도는 이미 나갔어도 critical."""
+    _seed(paths[0])
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0), **kw)
+    notes = Notes()
+    run(LV.phase_trade(b, notes, NOW, PRICES, *paths, dry_run=False))
+    assert all(s == "sell" for s, _, _ in b.placed)
+    assert any(c and word in m for c, m in notes.msgs)
+
+
+def test_success_true_with_nonzero_return_code_is_rejected(paths):
+    """★ 8005 유령 사고와 같은 형태 — success:true 라도 return_code≠0 은 거부로 알린다."""
+    _seed(paths[0])
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    bad = {"success": True, "data": {"return_code": 8005, "return_msg": "토큰 무효"}}
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0), responses={("buy", K.BASE): bad})
+    notes = Notes()
+    run(LV.phase_trade(b, notes, NOW, PRICES, *paths, dry_run=False))
+    assert any(c and "거부" in m for c, m in notes.msgs)
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert ["buy", K.BASE, st["last_trade"]["buys"][K.BASE]["qty"], "rejected"] in st["last_trade"]["results"]
+
+
+def test_order_status():
+    assert LV.order_status({"success": True, "data": {"return_code": 0}}) == "ok"
+    assert LV.order_status({"success": True, "data": {"return_code": "0"}}) == "ok"
+    assert LV.order_status({"success": True, "data": {"return_code": 20}}) == "rejected"
+    assert LV.order_status({"success": False, "error": "x"}) == "rejected"
+    assert LV.order_status({"success": False, "unknown": True}) == "unknown"
+    assert LV.order_status("garbage") == "rejected"
 
 
 def test_unknown_order_is_not_resent_and_alerts(paths):
@@ -302,7 +383,7 @@ def test_post_trade_mismatch_alerts(paths):
     b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0), after=hold)   # 체결 안 된 것처럼
     notes = Notes()
     run(LV.phase_trade(b, notes, NOW, PRICES, *paths, dry_run=False))
-    assert any(c and "목표와 다름" in m for c, m in notes.msgs)
+    assert any(c and "주문과 다름" in m for c, m in notes.msgs)
 
 
 @pytest.mark.parametrize("kw, seed_extra, now, reason", [

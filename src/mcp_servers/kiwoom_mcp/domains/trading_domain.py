@@ -30,6 +30,24 @@ from src.mcp_servers.kiwoom_mcp.common.domain_base import KiwoomDomainServer
 logger = logging.getLogger(__name__)
 
 
+def _won(price: float | None) -> str | None:
+    """가격 → 키움 단가 문자열. 정수 원이면 소수점 없이("106950") — str(106950.0)="106950.0" 은
+    키움이 단가 오류로 거부할 수 있다(MCP 가 int 를 float 로 바꿔 넘긴다, 2026-10-22 I3 지정가 도입 때 발견).
+    """
+    if not price:
+        return None
+    f = float(price)
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+def _trde_tp(order_type: str) -> str:
+    """이 서버의 주문구분('01' 지정가 · '03' 시장가) → 키움 REST trde_tp.
+    키움의 지정가(보통)는 '0' 이다 — '01' 을 그대로 보내면 [2000](407022:매매구분을 확인하십시요) 로 거부
+    (2026-10-22 I3 지정가 실검증에서 발견). 시장가 '03' 은 실주문으로 체결돼 온 값이라 그대로 둔다.
+    """
+    return "0" if order_type == "01" else order_type
+
+
 # === 입력 모델들 ===
 
 
@@ -313,8 +331,8 @@ class TradingDomainServer(KiwoomDomainServer):
                 "dmst_stex_tp": "KRX",  # 국내거래소
                 "stk_cd": stock_code,
                 "ord_qty": str(quantity),
-                "trde_tp": order_type,  # 01:지정가, 03:시장가
-                "ord_uv": str(price) if price else None,
+                "trde_tp": _trde_tp(order_type),  # 01:지정가→"0", 03:시장가
+                "ord_uv": _won(price),
                 "cond_uv": None,  # 조건부 가격
             }
 
@@ -388,8 +406,8 @@ class TradingDomainServer(KiwoomDomainServer):
                 "dmst_stex_tp": "KRX",
                 "stk_cd": stock_code,
                 "ord_qty": str(quantity),
-                "trde_tp": order_type,
-                "ord_uv": str(price) if price else None,
+                "trde_tp": _trde_tp(order_type),
+                "ord_uv": _won(price),
                 "cond_uv": None,
             }
 
@@ -458,7 +476,7 @@ class TradingDomainServer(KiwoomDomainServer):
                 "orig_ord_no": order_no,
                 "stk_cd": stock_code,
                 "mdfy_qty": str(quantity),
-                "mdfy_uv": str(price) if price else "0",
+                "mdfy_uv": _won(price) or "0",
                 "mdfy_cond_uv": None,
             }
 
@@ -626,7 +644,7 @@ class TradingDomainServer(KiwoomDomainServer):
             params = {
                 "stk_cd": stock_code,
                 "trde_tp": "2" if trade_type == "buy" else "1",  # 1:매도, 2:매수
-                "uv": str(price) if price else "0",
+                "uv": _won(price) or "0",
                 "io_amt": None,  # 입출금액
                 "trde_qty": None,  # 매매수량
                 "exp_buy_unp": None,  # 예상매수단가
@@ -650,7 +668,7 @@ class TradingDomainServer(KiwoomDomainServer):
             """
             query = f"주문 가능 수량: {stock_code}"
 
-            params = {"stk_cd": stock_code, "uv": str(price) if price else None}
+            params = {"stk_cd": stock_code, "uv": _won(price)}
 
             # None 값 제거
             params = {k: v for k, v in params.items() if v is not None}

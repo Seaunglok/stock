@@ -14,6 +14,11 @@ Windows 작업 스케줄러가 단발로 부른다(상주 데몬 아님 — hang
   날 종가가 0.5% 넘게 다르면 판단을 멈추고 알린다.
 - 계좌 조회 실패를 '보유 0' 으로 믿지 않는다(`_broker_holdings_checked` 가 None → 중단).
 - 주문 응답 불명은 **재전송하지 않는다** — 매매 후 잔고 대조로 확인하고 알린다.
+  success:true 라도 return_code≠0 이면 거부로 본다(8005 유령 사고와 같은 규칙).
+- **매수는 지정가**(2026-10-22, 실주문 전환 직전 발견): 키움은 시장가 매수를 상한가 매수로 보고 증거금을
+  상한가(+30%)로 잡는다 — 자산의 99% 를 시장가로 사면 '주문가능금액 부족' 거부. 그래서 매수는 09:00 체결 뒤
+  **현재가 +1% 지정가**(5원 올림, 즉시 체결)로, 수량은 **실제 주문가능금액** 안으로 줄인다. 현재가·주문가능금액을
+  못 읽으면 사지 않고 알린다(추측 주문 금지). 매도는 시장가(증거금 무관, 08:50 동시호가).
 - 하루 한 번: 같은 날 판단·매매는 다시 돌려도 중복되지 않는다(상태 파일 기록).
 
 운용 자금: 계좌 추정예탁자산 − I3 외 보유분(현재 SK이노베이션 — 추세추종 데몬이 청산 관리) = I3 자산.
@@ -24,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, time as dtime
@@ -45,6 +51,9 @@ DECIDE_AFTER = dtime(15, 35)
 TRADE_WINDOW = (dtime(8, 30), dtime(9, 20))
 MAX_PLAN_AGE_DAYS = 4
 CONSISTENCY_TOL = 0.005
+BUY_LIMIT_PCT = 0.01      # 매수 지정가 = 현재가 × 1.01 — 즉시 체결되면서 상한가 증거금을 피한다
+PRICE_STEP = 5            # 지정가 올림 단위 — ETF 호가 1원(머니마켓)·5원(KODEX200) 어느 쪽에도 유효
+FEE_BUF = 0.001           # 주문가능금액 대비 수수료·반올림 여유
 
 log = logging.getLogger("i3")
 
@@ -92,7 +101,9 @@ class Market(Protocol):
 class Broker(Protocol):
     async def holdings(self) -> list[dict] | None: ...
     async def equity(self) -> tuple[float, float]: ...
-    async def place(self, side: str, code: str, qty: int) -> Any: ...
+    async def price(self, code: str) -> float | None: ...                   # 현재가(장중)
+    async def orderable(self, code: str, price: int) -> float | None: ...    # 매수 주문가능금액
+    async def place(self, side: str, code: str, qty: int, price: int | None = None) -> Any: ...
 
 
 class Notifier(Protocol):
@@ -169,6 +180,28 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
 
 
 # ── 매매 ─────────────────────────────────────────────────────────────────────
+def limit_price(cur: float, pct: float = BUY_LIMIT_PCT, step: int = PRICE_STEP) -> int:
+    """현재가 → 매수 지정가(step 단위 올림). 현재가보다 위라 즉시 체결된다."""
+    return int(math.ceil(cur * (1 + pct) / step) * step)
+
+
+def affordable(cash: float, limit: int, fee_buf: float = FEE_BUF) -> int:
+    """주문가능금액으로 지정가에 살 수 있는 주식수(내림)."""
+    return int(cash // (limit * (1 + fee_buf))) if cash > 0 and limit > 0 else 0
+
+
+def order_status(resp: Any) -> str:
+    """'ok' | 'rejected' | 'unknown'. success:true 라도 return_code≠0 이면 거부
+    (trend_kiwoom_io._order_accepted 와 같은 규칙 — 8005 유령 포지션 사고)."""
+    if isinstance(resp, dict) and resp.get("unknown"):
+        return "unknown"
+    if not isinstance(resp, dict) or resp.get("success") is False:
+        return "rejected"
+    d = resp.get("data", resp)
+    rc = d.get("return_code") if isinstance(d, dict) else None
+    return "ok" if rc in (0, "0", None) else "rejected"
+
+
 async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: dict[str, float],
                       state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
                       dry_run: bool = True, halt: bool = False, wait_after_open=None,
@@ -209,22 +242,44 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
     else:
         sells = [o for o in orders if o[0] == "sell"]
         buys = [o for o in orders if o[0] == "buy"]
-        for side, code, qty in sells:
+        for side, code, qty in sells:                       # 시장가 — 08:50 동시호가, 09:00 체결
             rec["results"].append([side, code, qty, await broker.place(side, code, qty)])
-        if buys and sells and wait_after_open is not None:
-            await wait_after_open()            # 09:00 체결 뒤에 매수(매도 대금 확보)
-        for side, code, qty in buys:
-            rec["results"].append([side, code, qty, await broker.place(side, code, qty)])
-        unknown = [r for r in rec["results"] if isinstance(r[3], dict) and r[3].get("unknown")]
-        rejected = [r for r in rec["results"] if isinstance(r[3], dict) and r[3].get("success") is False
-                    and not r[3].get("unknown")]
+        if buys and wait_after_open is not None:
+            await wait_after_open()            # 매수는 09:00 체결 뒤 — 매도 대금 확보 + 현재가로 지정가
+        rec["buys"] = {}
+        for side, code, planned in buys:
+            px = await broker.price(code)
+            if not px or px <= 0:
+                await notify(f"⛔ [I3] {code} 현재가 조회 실패 — 매수 안 함(추측 주문 금지)", critical=True)
+                rec["buys"][code] = {"planned": planned, "skip": "현재가 없음"}
+                continue
+            lim = limit_price(px)
+            cash = await broker.orderable(code, lim)
+            if cash is None:
+                await notify(f"⛔ [I3] {code} 주문가능금액 조회 실패 — 매수 안 함", critical=True)
+                rec["buys"][code] = {"planned": planned, "cur": px, "limit": lim, "skip": "주문가능금액 없음"}
+                continue
+            qty = min(planned, affordable(cash, lim))
+            rec["buys"][code] = {"planned": planned, "qty": qty, "cur": px, "limit": lim, "cash": round(cash)}
+            if qty <= 0:
+                await notify(f"⚠️ [I3] {code} 살 수 있는 수량 0 — 주문가능 {cash:,.0f}원 · 지정가 {lim:,}원",
+                             critical=True)
+                continue
+            rec["results"].append([side, code, qty, await broker.place(side, code, qty, lim)])
+        status = [(s, c, q, order_status(r)) for s, c, q, r in rec["results"]]
+        unknown = [x for x in status if x[3] == "unknown"]
+        rejected = [x for x in status if x[3] == "rejected"]
         if unknown:
             await notify(f"⚠️ [I3] 응답 불명 주문 {len(unknown)}건 — 재전송 안 함, 잔고로 확인 필요: "
                          + ", ".join(f"{s} {c} {q}주" for s, c, q, _ in unknown), critical=True)
         if rejected:
             await notify(f"⚠️ [I3] 거부된 주문 {len(rejected)}건: "
                          + ", ".join(f"{s} {c} {q}주" for s, c, q, _ in rejected), critical=True)
-        # 매매 후 잔고 대조 — 응답 불명·부분체결을 여기서 잡는다(재전송은 하지 않는다)
+        # 매매 후 잔고 대조 — 보낸 주문(거부 제외)이 다 체결됐으면 나올 보유와 비교. 재전송은 하지 않는다.
+        expect = {c: cur.get(c, 0) for c in (K.BASE, K.CASH)}
+        for s, c, q, stt in status:
+            if stt != "rejected":
+                expect[c] += q if s == "buy" else -q
         if before_check is not None:
             await before_check()
         after = await broker.holdings()
@@ -232,22 +287,26 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
             await notify("⚠️ [I3] 매매 후 잔고 조회 실패 — HTS 로 확인 필요", critical=True)
         else:
             got = {h["symbol"]: h["qty"] for h in after if h["symbol"] in (K.BASE, K.CASH)}
-            diff = {c: (got.get(c, 0), q) for c, q in tgt.items() if got.get(c, 0) != q}
+            diff = {c: (got.get(c, 0), q) for c, q in expect.items() if got.get(c, 0) != q}
             rec["after"] = got
             if diff:
-                await notify("⚠️ [I3] 매매 후 잔고가 목표와 다름(재전송 안 함): "
-                             + ", ".join(f"{c} 보유 {g} / 목표 {q}" for c, (g, q) in diff.items()),
+                await notify("⚠️ [I3] 매매 후 잔고가 주문과 다름(미체결·부분체결, 재전송 안 함): "
+                             + ", ".join(f"{c} 보유 {g} / 기대 {q}" for c, (g, q) in diff.items()),
                              critical=True)
     st["traded_on"] = today
     st.pop("pending", None)
     st["last_trade"] = {k: v for k, v in rec.items() if k != "results"} | {
-        "results": [[s, c, q, "unknown" if isinstance(r, dict) and r.get("unknown") else
-                     ("rejected" if isinstance(r, dict) and r.get("success") is False else "ok")]
-                    for s, c, q, r in rec["results"]]}
+        "results": [[s, c, q, order_status(r)] for s, c, q, r in rec["results"]]}
     save_state(st, state_path)
     log_event("trade", st["last_trade"], events_path)
     tag = "🧪 모의" if dry_run else "💰 실전"
-    lines = " · ".join(f"{'매도' if s == 'sell' else '매수'} {c} {q}주" for s, c, q in orders) or "주문 없음"
+    if dry_run or not orders:
+        lines = " · ".join(f"{'매도' if s == 'sell' else '매수'} {c} {q}주" for s, c, q in orders) or "주문 없음"
+    else:
+        lines = " · ".join(
+            f"{'매도' if s == 'sell' else '매수'} {c} {q}주"
+            + (f"(지정가 {rec['buys'][c]['limit']:,})" if s == "buy" else "(시장가)") + f" {order_status(r)}"
+            for s, c, q, r in rec["results"]) or "주문 없음"
     await notify(f"[I3 {tag}] {today} 매매 — 목표 KODEX200 {plan['w']:.0%} · {lines}")
     return rec
 
@@ -294,12 +353,37 @@ class KiwoomBroker:
         from trend_kiwoom_io import _account_equity
         return await _account_equity()
 
-    async def place(self, side, code, qty):
-        from src.claude_agents.base.mcp_client import MCPManager
+    async def price(self, code):
+        from trend_config import MARKET_URL
+        from trend_kiwoom_io import _kiwoom_call, _num
+        d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": code})
+        return _num(d, "cur_prc", abs_val=True) or None
+
+    async def orderable(self, code, price):
+        """kt00010 주문가능금액(ord_alowa). 응답이 이상하면 None — 0 으로 믿지 않는다."""
         from trend_config import TRADING_URL
-        from trend_kiwoom_io import _place
-        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
-            return await _place(mcp, side, code, qty)
+        from trend_kiwoom_io import _kiwoom_call, _num
+        d = await _kiwoom_call("trading-domain", TRADING_URL, "orderable_amount",
+                               {"stock_code": code, "trade_type": "buy", "price": price})
+        if str(d.get("return_code")) != "0" or "ord_alowa" not in d:
+            return None
+        return _num(d, "ord_alowa")
+
+    async def place(self, side, code, qty, price=None):
+        """주문 1회 — price 가 있으면 지정가(01), 없으면 시장가(03). **재전송하지 않는다**: 예외·타임아웃은
+        접수 여부 불명({"unknown": True})으로 돌려 잔고 대조에 맡긴다(trend_kiwoom_io._place 와 같은 원칙)."""
+        from src.claude_agents.base.mcp_client import MCPManager
+        from trend_config import ACCOUNT_NO, TRADING_URL
+        tool = "place_buy_order" if side == "buy" else "place_sell_order"
+        args = {"stock_code": code, "quantity": qty, "price": price,
+                "order_type": "01" if price else "03", "account_no": ACCOUNT_NO}
+        try:
+            async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+                raw = await asyncio.wait_for(mcp.call_tool(tool, args), timeout=10.0)
+            return json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            log.error("[ORDER] %s %s %d주 응답 불명(재전송 안 함): %s", side, code, qty, e)
+            return {"success": False, "unknown": True, "error": f"주문 응답 불명: {e}"}
 
 
 async def _notify(msg: str, critical: bool = False) -> None:

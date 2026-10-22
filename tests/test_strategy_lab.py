@@ -215,6 +215,59 @@ def test_drawdown_exit_no_lookahead():
     assert [t2(i, d) for i, d in enumerate(days[:3])] == r1
 
 
+def test_dd_control_grids_are_declared():
+    """★ 10-22 측정 전 선언."""
+    import lab_dd_control as I
+    assert I.I1_DEFAULT == (10, 20) and len(I.I1_GRID) == 9 and I.I1_REGIME_MA == 120
+    assert I.I2_GRID == (2, 3, 5, 8) and I.I2_DEFAULT == 5
+    assert (I.I2_FLOOR_DD, I.I2_BAND) == (18.0, 0.10)
+
+
+def test_drawdown_budget_exposure_shrinks_with_drawdown():
+    """★ 낙폭 예산 — 최고치에선 m×18%, 낙폭이 바닥선(−18%)에 닿으면 0."""
+    import lab_dd_control as I
+    t = I.drawdown_budget("A", 3, "C")
+    assert t(0, "d0", 100.0) == pytest.approx({"A": 0.54, "C": 0.46})
+    assert t(1, "d1", 91.0) == pytest.approx({"A": 3 * (91 - 82) / 91, "C": 1 - 3 * (91 - 82) / 91})
+    assert t(2, "d2", 82.0) == {"C": 1.0}                     # 바닥 → 위험자산 0
+    t5 = I.drawdown_budget("A", 8, "C")
+    assert t5(0, "d0", 100.0) == {"A": 1.0}                   # 상한 1(레버리지 없음)
+
+
+def test_drawdown_budget_trades_only_beyond_band():
+    import lab_dd_control as I
+    t = I.drawdown_budget("A", 3, "C")
+    t(0, "d0", 100.0)                                           # e = 0.54
+    assert t(1, "d1", 99.0) is None                             # e ≈ 0.52 → 10%p 미만 변화
+    assert t(2, "d2", 95.0) is not None                         # e ≈ 0.41 → 매매
+
+
+def test_simulate_passes_closing_nav_when_asked():
+    bars = _bars([(100, 100), (100, 120), (100, 130)])
+    dates = sorted(bars)
+    seen = []
+
+    def tgt(i, d, nav):
+        seen.append(nav)
+        return {"X": 1.0} if i == 0 else None
+    L.simulate({"X": L.Asset("X", bars)}, dates, tgt, pass_nav=True)
+    assert seen[0] == pytest.approx(1.0) and seen[1] > 1.15     # 둘째 날 종가 반영
+
+
+def test_reentry_requires_regime_up():
+    """★ I1 — n일 고점을 넘어도 KOSPI 가 MA 아래면 재진입하지 않는다."""
+    import lab_dd_control as I
+    bars = {f"2020-01-{k + 1:02d}": {"open": c, "close": c} for k, c in enumerate([100, 80, 85, 90])}
+    days = sorted(bars)
+    down = {d: {"open": c, "close": c} for d, c in zip(days, [100, 90, 80, 70])}   # KOSPI 하락
+    up = {d: {"open": c, "close": c} for d, c in zip(days, [100, 101, 102, 103])}  # KOSPI 상승
+    for kospi, expect in ((down, None), (up, {"A": 1.0})):
+        t = I.reentry_confirmed(bars, kospi, "A", 10, 1, "C", regime_ma=2)
+        t(0, days[0])
+        assert t(1, days[1]) == {"C": 1.0}                    # −20% 이탈
+        assert t(2, days[2]) == expect                        # 85 > 80 돌파 — 레짐에 따라
+
+
 def test_robustness_uses_median_not_best():
     """★ 가장 좋은 설정 하나가 아니라 중앙값으로 판정한다."""
     grid = [{"전체": _m(c, 15.0, -5.0), "박스권": _m(5.0), "강세장": _m(24.0)} for c in (5.0, 6.0, 40.0)]

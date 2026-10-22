@@ -118,9 +118,12 @@ def _side_cost(taxed: bool, sell: bool) -> float:
 
 
 def simulate(assets: dict[str, Asset], dates: list[str],
-             target: Callable[[int, str], dict[str, float] | None],
-             equity: float = 0.0) -> SimResult:
+             target: Callable[..., dict[str, float] | None],
+             equity: float = 0.0, pass_nav: bool = False) -> SimResult:
     """매일 종가 후 target(i, date) 를 부른다 → {code: 비중} 이면 **다음 날 시가**에 그 비중으로 맞춘다.
+
+    pass_nav=True 면 target(i, date, nav) — 그날 **종가 기준 자기 자산**을 넘겨준다(낙폭 예산처럼
+    전략이 자기 손익을 보고 비중을 정하는 경우). 그날까지의 값이라 미래 정보가 아니다.
 
     None 을 돌려주면 그대로 유지. 비중 합 < 1 이면 나머지는 현금. equity>0 이면 정수 주식수
     (소액 계좌 제약), 0 이면 소수 단위(지수형 연구용). 바가 없는 날(정지·휴장 차이)은 그 종목을
@@ -182,7 +185,7 @@ def simulate(assets: dict[str, Asset], dates: list[str],
         res.dates.append(d)
         res.curve.append(nav_close)
         if i < len(dates) - 1:
-            t = target(i, d)
+            t = target(i, d, nav_close) if pass_nav else target(i, d)
             if t is not None:
                 pending = t
     avg = statistics.fmean(res.curve) if res.curve else 0.0

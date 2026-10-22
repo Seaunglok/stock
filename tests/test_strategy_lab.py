@@ -15,7 +15,20 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import strategy_lab as L  # noqa: E402
+import strategy_lab as L
+
+
+def test_prune_live_cache_keeps_research_dates(tmp_path):
+    """매일 '오늘' 기준 캐시는 최신만 남기고, 연구·테스트용 고정 기준일(HOLDOUT 끝 이하)은 지우지 않는다."""
+    names = ["X_2026-08-24.json", "X_2026-10-21.json", "X_2026-10-22.json", "X_2026-10-23.json",
+             "X_2026-10-24.json", "XY_2026-10-22.json", "ohlc_X_2026-10-22.json"]
+    for n in names:
+        (tmp_path / n).write_text("{}", encoding="utf-8")
+    assert L.prune_live_cache("X", "2026-10-24", tmp_path) == 2
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert left == ["XY_2026-10-22.json", "X_2026-08-24.json", "X_2026-10-21.json", "X_2026-10-24.json",
+                    "ohlc_X_2026-10-22.json"]
+    assert L.prune_live_cache("X", "2026-10-21", tmp_path) == 0          # 연구 기준일 이하로는 아무것도 안 지운다  # noqa: E402
 
 
 def _bars(prices: list[tuple[float, float]], start_day: int = 1, month: str = "2020-01") -> dict:

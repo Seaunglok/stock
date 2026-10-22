@@ -167,34 +167,10 @@ def _parse_sell_orders(payload: Any, symbol: str,
     since_hhmmss 이후 주문만 센다(당일 앞선 다른 주문을 이번 것으로 오인하지 않게).
     취소·정정·거부 주문은 뺀다. 체결가는 체결수량 가중 평균(체결 0 이면 0.0).
     2026-09-30 응답 불명 매도 확인용(_confirm_unknown_sell).
+    2026-10-22: 매수·매도 공용 파서(i3_fills.parse_fills)로 합침 — 규칙은 그대로(tests/test_unknown_sell 이 잠근다).
     """
-    try:
-        p = json.loads(payload) if isinstance(payload, str) else payload
-    except Exception:
-        return None
-    if not isinstance(p, dict) or p.get("success") is False:
-        return None
-    d = p.get("data", p)
-    if not isinstance(d, dict) or str(d.get("return_code", "0")) != "0":
-        return None
-    rows = d.get("cntr")
-    if not isinstance(rows, list):
-        return None
-    ordered = filled = 0
-    amount = 0.0
-    for r in rows:
-        if not isinstance(r, dict) or str(r.get("stk_cd", "")).lstrip("A") != symbol:
-            continue
-        side, status = str(r.get("io_tp_nm", "")), str(r.get("ord_stt", ""))
-        if "매도" not in side or any(x in side + status for x in ("취소", "정정", "거부")):
-            continue
-        if str(r.get("ord_tm", "")).zfill(6) < since_hhmmss:
-            continue
-        cq = abs(_kint(r.get("cntr_qty", 0)))
-        ordered += abs(_kint(r.get("ord_qty", 0)))
-        filled += cq
-        amount += cq * _num(r, "cntr_pric", abs_val=True)
-    return ordered, filled, (amount / filled if filled else 0.0)
+    from i3_fills import parse_fills
+    return parse_fills(payload, symbol, "매도", since_hhmmss)
 
 
 async def _account_equity() -> tuple[float, float]:

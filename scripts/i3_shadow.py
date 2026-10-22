@@ -225,7 +225,8 @@ def _run_trend(data: dict, start: str, equity: float, upto: str) -> dict:
     if not win:
         return {"curve": [(start, round(equity))], "w_hist": {}, "trade_days": [], "nav_hist": {start: equity}, "w": None}
     P._SIG_MEMO.clear()
-    res = P.simulate(TP.DATA_START, dates[-1], 100, cfg, Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS),
+    # end 는 위 _load 와 같은 값(upto)으로 — 다르면 캐시 키가 달라 100종목을 다시 받는다(10-22 리팩터에서 발견)
+    res = P.simulate(TP.DATA_START, upto, 100, cfg, Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS),
                      P.Sizing(mode="notional", position_pct=k["position_pct"]), k["max_pos"], 0,
                      "partial" in k["exits"], P._sector_map(), hard_stop_pct=k["hard_stop"],
                      rank_mode=k["rank_mode"], regime_ma=k["regime_ma"], breadth_min=k["breadth_min"],
@@ -559,22 +560,6 @@ def append_history(row: dict, path: Path = HISTORY_FILE) -> None:
     tmp.replace(path)
 
 
-async def _recent_ohlc(code: str) -> dict:
-    """키움 최근 일봉(고가·저가 포함) — 실전 코드(i3_live)는 건드리지 않고 리그에서만 쓴다."""
-    from trend_config import MARKET_URL
-    from trend_kiwoom_io import _kiwoom_call, _num
-    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "get_daily_chart", {"stock_code": code, "limit": 150})
-    out = {}
-    for r in d.get("stk_dt_pole_chart_qry") or []:
-        dt = str(r.get("dt", ""))
-        c = _num(r, "cur_prc", abs_val=True)
-        if len(dt) == 8 and c > 0:
-            o = _num(r, "open_pric", abs_val=True) or c
-            out[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = {"open": o, "high": _num(r, "high_pric", abs_val=True) or max(o, c),
-                                                   "low": _num(r, "low_pric", abs_val=True) or min(o, c), "close": c}
-    return out
-
-
 async def _load_data(today: str) -> tuple[dict, dict]:
     """멤버가 쓰는 종목: 장기 이력 FDR + 최근·오늘 일봉 키움(실전 판단과 같은 출처).
     두 출처를 겹치는 날로 대조한 결과(audit)도 돌려준다 — 어긋나면 그날 리그 기록은 믿을 수 없다."""
@@ -588,7 +573,7 @@ async def _load_data(today: str) -> tuple[dict, dict]:
             hist, rec = await m.kospi_bars(), await m.recent("KOSPI")
         elif c.startswith("ohlc:"):
             code = c.split(":", 1)[1]
-            hist, rec = C.load_ohlc(code, "2010-01-01", today), await _recent_ohlc(code)
+            hist, rec = C.load_ohlc(code, "2010-01-01", today), await m.recent(code)   # 실전과 같은 조회(고가·저가 포함)
         else:
             hist = L.load_bars(c, "2010-01-01", today)
             try:

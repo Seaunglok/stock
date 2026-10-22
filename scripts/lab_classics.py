@@ -83,6 +83,7 @@ def load_ohlc(code: str, start: str = "1990-01-01", end: str = END) -> dict[str,
                                             "low": min(lo, o, c) if lo == lo and lo > 0 else min(o, c), "close": c}
         _OHLC_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(rows), encoding="utf-8")
+        L.prune_live_cache(f"ohlc_{safe}", end, _OHLC_DIR)
     return {d: v for d, v in rows.items() if start <= d <= end}
 
 

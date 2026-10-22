@@ -415,8 +415,11 @@ class KiwoomMarket:
             dt = str(r.get("dt", ""))
             c = _num(r, "cur_prc", abs_val=True) / scale
             o = _num(r, "open_pric", abs_val=True) / scale or c
-            if len(dt) == 8 and c > 0:
-                out[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = {"open": o, "close": c}
+            if len(dt) == 8 and c > 0:      # 고가·저가도 담는다(리그 변동성돌파가 같은 함수를 쓴다 — 판단은 시가·종가만 본다)
+                out[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = {
+                    "open": o, "close": c,
+                    "high": (_num(r, "high_pric", abs_val=True) / scale) or max(o, c),
+                    "low": (_num(r, "low_pric", abs_val=True) / scale) or min(o, c)}
         return out
 
 

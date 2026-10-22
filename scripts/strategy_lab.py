@@ -98,7 +98,27 @@ def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31") -> 
             o = float(r.get("Open", c) or c)
             rows[d.strftime("%Y-%m-%d")] = {"open": o if o == o and o > 0 else c, "close": c}
         path.write_text(json.dumps(rows), encoding="utf-8")
+        prune_live_cache(safe, end)
     return {d: v for d, v in rows.items() if start <= d <= end}
+
+
+def prune_live_cache(prefix: str, keep_end: str, cache_dir: Path | None = None) -> int:
+    """실전·리그가 매일 '오늘' 기준으로 받는 캐시({prefix}_{날짜}.json)가 쌓이지 않게, 같은 종목의 더 오래된
+    일일 캐시를 지운다. 연구·테스트가 쓰는 고정 기준일(HOLDOUT 끝 이하)은 **지우지 않는다**. 지운 개수 반환."""
+    import re
+    if keep_end <= HOLDOUT[1]:
+        return 0
+    pat = re.compile(rf"^{re.escape(prefix)}_(\d{{4}}-\d{{2}}-\d{{2}})\.json$")
+    gone = 0
+    for p in (cache_dir or _CACHE_DIR).glob(f"{prefix}_*.json"):
+        m = pat.match(p.name)
+        if m and HOLDOUT[1] < m.group(1) < keep_end:
+            try:
+                p.unlink()
+                gone += 1
+            except OSError:
+                pass
+    return gone
 
 
 def calendar(bars: dict[str, dict], lo: str, hi: str) -> list[str]:

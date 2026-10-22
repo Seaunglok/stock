@@ -188,6 +188,19 @@ class FakeBroker:
         self.limits.append(price)
         return self.responses.get((side, code), {"success": True, "data": {"return_code": 0}})
 
+    exec_fail = False
+
+    async def executions(self, day):
+        """보낸 주문이 그대로 체결된 체결내역(ka10076 형식) — 매수는 지정가보다 조금 싸게, 매도는 기준가에."""
+        if self.exec_fail:
+            raise RuntimeError("체결내역 조회 실패")
+        rows = []
+        for (side, code, qty), lim in zip(self.placed, self.limits):
+            px = (lim - 5) if lim else self._px.get(code, 0)
+            rows.append({"stk_cd": f"A{code}", "io_tp_nm": "+매수" if side == "buy" else "-매도", "ord_stt": "체결",
+                         "ord_tm": "090600", "ord_qty": str(qty), "cntr_qty": str(qty), "cntr_pric": str(px)})
+        return {"success": True, "data": {"return_code": 0, "cntr": rows}}
+
 
 class Notes:
     def __init__(self):
@@ -299,6 +312,68 @@ def test_real_trade_sells_first_then_waits_then_buys(paths):
     assert ev.index("wait") > ev.index("place") and ev.index("price") > ev.index("wait")
     # ★ 매도는 시장가, 매수는 현재가 +1% 지정가(5원 올림)
     assert b.limits[0] is None and b.limits[-1] == LV.limit_price(90_000) == 90_900
+
+
+def test_fills_are_recorded_with_slippage(paths):
+    """★ 체결 기록(P1-②) — 보낸 주문마다 체결가·슬리피지가 fills.jsonl 에 남는다(상태 파일 옆, 테스트는 임시 폴더)."""
+    _seed(paths[0])
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0))
+    r = run(LV.phase_trade(b, Notes(), NOW, PRICES, *paths, dry_run=False))
+    rows = [json.loads(x) for x in (paths[0].parent / "fills.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {(x["side"], x["code"]) for x in rows} == {("sell", K.CASH), ("buy", K.BASE)}
+    buy = next(x for x in rows if x["side"] == "buy")
+    assert buy["parsed"] and buy["fill_price"] == LV.limit_price(90_000) - 5 and buy["ref_price"] == 90_000
+    assert buy["slippage_bp"] == pytest.approx(((90_895) / 90_000 - 1) * 1e4, abs=0.01)
+    assert r["fills"] == rows
+
+
+def test_fill_lookup_failure_does_not_break_trade(paths):
+    _seed(paths[0])
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0))
+    b.exec_fail = True
+    r = run(LV.phase_trade(b, Notes(), NOW, PRICES, *paths, dry_run=False))
+    assert r["fills"] and all(not x["parsed"] and x["fill_price"] is None for x in r["fills"])
+    assert json.loads(paths[0].read_text(encoding="utf-8"))["traded_on"] == "2026-10-22"
+
+
+def _two_days(paths, eq1, eq2, hold, between=None):
+    days = _days()
+    d1, d2 = days[-2], days[-1]
+    notes = Notes()
+    run(LV.phase_decide(FakeMarket(days[:-1], d1), FakeBroker(holdings=hold, equity=(eq1, 0.0)), notes,
+                        datetime.fromisoformat(d1 + "T15:50:00"), *paths))
+    if between:
+        between()
+    r = run(LV.phase_decide(FakeMarket(days, d2), FakeBroker(holdings=hold, equity=(eq2, 0.0)), notes,
+                            datetime.fromisoformat(d2 + "T15:50:00"), *paths))
+    return r, json.loads(paths[0].read_text(encoding="utf-8")), notes
+
+
+def test_withdrawal_between_decides_is_not_a_loss(paths):
+    """★ 일부러 깨뜨리기(P1-①) — 매매 없는 날 50만원 출금: 자동 보정, 성과 지수 그대로, 낙폭 예산 100% 유지."""
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    r, st, notes = _two_days(paths, 3_400_000.0, 2_900_000.0, hold)
+    assert r["flow"]["how"] == "auto-withdrawal" and r["flow"]["amount"] == -500_000
+    assert st["navs"][-1][1] == pytest.approx(st["navs"][0][1]) and r["exposure"] == 1.0
+    assert r["nav"] == 2_900_000                                     # 주문 수량은 실제 자산으로
+    assert any(c and "출금" in m for c, m in notes.msgs)
+
+
+def test_without_flow_correction_a_withdrawal_would_cut_exposure():
+    """보정이 없으면(원시 자산으로 예산) 50만원 출금이 14.7% 손실로 보여 비중이 깎인다 — 이 보정이 막는 사고."""
+    assert K.budget_exposure([3_400_000.0, 2_900_000.0]) < 0.25
+
+
+def test_declared_deposit_is_applied(paths):
+    """운용자가 입금(SK이노 매도 대금 등)을 기록하면 다음 판단에서 성과 지수에 안 섞인다."""
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    r, st, _ = _two_days(paths, 3_400_000.0, 3_542_200.0, hold,
+                         between=lambda: LV.record_flow(142_200, "SK이노 매도", datetime(2026, 10, 23), paths[0]))
+    assert r["flow"] == {"amount": 142_200, "how": "declared", "resid": 0}
+    assert st["navs"][-1][1] == pytest.approx(st["navs"][0][1])
+    assert st["flows_declared"][0]["applied_on"] is not None
 
 
 def test_wait_broker_ready_retries_until_mcp_answers():

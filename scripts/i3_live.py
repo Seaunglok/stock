@@ -42,6 +42,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
         sys.path.insert(0, _p)
 
 import i3_core as K  # noqa: E402
+import i3_fills as FL  # noqa: E402
+import i3_flows as F  # noqa: E402
 
 DATA_DIR = _ROOT / "data" / "i3"
 STATE_FILE = DATA_DIR / "state.json"
@@ -64,6 +66,7 @@ PRICE_STEP = 5            # 지정가 올림 단위 — ETF 호가 1원(머니�
 FEE_BUF = 0.001           # 주문가능금액 대비 수수료·반올림 여유
 
 log = logging.getLogger("i3")
+_FLOW_ARGS: dict = {}            # --phase flow 인자(main 이 채운다)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -112,6 +115,7 @@ class Broker(Protocol):
     async def price(self, code: str) -> float | None: ...                   # 현재가(장중)
     async def orderable(self, code: str, price: int) -> float | None: ...    # 매수 주문가능금액
     async def place(self, side: str, code: str, qty: int, price: int | None = None) -> Any: ...
+    async def executions(self, day: str) -> Any: ...                        # 그날 체결내역 원응답(ka10076)
 
 
 class Notifier(Protocol):
@@ -165,7 +169,20 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     nav = sleeve_nav(eq, hold)
 
     st = load_state(state_path)
-    navs = [x for x in st.get("navs", []) if x[0] != today] + [[today, nav]]
+    # 입출금 보정(P1-①, i3_flows): 낙폭 예산은 '성과 지수'(실제 자산 ÷ 좌수)로 본다 — 출금이 손실로 보이지 않게.
+    acct = st.get("acct")
+    if acct and acct["date"] < today:
+        st["acct_prev"] = acct
+    acct_base = acct if acct and acct["date"] < today else st.get("acct_prev")
+    declared_rows = [f for f in st.get("flows_declared", []) if f.get("applied_on") in (None, today)]
+    declared = sum(float(f["amount"]) for f in declared_rows)
+    traded_since = bool(acct_base) and st.get("traded_on", "") > acct_base["date"]
+    flow, how, resid = F.detect_flow(acct_base["snap"] if acct_base else None, hold, nav, traded_since, declared)
+    idx, units = F.apply_flow(acct_base["index"] if acct_base else None,
+                              acct_base["units"] if acct_base else None, nav, flow)
+    for f in declared_rows:
+        f["applied_on"] = today
+    navs = [x for x in st.get("navs", []) if x[0] != today] + [[today, idx]]
     eng = K.engine_state(base, kospi, today)
     if eng.last_date != today:
         return {"abort": f"엔진 마지막 날짜 {eng.last_date} ≠ 오늘"}
@@ -173,8 +190,11 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     e = K.budget_exposure([n for _, n in navs])
     rec = {"date": today, "nav": round(nav), "engine_holding": eng.holding, "engine_changed": eng.changed_today,
            "exposure": round(e, 4), "w": round(w, 4), "trade": need, "reason": reason,
-           "close": {K.BASE: base[today]["close"], K.CASH: (await market.recent(K.CASH)).get(today, {}).get("close")}}
+           "close": {K.BASE: base[today]["close"], K.CASH: (await market.recent(K.CASH)).get(today, {}).get("close")},
+           "index": round(idx, 2), "units": round(units, 10),
+           "flow": {"amount": round(flow), "how": how, "resid": round(resid)}}
     st["navs"] = navs[-600:]
+    st["acct"] = {"date": today, "snap": F.snapshot(hold, nav, (K.BASE, K.CASH)), "index": idx, "units": units}
     st["last_decision"] = rec
     if need:
         st["w"] = w
@@ -184,7 +204,22 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     tag = "🧪 모의" if dry_run else "💰 실전"
     await notify(f"[I3 {tag}] {today} 판단 — 엔진 {'보유' if eng.holding else '이탈'} · 낙폭예산 {e:.0%} → "
                  f"KODEX200 목표 {w:.0%} · {'내일 매매' if need else '매매 없음'} ({reason}) · I3 자산 {nav:,.0f}원")
+    if how == "auto-withdrawal":
+        await notify(f"⚠️ [I3] 출금으로 보고 자동 보정 — 설명 안 되는 감소 {-resid:,.0f}원(매매 없는 날). "
+                     f"낙폭 예산(성과 지수)은 영향 없음. 출금한 적이 없다면 HTS 로 확인 필요", critical=True)
+    elif how == "unexplained-gain":
+        await notify(f"ℹ️ [I3] 설명 안 되는 증가 {resid:,.0f}원 — 분배금이면 그대로 두면 되고, 입금·다른 종목 매도라면 "
+                     f"`python scripts/i3_live.py --phase flow --amount {resid:.0f}` 로 기록")
     return rec
+
+
+def record_flow(amount: float, memo: str, now: datetime, state_path: Path = STATE_FILE) -> dict:
+    """운용자 입출금 기록(+입금 / −출금) — 다음 판단 때 성과 지수에서 뺀다(i3_flows). 매매일에도 반영된다."""
+    st = load_state(state_path)
+    row = {"date": now.strftime("%Y-%m-%d"), "amount": float(amount), "memo": memo, "applied_on": None}
+    st.setdefault("flows_declared", []).append(row)
+    save_state(st, state_path)
+    return row
 
 
 # ── 매매 ─────────────────────────────────────────────────────────────────────
@@ -213,7 +248,7 @@ def order_status(resp: Any) -> str:
 async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: dict[str, float],
                       state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
                       dry_run: bool = True, halt: bool = False, wait_after_open=None,
-                      before_check=None) -> dict:
+                      before_check=None, fills_path: Path | None = None) -> dict:
     today = now.strftime("%Y-%m-%d")
     if halt:
         return {"skip": "I3_HALT=true"}
@@ -301,6 +336,30 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
                 await notify("⚠️ [I3] 매매 후 잔고가 주문과 다름(미체결·부분체결, 재전송 안 함): "
                              + ", ".join(f"{c} 보유 {g} / 기대 {q}" for c, (g, q) in diff.items()),
                              critical=True)
+        # 체결 기록(P1-②, i3_fills) — 실제 체결가 vs 주문 직전 현재가(매수)·판단 종가(매도). 비용 가정 실측용.
+        # 조회가 실패해도 매매 결과엔 영향 없다(기록만 '파싱 실패'로 남긴다).
+        sent = [(s, c, q, r) for s, c, q, r in rec["results"] if order_status(r) != "rejected"]
+        if sent:
+            try:
+                raw = await broker.executions(today.replace("-", ""))
+            except Exception as e:
+                log.warning("[FILL] 체결내역 조회 실패: %s", e)
+                raw = None
+            since = now.strftime("%H%M%S")
+            fills = []
+            for s, c, q, _r in sent:
+                parsed = FL.parse_fills(raw, c, "매수" if s == "buy" else "매도", since) if raw is not None else None
+                if s == "buy":
+                    b = rec["buys"].get(c, {})
+                    fills.append(FL.fill_record(today, s, c, q, "지정가", b.get("limit"), b.get("cur"), parsed))
+                else:
+                    fills.append(FL.fill_record(today, s, c, q, "시장가", None, prices.get(c), parsed))
+            rec["fills"] = fills
+            fp = fills_path or state_path.parent / "fills.jsonl"
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            with fp.open("a", encoding="utf-8") as f:
+                for x in fills:
+                    f.write(json.dumps(x, ensure_ascii=False) + "\n")
     st["traded_on"] = today
     st.pop("pending", None)
     st["last_trade"] = {k: v for k, v in rec.items() if k != "results"} | {
@@ -315,7 +374,11 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
             f"{'매도' if s == 'sell' else '매수'} {c} {q}주"
             + (f"(지정가 {rec['buys'][c]['limit']:,})" if s == "buy" else "(시장가)") + f" {order_status(r)}"
             for s, c, q, r in rec["results"]) or "주문 없음"
-    await notify(f"[I3 {tag}] {today} 매매 — 목표 KODEX200 {plan['w']:.0%} · {lines}")
+    filled = [f"{x['code']} {x['fill_qty']}주 @{x['fill_price']:,.0f}"
+              + (f"({x['slippage_bp']:+.1f}bp)" if x.get("slippage_bp") is not None else "")
+              for x in rec.get("fills", []) if x.get("fill_price")]
+    await notify(f"[I3 {tag}] {today} 매매 — 목표 KODEX200 {plan['w']:.0%} · {lines}"
+                 + (f" · 체결 {', '.join(filled)}" if filled else ""))
     return rec
 
 
@@ -393,6 +456,15 @@ class KiwoomBroker:
             log.error("[ORDER] %s %s %d주 응답 불명(재전송 안 함): %s", side, code, qty, e)
             return {"success": False, "unknown": True, "error": f"주문 응답 불명: {e}"}
 
+    async def executions(self, day):
+        """그날 체결내역 원응답(ka10076) — 체결가 기록용. 실패는 호출자가 '파싱 실패'로 남긴다."""
+        from src.claude_agents.base.mcp_client import MCPManager
+        from trend_config import ACCOUNT_NO, TRADING_URL
+        async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
+            return await asyncio.wait_for(mcp.call_tool("get_order_executions",
+                                                        {"account_no": ACCOUNT_NO, "start_date": day,
+                                                         "end_date": day}), timeout=10.0)
+
 
 async def _notify(msg: str, critical: bool = False) -> None:
     from trend_runtime import notify
@@ -426,6 +498,13 @@ async def wait_broker_ready(broker: Broker, deadline: datetime, sleep=asyncio.sl
 async def _main(phase: str) -> int:
     if phase == "status":
         print(json.dumps(load_state(), ensure_ascii=False, indent=2))
+        return 0
+    if phase == "flow":
+        if _FLOW_ARGS.get("amount") is None:
+            print("사용법: python scripts/i3_live.py --phase flow --amount <+입금|-출금 원> [--memo 메모]")
+            return 2
+        row = record_flow(_FLOW_ARGS["amount"], _FLOW_ARGS.get("memo", ""), datetime.now())
+        print(json.dumps({"기록": row, "안내": "다음 판단(15:50) 때 성과 지수에서 뺀다"}, ensure_ascii=False))
         return 0
     try:
         return await _run_phase(phase)
@@ -472,8 +551,11 @@ async def _run_phase(phase: str) -> int:
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=["decide", "trade", "status"])
+    ap.add_argument("--phase", required=True, choices=["decide", "trade", "status", "flow"])
+    ap.add_argument("--amount", type=float, help="flow: +입금 / -출금 (원)")
+    ap.add_argument("--memo", default="", help="flow: 메모")
     args = ap.parse_args()
+    _FLOW_ARGS.update(amount=args.amount, memo=args.memo)
     from dotenv import load_dotenv
     load_dotenv(_ROOT / ".env")
     _setup_logging()

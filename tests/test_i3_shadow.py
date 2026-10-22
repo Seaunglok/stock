@@ -229,6 +229,34 @@ def test_r6_member_is_the_declared_design_and_marked_as_exception(league_data):
     assert x[START] == pytest.approx(i3[START])            # 출발일 판단은 같다(리셋은 재진입 때만)
 
 
+def test_d5a_member_is_the_declared_design_and_marked_as_exception(league_data):
+    """D5a 는 lab_gen5 선언(c9f5dfd)의 결합 그대로 — KODEX200 비중은 **매일 챔피언 I3 와 같고**(같은 계좌 자산 경로를 주면),
+    남는 돈만 방어 자산·현금 자리로 간다. 연구 현금(153130)이 리그로 새면 안 되고, 입장이 규칙 밖 결정임이 기록돼 있어야 한다."""
+    import lab_gen5 as G5
+    d5a = next(m for m in S.MEMBERS if m.name == "D5a")
+    assert S._DEF3 == G5.DEF3 and "예외" in d5a.admitted and "규칙 밖" in d5a.admitted
+    dates = S._calendar(league_data, UPTO)
+    _, i3, _ = S._b_i3("I3")(league_data, dates)
+    codes, t, needs_nav = S._b_d5a(league_data, dates)
+    assert needs_nav and set(codes) == {K.BASE, K.CASH, *G5.DEF3}
+    k = league_data[K.BASE]
+    w_i3, checked, held_def, partial = None, 0, 0, 0
+    for i, d in enumerate(dates):
+        nav = 3_640_000.0 * k[d]["close"] / k[dates[0]]["close"]      # 둘 다 같은 경로 — 낙폭 예산이 실제로 깎이는 구간 포함
+        a, b = i3(i, d, nav), t(i, d, nav)
+        if a is not None:
+            w_i3 = a.get(K.BASE, 0.0)
+        if b is None:
+            continue
+        assert b.get(K.BASE, 0.0) == pytest.approx(w_i3), d
+        assert set(b) <= set(codes) and "153130" not in b, d
+        assert sum(b.values()) == pytest.approx(1.0) and all(w >= -1e-12 for w in b.values()), d
+        checked += 1
+        held_def += any(b.get(x, 0) > 0 for x in G5.DEF3)
+        partial += 0 < w_i3 < 1
+    assert checked > 50 and held_def > 0 and partial > 0, (checked, held_def, partial)
+
+
 def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
     """종목형 팩터 멤버(저베타·퀄리티) — 대형주 데이터는 합성으로 바꿔 끼워 배선만 시험: 같은 출발선, 월말에만 매매,
     주식 비중 0~100%, 매도세 있는 자산으로 취급."""

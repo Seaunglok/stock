@@ -62,7 +62,8 @@ DUP_CORR = 0.98                  # 월간 점검: 최근 DUP_WINDOW 일 일간 �
 DUP_WINDOW = 60                  # (10-22 구현 중 수정 — 첫 기록 전): 자동 탈락으로 하면 R1·R6(재진입 때만 다름)과
 #                                  같은 시기에 둘 다 100% 보유인 계열(Faber·골든크로스)이 차이가 드러나기 전에 잘린다.
 DOWN_RUNS = 5                    # 연속 실패(데이터 중단·상장폐지 등) 이만큼이면 탈락(운용 불가)
-CAPACITY = 20                    # 정원(활성 멤버, 챔피언 포함)
+CAPACITY = 25                    # 정원(활성 멤버, 챔피언 포함). 10-22 운용자 결정으로 20→25 — 1월 점검 밖의 예외
+#                                  (D5a 를 넣을 자리: "25개 늘리자 그럼")
 MAX_NEW_PER_MONTH = 3            # 월 신규 등록 상한(창립 멤버 2026-10-22 제외)
 FOUNDING_DATE = "2026-10-22"
 CHAMPION_ALERT_MDD = 20.0        # 챔피언 실계좌 낙폭이 넘으면 긴급 점검(자동 교체 없음)
@@ -170,6 +171,15 @@ def _b_i3x(spec: str):
         return ((K.BASE, K.CASH),
                 CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **CH.SPECS[spec]), True)
     return build
+
+
+def _b_d5a(data, dates):
+    """5세대 D5a — lab_gen5 선언(c9f5dfd) 그대로: I3 × 남는 돈은 방어 자산 TSMOM. 연구의 현금(153130)만 리그 현금 자리로."""
+    import lab_classics as C
+    import lab_gen5 as G5
+    ends = month_ends_live(sorted(data[K.BASE]))
+    t = G5.combine(data[K.BASE], data[KOSPI], C.tsmom({a: data[a] for a in G5.DEF3}, ends))
+    return (K.BASE, *G5.DEF3, K.CASH), remap(t, {G5.CASH: K.CASH}), True
 
 
 def _b_i1a(data, dates):
@@ -359,6 +369,13 @@ MEMBERS = MEMBERS + (
            (K.BASE, K.CASH, KOSPI), _run_factor("BAB")),
     Member("퀄리티", "펀드 팩터(AQR)", "2026-10-23", _AQR, "Asness 외(2019) QMJ 롱온리 — 수익성·안전성 상위 20종목",
            (K.BASE, K.CASH, KOSPI), _run_factor("QMJ")),
+)
+_DEF3 = ("148070", "132030", "138230")          # 국고채10년·금·달러 = lab_gen5.DEF3 (테스트가 같은지 확인)
+MEMBERS = MEMBERS + (
+    Member("D5a", "I3 계보", "2026-10-23",
+           "운용자 예외(10-22): 입장 조건 G3(미공개 ≥ I3 −1%p)만 미달 — 규칙 밖 결정으로 입장, 정원 20→25 도 같은 결정",
+           "5세대: I3 × 남는 돈은 국고채10년·금·달러 중 12개월 수익 > 0 인 것에 1/3씩 — 학습에서 위험은 I3 와 같고 연 +1.6%p",
+           (K.BASE, *_DEF3, K.CASH, KOSPI), std_run(_b_d5a)),
 )
 
 

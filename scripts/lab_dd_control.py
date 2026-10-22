@@ -130,7 +130,7 @@ def _run_family(name, grid, default, label_fn, make_main, make_long, pass_nav, d
     med_long = {"mdd": statistics.median(m_["mdd"] for _, m_ in lm),
                 "worst_year": statistics.median(m_["worst_year"] for _, m_ in lm)}
     long_rows = L.judge_long(med_long)
-    print(f"  장기 스트레스 {LONG_STRESS[0]}~{LONG_STRESS[1]} (CAGR / MDD / 최악연도):  "
+    print(f"  장기 스트레스 {long_dates[0]}~{long_dates[-1]} (CAGR / MDD / 최악연도):  "
           + " · ".join(f"{label_fn(p)} {m_['cagr']:+.1f}%/{m_['mdd']:.0f}%/{m_['worst_year']:+.0f}%" for p, m_ in lm))
     for nm, ok, txt in long_rows:
         print(f"      [{'O' if ok else 'X'}] 중앙값 {nm}: {txt}")

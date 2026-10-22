@@ -313,6 +313,42 @@ def test_i3_respects_engine_exit():
     assert t(2, days[2], 100.0) == {"C": 1.0}
 
 
+def test_i4_grids_declared():
+    """★ 10-22 측정 전 선언."""
+    import lab_i4 as X
+    assert X.LEV_DEFAULT == (11, 252) and len(X.LEV_GRID) == 9 and X.LEV_CAP == 2.0
+    assert X.ROT_DEFAULT == (6, 252) and len(X.ROT_GRID) == 9
+
+
+def _flat(days, v=100.0):
+    return {d: {"open": v, "close": v} for d in days}
+
+
+def test_i4_leverage_splits_without_borrowing():
+    """★ 실효 노출 e>1 이면 레버리지 (e−1) + 기본 (2−e) — 비중 합 ≤ 1(차입 없음)."""
+    import lab_i4 as X
+    days = [f"2020-01-{k + 1:02d}" for k in range(3)]
+    t = X.i4(_flat(days), _flat(days), 11, 252, lev=True, rotate=False)
+    w = t(0, days[0], 100.0)                                   # 최고점: e = min(2, 11×0.18) = 1.98
+    assert w[X.LEV] == pytest.approx(0.98) and w[X.BASE] == pytest.approx(0.02)
+    assert sum(w.values()) == pytest.approx(1.0)
+    w2 = t(1, days[1], 95.0)                                   # 낙폭 5% → e = 11×(95−82)/95 ≈ 1.505
+    assert w2[X.LEV] == pytest.approx(11 * 13 / 95 - 1, rel=1e-6)
+
+
+def test_i4_rotation_picks_stronger_and_never_levers_alt():
+    """한·미 교체 — 최근 252일 수익이 큰 쪽. 나스닥이 선택되면 레버리지 없음."""
+    import lab_i4 as X
+    days = [f"2019-{m:02d}-{d:02d}" for m in range(1, 13) for d in range(1, 26)] + ["2020-01-02"]
+    base = {d: {"open": 100.0, "close": 100.0 + i * 0.01} for i, d in enumerate(days)}     # 약한 상승
+    alt = {d: {"open": 100.0, "close": 100.0 + i * 0.5} for i, d in enumerate(days)}       # 강한 상승
+    t = X.i4(base, base, 11, 252, lev=True, rotate=True, alt_bars=alt)
+    ws = [w for w in (t(i, d, 100.0) for i, d in enumerate(days)) if w is not None]
+    first_alt = next(w for w in ws if X.ALT in w)                 # 252일 이력이 생긴 뒤 첫 달에 교체
+    assert X.LEV not in first_alt and first_alt[X.ALT] <= 1.0
+    assert any(X.LEV in w for w in ws[:1]), "교체 전(KODEX200)엔 최고점에서 레버리지를 썼어야 한다"
+
+
 def test_robustness_uses_median_not_best():
     """★ 가장 좋은 설정 하나가 아니라 중앙값으로 판정한다."""
     grid = [{"전체": _m(c, 15.0, -5.0), "박스권": _m(5.0), "강세장": _m(24.0)} for c in (5.0, 6.0, 40.0)]

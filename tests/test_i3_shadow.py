@@ -148,6 +148,17 @@ def test_every_member_starts_from_the_same_line(league_data):
                                               START, eq, UPTO)["I3"]["curve"]
 
 
+def test_r6_member_is_the_declared_design_and_marked_as_exception(league_data):
+    """R6 는 lab_challengers 선언(a580dbe)의 설계 그대로이고, 입장이 규칙 밖 결정임이 기록돼 있어야 한다."""
+    import lab_challengers as CH
+    r6 = next(m for m in S.MEMBERS if m.name == "R6")
+    assert CH.SPECS["R6"] == {"reset": "once", "reset_trend_ma": 250, "reset_trend_lag": 20}
+    assert "예외" in r6.admitted and "규칙 밖" in r6.admitted
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], r6))
+    i3, x = res["I3"]["w_hist"], res["R6"]["w_hist"]
+    assert x[START] == pytest.approx(i3[START])            # 출발일 판단은 같다(리셋은 재진입 때만)
+
+
 def test_one_failing_member_does_not_stop_the_league(league_data):
     def boom(*a):
         raise RuntimeError("데이터 없음")

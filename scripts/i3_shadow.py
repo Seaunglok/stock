@@ -147,6 +147,15 @@ def _b_i3(mode: str):
     return build
 
 
+def _b_i3x(spec: str):
+    """lab_challengers 일반형(세대별 설계) — 같은 i3x 를 그대로 쓴다(다시 구현하지 않는다)."""
+    def build(data, dates):
+        import lab_challengers as CH
+        return ((K.BASE, K.CASH),
+                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **CH.SPECS[spec]), True)
+    return build
+
+
 def _b_i1a(data, dates):
     import lab_dd_control as I
     t = I.reentry_confirmed(data[K.BASE], data[KOSPI], K.BASE, *I.I1_DEFAULT, K.CASH)
@@ -271,6 +280,10 @@ MEMBERS: tuple[Member, ...] = (
     Member("I3", "I3", _D, "챔피언(실전)", "재진입 확인 엔진 × 낙폭 예산", (K.BASE, K.CASH, KOSPI), std_run(_b_i3("I3"))),
     Member("R1", "I3 계보", _D, "운용자 결정(10-22): 그림자 기록", "8차: 재진입 리셋 — 강세장 강점·연속 실패 약점",
            (K.BASE, K.CASH, KOSPI), std_run(_b_i3("R1"))),
+    Member("R6", "I3 계보", _D,
+           "운용자 예외(10-22): 입장 조건 E2(강세장 +1%p)를 0.2%p 차로 못 넘음 — 규칙 밖 결정으로 입장",
+           "3세대: 1년 1회 리셋 + KOSPI 250일선 상승 때만 — 학습에서 위험은 I3 와 같고 연 +0.5%p",
+           (K.BASE, K.CASH, KOSPI), std_run(_b_i3x("R6"))),
     Member("I1a", "I3 계보", _D, _OP, "5차: I3 의 엔진만(낙폭 예산 없음)", (K.BASE, K.CASH, KOSPI), std_run(_b_i1a)),
     Member("MA60", "지수 추세", _D, _OP, "1차 A: KODEX200 ⇔ KOSPI>MA60", (K.BASE, K.CASH, KOSPI), std_run(_b_ma60)),
     Member("듀얼모멘텀", "모멘텀", _D, _OP, "1차 C: 월말 KODEX200·나스닥100·국고채3년 12개월 수익 비교",

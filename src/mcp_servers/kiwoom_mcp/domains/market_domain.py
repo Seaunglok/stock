@@ -368,7 +368,8 @@ class MarketDomainServer(KiwoomDomainServer):
         async def get_daily_chart(
             stock_code: str,
             start_date: str | None = None,
-            end_date: str | None = None
+            end_date: str | None = None,
+            limit: int = 150,
         ) -> StandardResponse:
             """
             일봉 차트 조회
@@ -377,9 +378,11 @@ class MarketDomainServer(KiwoomDomainServer):
                 stock_code: 종목코드 (6자리 숫자)
                 start_date: 시작일 (YYYYMMDD 형식, 선택사항)
                 end_date: 종료일 (YYYYMMDD 형식, 선택사항)
+                limit: 반환 일봉 수 상한(최신순, 기본 150). 원본 응답이 ~138KB라 MCP 결과 잘림
+                       (30KB)으로 JSON 이 깨져 **빈 결과**가 됐다(2026-10-22 실측) — 서버에서 미리 자른다.
 
             Returns:
-                StandardResponse: 일봉 차트 데이터
+                StandardResponse: 일봉 차트 데이터 (일봉 배열: dt/cur_prc/open_pric/high_pric/low_pric/trde_qty)
 
             API: ka10081 (주식일봉차트조회요청)
             """
@@ -411,9 +414,24 @@ class MarketDomainServer(KiwoomDomainServer):
                 "upd_stkpc_tp": "1",  # 수정주가
             }
 
-            return await self.call_api_with_response(
+            resp = await self.call_api_with_response(
                 api_id=KiwoomAPIID.STOCK_DAILY_CHART, query=query, params=params
             )
+            # 응답 축소 — get_sector_daily_chart 와 같은 이유(잘림 → JSON 파손 → 빈 결과).
+            try:
+                data = resp.get("data") if isinstance(resp, dict) else None
+                if isinstance(data, dict):
+                    for key, arr in list(data.items()):
+                        if isinstance(arr, list) and arr and isinstance(arr[0], dict) and "dt" in arr[0]:
+                            keep = arr[:limit] if limit > 0 else arr
+                            data[key] = [
+                                {k: r.get(k) for k in ("dt", "cur_prc", "open_pric", "high_pric",
+                                                       "low_pric", "trde_qty") if r.get(k) is not None}
+                                for r in keep if isinstance(r, dict)
+                            ]
+            except Exception:  # 구조가 다르면 원본 그대로 반환
+                pass
+            return resp
 
         @self.mcp.tool()
         async def get_sector_daily_chart(

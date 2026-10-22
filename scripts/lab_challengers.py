@@ -1,0 +1,178 @@
+"""I3 리그 도전자 2세대 — 부모(R1)의 강점은 잇고 약점만 고친다 (2026-10-22, 사전 선언).
+
+운용자(10-22): "도전자들을 계속 만들어서 발전해야 한다. 도전자들의 설계도 참고해서 추가해야 발전한다.
+약점은 줄이고 강점은 더 살리는 방향으로."
+
+리그 규칙(i3_shadow): 도전자는 lab 사전선언 측정 후 등록, 승격은 **등록 이후 실전 데이터**로만(과거 성적 무관).
+그래서 과거 결과를 보고 설계한 2세대라도 괜찮다 — 판정은 아직 오지 않은 데이터가 한다. 다만 리그를 망가뜨릴
+설계(제1원칙 위반·부모보다 약점이 더 큰 것)는 입장 단계에서 거른다.
+
+부모 R1(재진입 리셋, 8차) — 강점: 재진입 때 100% 진입 → 강세장 +3.1%p, 연 +2.1%p.
+                             약점: 재진입이 연달아 실패하면 손실 상한 없음 → 장기 MDD 43%, 미공개 −11.4%.
+
+선언 (측정 전 — 결과를 보고 고치면 무효)
+---------------------------------------
+  R3 1년 1회 리셋   리셋은 직전 리셋 후 L(252)영업일이 지났을 때만. 아니면 I3 예산 그대로(연속 휩쏘 차단).
+  R4 리셋+초기 손절 R1 리셋 + 재진입 후 TIGHT_DAYS(60)영업일 동안 엔진 이탈선 −10% → −TIGHT_X(5)%.
+                    실패한 재진입의 손실을 절반으로(강세장 재진입은 대개 60일 안에 실패하거나 자리 잡는다).
+  R5 둘 다          R3 + R4.
+  (엔진·m·L·바닥 18%·밴드 10%p 는 I3 그대로. 숫자는 위 하나씩 — 격자 탐색 없음.)
+리그 입장 조건(기본값, 전부):
+  E1 제1원칙   학습 MDD ≤ 20% · 최악연도 ≥ −10%
+  E2 강점 유지 강세장 연수익 ≥ I3 + 1.0%p
+  E3 약점 감소 장기(1998~ KOSPI) MDD ≤ R1 − 5%p **그리고** 미공개 수익 ≥ R1 + 3%p
+통과한 것은 i3_shadow.CHALLENGERS 에 오늘 날짜로 등록. 떨어진 것은 기록만 하고 같은 숫자로 다시 재지 않는다.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import strategy_lab as L  # noqa: E402
+import lab_dd_control as I  # noqa: E402
+import lab_holdout as H  # noqa: E402
+
+# ── 선언 ─────────────────────────────────────────────────────────────────────
+TIGHT_X = 5.0
+TIGHT_DAYS = 60
+SPECS: dict[str, dict] = {           # 이름 → i3x 옵션
+    "I3": {"reset": "none"},
+    "R1": {"reset": "always"},
+    "R3": {"reset": "once"},
+    "R4": {"reset": "always", "tight_x": TIGHT_X, "tight_days": TIGHT_DAYS},
+    "R5": {"reset": "once", "tight_x": TIGHT_X, "tight_days": TIGHT_DAYS},
+}
+NEW = ("R3", "R4", "R5")
+E2_BULL_GAIN_PP = 1.0
+E3_LONG_MDD_CUT_PP = 5.0
+E3_HO_GAIN_PP = 3.0
+EQUITY = 3_640_000.0
+END = L.HOLDOUT[1]
+BASE, CASH = "069500", "153130"
+
+
+def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookback: int,
+        reset: str = "none", tight_x: float | None = None, tight_days: int = 0,
+        x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
+        floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
+    """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
+    tight_x: 재진입 후 tight_days 동안 엔진 이탈선(%). 엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
+    days = sorted(bars)
+    pos = {d: k for k, d in enumerate(days)}
+    closes = [bars[d]["close"] for d in days]
+    kdays = sorted(kospi)
+    kpos = {d: k for k, d in enumerate(kdays)}
+    kcl = [kospi[d]["close"] for d in kdays]
+    out_w = {cash: 1.0} if cash else {}
+    eng = {"in": True, "peak": None, "started": False, "entry_i": None}
+    st: dict = {"in": True, "navs": [], "w": None, "ref": None, "last_reset": None}
+
+    def regime_up(d: str) -> bool:
+        k = kpos.get(d)
+        if k is None or k + 1 < regime_ma:
+            return False
+        return kcl[k] > sum(kcl[k + 1 - regime_ma:k + 1]) / regime_ma
+
+    def engine(i: int, d: str):
+        k = pos.get(d)
+        if k is None:
+            return None
+        c = closes[k]
+        if not eng["started"]:
+            eng["started"], eng["peak"] = True, c
+            return {asset: 1.0}
+        if eng["in"]:
+            eng["peak"] = max(eng["peak"], c)
+            x = x_pct
+            if tight_x is not None and eng["entry_i"] is not None and i - eng["entry_i"] < tight_days:
+                x = tight_x
+            if c <= eng["peak"] * (1 - x / 100.0):
+                eng["in"] = False
+                return out_w
+            return None
+        if k >= n and c > max(closes[k - n:k]) and regime_up(d):
+            eng["in"], eng["peak"], eng["entry_i"] = True, c, i
+            return {asset: 1.0}
+        return None
+
+    def target(i: int, d: str, nav: float):
+        sig = engine(i, d)
+        st["navs"].append(nav)
+        if sig is not None:
+            now_in = asset in sig
+            if now_in and not st["in"] and reset != "none":
+                here = len(st["navs"]) - 1
+                if reset == "always" or st["last_reset"] is None or here - st["last_reset"] >= lookback:
+                    st["ref"] = st["last_reset"] = here
+                else:
+                    st["ref"] = None                     # 1년 1회 — 이번엔 용서하지 않는다(I3 예산)
+            st["in"] = now_in
+        peak = max(st["navs"][-lookback:])
+        floor = (1 - floor_dd / 100.0) * peak
+        if st["ref"] is not None:
+            floor = (1 - floor_dd / 100.0) * max(st["navs"][st["ref"]:][-lookback:])
+        e = min(1.0, max(0.0, m * (nav - floor) / nav)) if nav > 0 else 0.0
+        w = e if st["in"] else 0.0
+        if (st["w"] is not None and sig is None and abs(w - st["w"]) < band
+                and not (w == 0.0 and st["w"] > 0)):
+            return None
+        st["w"] = w
+        out = {asset: w} if w > 0 else {}
+        if cash and w < 1.0:
+            out[cash] = 1.0 - w
+        return out
+    return target
+
+
+def measure(spec: dict, kodex, cash, ks, dates, long_dates) -> dict:
+    m, lb = H.I3_DEFAULT
+    res = L.simulate({BASE: L.Asset(BASE, kodex), CASH: L.Asset(CASH, cash)}, dates,
+                     i3x(kodex, ks, BASE, CASH, m, lb, **spec), EQUITY, pass_nav=True)
+    lr = L.simulate({"IDX": L.Asset("IDX", ks)}, long_dates, i3x(ks, ks, "IDX", None, m, lb, **spec),
+                    0.0, pass_nav=True)
+    return {"전체": L.slice_metrics(res, *L.FULL), "박스권": L.slice_metrics(res, *L.PERIODS["박스권"]),
+            "강세장": L.slice_metrics(res, *L.PERIODS["강세장"]), "미공개": L.slice_metrics(res, *L.HOLDOUT),
+            "장기": L.metrics(lr.dates, lr.curve), "trades": res.trades}
+
+
+def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    kodex = L.load_bars(BASE, "2014-01-01", END)
+    cash = L.load_bars(CASH, "2014-01-01", END)
+    ks = L.load_bars("^KS11", "1996-01-01", END)
+    dates = [d for d in L.calendar(kodex, L.FULL[0], END) if d in cash]
+    long_dates = L.calendar(ks, *I.LONG_STRESS)
+    M = {name: measure(spec, kodex, cash, ks, dates, long_dates) for name, spec in SPECS.items()}
+    print("=" * 108)
+    print(f"도전자 2세대 — 기본값 {H.I3_DEFAULT}, 예탁 {EQUITY:,.0f}원 (부모 R1: 강점 강세장 · 약점 연속 실패)")
+    print(f"  {'':5}{'연수익':>8}{'MDD':>7}{'최악':>7}{'박스권':>8}{'강세장':>8}{'미공개':>8}{'장기MDD':>9}{'장기최악':>9}{'매매':>6}")
+    for name, r in M.items():
+        print(f"  {name:5}{r['전체']['cagr']:>7.2f}%{r['전체']['mdd']:>6.1f}%{r['전체']['worst_year']:>+6.1f}%"
+              f"{r['박스권']['cagr']:>7.1f}%{r['강세장']['cagr']:>7.1f}%{r['미공개']['total']:>+7.1f}%"
+              f"{r['장기']['mdd']:>8.1f}%{r['장기']['worst_year']:>+8.1f}%{r['trades']:>6}")
+    print("=" * 108)
+    admitted = []
+    for name in NEW:
+        r = M[name]
+        checks = [
+            ("E1 제1원칙", r["전체"]["mdd"] <= L.MAX_MDD_PCT and r["전체"]["worst_year"] >= L.MIN_YEAR_RET_PCT),
+            ("E2 강점(강세장 +1%p)", r["강세장"]["cagr"] >= M["I3"]["강세장"]["cagr"] + E2_BULL_GAIN_PP),
+            ("E3 약점(장기 MDD −5%p·미공개 +3%p vs R1)",
+             r["장기"]["mdd"] <= M["R1"]["장기"]["mdd"] - E3_LONG_MDD_CUT_PP
+             and r["미공개"]["total"] >= M["R1"]["미공개"]["total"] + E3_HO_GAIN_PP),
+        ]
+        ok = all(x for _, x in checks)
+        if ok:
+            admitted.append(name)
+        print(f"  {name}: " + " · ".join(f"{n}{'O' if x else 'X'}" for n, x in checks) + f" → {'리그 입장' if ok else '탈락'}")
+    print(f"\n리그 입장: {', '.join(admitted) if admitted else '없음'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

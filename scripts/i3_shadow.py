@@ -52,6 +52,22 @@ PROMO_MIN_DIVERGE_DAYS = 20      # 챔피언과 다르게 행동한 날이 이�
 PROMO_MARGIN_PP = 2.0            # 등록 이후 누적 수익 ≥ 챔피언 + 2%p
 PROMO_MAX_MDD = 20.0             # 운용자 ① 그대로
 PROMO_MDD_TOL_PP = 3.0           # 그리고 MDD ≤ 챔피언 MDD + 3%p
+PROMO_CONSECUTIVE = 2            # 월간 점검에서 연속 충족 횟수(멤버가 많을수록 '운 좋은 1등'이 나온다)
+
+# ── 리그 운영 규칙 (2026-10-22 운용자 확정 — 첫 실전 기록 전. 바꾸는 건 매년 1월 점검 때만) ──────────
+RELEGATE_MDD = 25.0              # 등록 후 MDD 초과 → 즉시 탈락(위험)
+RELEGATE_MIN_DAYS = 60           # 부진·중복 탈락은 등록 후 이만큼 지난 뒤(약 3개월)
+RELEGATE_LAG_PP = 10.0           # 월간 점검: 등록 후 누적이 챔피언보다 이만큼 낮으면 탈락(부진)
+DUP_CORR = 0.98                  # 월간 점검: 최근 DUP_WINDOW 일 일간 수익 상관 ≥ 이면 '중복 의심' **알림만**
+DUP_WINDOW = 60                  # (10-22 구현 중 수정 — 첫 기록 전): 자동 탈락으로 하면 R1·R6(재진입 때만 다름)과
+#                                  같은 시기에 둘 다 100% 보유인 계열(Faber·골든크로스)이 차이가 드러나기 전에 잘린다.
+DOWN_RUNS = 5                    # 연속 실패(데이터 중단·상장폐지 등) 이만큼이면 탈락(운용 불가)
+CAPACITY = 20                    # 정원(활성 멤버, 챔피언 포함)
+MAX_NEW_PER_MONTH = 3            # 월 신규 등록 상한(창립 멤버 2026-10-22 제외)
+FOUNDING_DATE = "2026-10-22"
+CHAMPION_ALERT_MDD = 20.0        # 챔피언 실계좌 낙폭이 넘으면 긴급 점검(자동 교체 없음)
+CHAMPION_ALERT_YEAR = -10.0      # 챔피언 실계좌 올해 수익이 이 아래면 긴급 점검
+STATUS_FILE = DATA_DIR / "league_status.json"
 
 
 # ── 공통: 실전 시작일부터의 그림자 실행 ──────────────────────────────────────────
@@ -373,6 +389,147 @@ def promotion(champ: dict, chal: dict, since: str) -> dict:
             "mdd": round(xm["mdd"], 3), "champ_mdd": round(cm["mdd"], 3), "checks": checks, "ok": all(checks.values())}
 
 
+# ── 리그 운영: 탈락·승격 연속·중복·챔피언 점검 (순수 함수 — 테스트로 일부러 깨뜨린다) ─────────────
+def _since(curve: list, since: str) -> list:
+    return [(d, v) for d, v in curve if d >= since]
+
+
+def relegation(champ: dict, chal: dict, since: str, review: bool) -> str | None:
+    """탈락 사유 하나(없으면 None). 위험은 매일, 부진은 월간 점검 + 최소 체류 뒤."""
+    xc = _since(chal["curve"], since)
+    if len(xc) < 2:
+        return None
+    xm = L.metrics([d for d, _ in xc], [v for _, v in xc])
+    if xm["mdd"] > RELEGATE_MDD:
+        return f"위험: 등록 후 MDD {xm['mdd']:.1f}% > {RELEGATE_MDD:g}%"
+    if not review or len(xc) < RELEGATE_MIN_DAYS:
+        return None
+    cc = _since(champ["curve"], since)
+    if len(cc) < 2:
+        return None
+    cm = L.metrics([d for d, _ in cc], [v for _, v in cc])
+    if xm["total"] < cm["total"] - RELEGATE_LAG_PP:
+        return f"부진: 등록 후 {xm['total']:+.1f}% < 챔피언 {cm['total']:+.1f}% − {RELEGATE_LAG_PP:g}%p"
+    return None
+
+
+def _daily_rets(curve: list) -> dict[str, float]:
+    return {b[0]: b[1] / a[1] - 1 for a, b in zip(curve, curve[1:]) if a[1] > 0}
+
+
+def duplicates(results: dict, regs: dict[str, str]) -> list[tuple[str, str, float]]:
+    """[(탈락할 이름, 남길 이름, 상관)] — 둘 다 최소 체류를 채웠고 최근 DUP_WINDOW 일 일간 수익 상관 ≥ DUP_CORR.
+    먼저 들어온 쪽(같으면 이름순 앞)을 남긴다. 챔피언은 탈락시키지 않는다."""
+    import statistics as stt
+    names = [n for n, r in results.items() if "curve" in r]
+    rets = {n: _daily_rets(results[n]["curve"]) for n in names}
+    out, gone = [], set()
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if a in gone or b in gone:
+                continue
+            common = sorted(set(rets[a]) & set(rets[b]))[-DUP_WINDOW:]
+            if len(common) < DUP_WINDOW:
+                continue
+            xa, xb = [rets[a][d] for d in common], [rets[b][d] for d in common]
+            if stt.pstdev(xa) == 0 or stt.pstdev(xb) == 0:
+                continue
+            c = stt.correlation(xa, xb)
+            if c >= DUP_CORR:
+                keep, drop = sorted((a, b), key=lambda n: (n != CHAMPION, regs.get(n, ""), n))
+                out.append((drop, keep, round(c, 4)))
+                gone.add(drop)
+    return out
+
+
+def champion_alert(navs: list[list]) -> str | None:
+    """실계좌(챔피언) 제1원칙 점검 — 최고 대비 낙폭 · 올해 수익. 자동 교체는 하지 않는다."""
+    if len(navs) < 2:
+        return None
+    peak, mdd = navs[0][1], 0.0
+    for _, v in navs:
+        peak = max(peak, v)
+        mdd = max(mdd, (peak - v) / peak * 100)
+    year = navs[-1][0][:4]
+    first = next((v for d, v in navs if d[:4] == year), navs[0][1])
+    ytd = (navs[-1][1] / first - 1) * 100
+    if mdd > CHAMPION_ALERT_MDD:
+        return f"실계좌 최고 대비 낙폭 {mdd:.1f}% > {CHAMPION_ALERT_MDD:g}%"
+    if ytd < CHAMPION_ALERT_YEAR:
+        return f"실계좌 올해 수익 {ytd:+.1f}% < {CHAMPION_ALERT_YEAR:+g}%"
+    return None
+
+
+def is_review_day(status: dict, upto: str) -> bool:
+    """그 달 첫 리그 실행(= 첫 영업일 판단 뒤)이 월간 점검. 같은 달 두 번 하지 않는다."""
+    return status.get("last_review", "")[:7] != upto[:7]
+
+
+def govern(status: dict, res: dict, members, upto: str, live_navs: list[list]) -> tuple[dict, list[tuple[str, bool]]]:
+    """운영 규칙을 오늘 결과에 적용 → (새 status, [(알림 문구, critical)]). status 는 append-only 성격으로 쌓는다."""
+    st = json.loads(json.dumps(status or {}))
+    st.setdefault("retired", {})
+    st.setdefault("errors", {})
+    st.setdefault("promo_streak", {})
+    st.setdefault("reviews", {})
+    msgs: list[tuple[str, bool]] = []
+    regs = {m.name: m.registered for m in members}
+    active = [m for m in members if m.name not in st["retired"]]
+    champ = res.get(CHAMPION, {})
+
+    def retire(name, reason):
+        st["retired"][name] = {"date": upto, "reason": reason}
+        msgs.append((f"🚪 [I3 리그] {name} 탈락 — {reason} (기록은 보관, 같은 설정 재입장 없음)", False))
+
+    for m in active:                                   # 운용 불가
+        if m.name == CHAMPION:
+            continue
+        if "error" in res.get(m.name, {}):
+            st["errors"][m.name] = st["errors"].get(m.name, 0) + 1
+            if st["errors"][m.name] >= DOWN_RUNS:
+                retire(m.name, f"운용 불가: {DOWN_RUNS}회 연속 실패 ({res[m.name]['error'][:60]})")
+        else:
+            st["errors"][m.name] = 0
+    review = is_review_day(st, upto)
+    if "curve" in champ:
+        for m in active:
+            if m.name == CHAMPION or m.name in st["retired"] or "curve" not in res.get(m.name, {}):
+                continue
+            why = relegation(champ, res[m.name], m.registered, review)
+            if why:
+                retire(m.name, why)
+    if review:
+        alive = {m.name: res[m.name] for m in active if m.name not in st["retired"] and "curve" in res.get(m.name, {})}
+        long_enough = {n: r for n, r in alive.items()
+                       if len(_since(r["curve"], regs[n])) >= RELEGATE_MIN_DAYS or n == CHAMPION}
+        dups = duplicates(long_enough, regs)
+        for drop, keep, c in dups:
+            msgs.append((f"🔁 [I3 리그] 중복 의심 — {drop} ↔ {keep} 최근 {DUP_WINDOW}일 일간 수익 상관 {c:.3f} "
+                         f"(자동 탈락 안 함: 같은 국면에선 다른 설계도 같게 움직인다 — 운용자 판단)", False))
+        cands = []
+        if "curve" in champ:
+            for m in active:
+                if m.name == CHAMPION or m.name in st["retired"] or "curve" not in res.get(m.name, {}):
+                    continue
+                ok = promotion(champ, res[m.name], max(m.registered, champ["curve"][0][0]))["ok"]
+                st["promo_streak"][m.name] = st["promo_streak"].get(m.name, 0) + 1 if ok else 0
+                if st["promo_streak"][m.name] >= PROMO_CONSECUTIVE:
+                    cands.append(m.name)
+        for n in cands:
+            msgs.append((f"🏆 [I3 리그] {n} 승격 후보 — 월간 점검 {PROMO_CONSECUTIVE}회 연속 승격 조건 충족. "
+                         f"운용자 승인 전엔 챔피언을 바꾸지 않는다(실행 가능성·실전==검증 대조 먼저).", True))
+        n_active = sum(1 for m in members if m.name not in st["retired"])
+        st["reviews"][upto[:7]] = {"date": upto, "active": n_active, "retired_total": len(st["retired"]),
+                                   "candidates": cands, "duplicate_suspects": [[a, b, c] for a, b, c in dups]}
+        st["last_review"] = upto
+        if n_active > CAPACITY:
+            msgs.append((f"⚠️ [I3 리그] 활성 멤버 {n_active} > 정원 {CAPACITY} — 신규 등록 중지", False))
+    why = champion_alert(live_navs)
+    if why:
+        msgs.append((f"⛔ [I3] 챔피언 긴급 점검 — {why}. 자동 교체 없음, 운용자 판단 필요", True))
+    return st, msgs
+
+
 def _slug(name: str) -> str:
     return name.lower()
 
@@ -474,13 +631,17 @@ async def main_async(now: datetime) -> int:
     # 장중엔 오늘 일봉이 미완성 — 15:35 전이면 어제까지만 본다
     upto = (today if now.time() >= AFTER_CLOSE and today in base and today in kospi
             else max(d for d in base if d < today))
-    res = run_league(data, start, equity, upto)
+    status = json.loads(STATUS_FILE.read_text(encoding="utf-8")) if STATUS_FILE.exists() else {}
+    retired = set((status.get("retired") or {}).keys())
+    res = run_league(data, start, equity, upto, tuple(m for m in MEMBERS if m.name not in retired))
     champ = res[CHAMPION]
     live_nav = float(navs[-1][1])
-    prev = json.loads(SHADOW_FILE.read_text(encoding="utf-8")) if SHADOW_FILE.exists() else {}
     promo = {}
     models = {}
     for mb in MEMBERS:
+        if mb.name in retired:
+            models[mb.name] = {"retired": status["retired"][mb.name], "family": mb.family}
+            continue
         r = res[mb.name]
         if "error" in r:
             models[mb.name] = {"error": r["error"], "family": mb.family}
@@ -506,14 +667,29 @@ async def main_async(now: datetime) -> int:
         if "nav" in v:
             row[f"{_slug(n)}_nav"], row[f"{_slug(n)}_w"] = v["nav"], "" if v["w"] is None else v["w"]
     append_history(row)
+    new_status, msgs = govern(status, res, MEMBERS, upto, navs)
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(new_status, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATUS_FILE)
     print(json.dumps(rec, ensure_ascii=False, indent=2))
-    await LV._notify(summary_line(rec))
-    for n, p in promo.items():
-        if p.get("ok") and not (prev.get("promotion", {}).get(n, {}) or {}).get("ok"):
-            await LV._notify(
-                f"🏆 [I3 리그] 도전자 {n} 승격 조건 충족 — {p['days']}영업일 · 누적 {p['ret']:+.2f}% "
-                f"(I3 {p['champ_ret']:+.2f}%) · MDD {p['mdd']:.1f}%. 운용자 승인 전엔 바꾸지 않는다.", critical=True)
+    await LV._notify(weekly_table(rec) if now.weekday() == 4 else summary_line(rec))
+    for text, critical in msgs:
+        await LV._notify(text, critical=critical)
     return 0
+
+
+def weekly_table(rec: dict) -> str:
+    """매주 금요일 — 상세 순위표(등록 후 수익·MDD·위험 비중)."""
+    rows = [(n, v) for n, v in rec["models"].items() if "ret" in v]
+    rows.sort(key=lambda x: -x[1]["ret"])
+    lines = [f"📊 [I3 리그 주간] {rec['asof']} · 실계좌 {rec['live']['ret']:+.2f}% (시작 {rec['start']})"]
+    for i, (n, v) in enumerate(rows, 1):
+        w = "-" if v.get("w") is None else f"{v['w']:.0%}"
+        lines.append(f"{i:>2}. {'👑' if n == CHAMPION else ''}{n} {v['ret']:+.2f}% · MDD {v['mdd']:.1f}% · 비중 {w}")
+    gone = [n for n, v in rec["models"].items() if "retired" in v]
+    if gone:
+        lines.append("탈락: " + ", ".join(gone))
+    return "\n".join(lines)
 
 
 def main() -> int:

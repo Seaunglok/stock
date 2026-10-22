@@ -95,6 +95,76 @@ def test_promotion_rule_as_declared():
     assert not S.promotion(champ, crash, "2026-01-01")["ok"]                          # MDD 초과
 
 
+def _curve_from(start_idx, vals):
+    return [(f"2027-{1 + (start_idx + i) // 28:02d}-{1 + (start_idx + i) % 28:02d}", v) for i, v in enumerate(vals)]
+
+
+def _res(vals, w=None):
+    c = _curve_from(0, vals)
+    return {"curve": c, "w_hist": {d: (w if w is not None else 1.0) for d, _ in c}}
+
+
+def _m(name, reg="2027-01-01"):
+    return S.Member(name, "시험", reg, "시험", "", (), lambda *a: {})
+
+
+def test_relegation_rules_as_declared():
+    """★ 일부러 깨뜨리기 — 위험(MDD>25%)은 언제든, 부진(−10%p)은 월간 점검 + 60일 뒤에만."""
+    champ = _res([100 + i * 0.01 for i in range(80)])
+    crash = _res([100.0] * 10 + [70.0] * 70)                      # MDD 30%
+    assert "위험" in S.relegation(champ, crash, "2027-01-01", review=False)
+    lag = _res([100 - i * 0.2 for i in range(80)])                # 약 −16%, MDD 16% (위험 아님)
+    assert S.relegation(champ, lag, "2027-01-01", review=False) is None           # 월간 점검 아님
+    assert "부진" in S.relegation(champ, lag, "2027-01-01", review=True)
+    short = _res([100 - i * 0.2 for i in range(40)])
+    assert S.relegation(champ, short, "2027-01-01", review=True) is None          # 60일 전
+    ok = _res([100 + i * 0.02 for i in range(80)])
+    assert S.relegation(champ, ok, "2027-01-01", review=True) is None
+
+
+def test_duplicates_are_only_suspected_never_retired():
+    """중복은 알림만 — 재진입 때만 다른 R1·R6 가 차이가 드러나기 전에 잘리면 안 된다."""
+    same = [100 + (i % 3) for i in range(80)]
+    res = {"I3": _res(same), "R6": _res(same), "B": _res([100 + (i % 5) * 0.7 for i in range(80)])}
+    members = (_m("I3"), _m("R6"), _m("B"))
+    st, msgs = S.govern({}, res, members, "2027-03-25", [])
+    assert "R6" not in st["retired"] and any("중복 의심" in t and "R6" in t for t, _ in msgs)
+    assert st["reviews"]["2027-03"]["duplicate_suspects"][0][:2] == ["R6", "I3"]
+
+
+def test_promotion_needs_two_consecutive_monthly_reviews():
+    n = S.PROMO_MIN_DAYS + 5
+    champ = {"curve": _curve_from(0, [100 + i * 0.01 for i in range(n)]), "w_hist": {}}
+    champ["w_hist"] = {d: 0.5 for d, _ in champ["curve"]}
+    good = {"curve": _curve_from(0, [100 + i * 0.05 for i in range(n)]), "w_hist": {d: 1.0 for d, _ in champ["curve"]}}
+    members = (_m("I3"), _m("X"))
+    st, msgs = S.govern({}, {"I3": champ, "X": good}, members, "2027-06-01", [])
+    assert st["promo_streak"]["X"] == 1 and not any("승격 후보" in t for t, _ in msgs)
+    st, msgs = S.govern(st, {"I3": champ, "X": good}, members, "2027-06-15", [])          # 같은 달 — 점검 아님
+    assert st["promo_streak"]["X"] == 1
+    st, msgs = S.govern(st, {"I3": champ, "X": good}, members, "2027-07-01", [])
+    assert any("승격 후보" in t and c for t, c in msgs)                                   # critical
+
+
+def test_down_runs_retire_and_champion_alert():
+    members = (_m("I3"), _m("X"))
+    st = {}
+    for i in range(S.DOWN_RUNS):
+        st, msgs = S.govern(st, {"I3": _res([100, 101]), "X": {"error": "데이터 없음"}}, members,
+                            f"2027-01-{10 + i:02d}", [])
+    assert "운용 불가" in st["retired"]["X"]["reason"]
+    navs = [["2027-01-02", 100.0], ["2027-02-02", 120.0], ["2027-03-02", 95.0]]           # 낙폭 20.8%
+    _, msgs = S.govern({}, {"I3": _res([100, 101])}, (members[0],), "2027-03-02", navs)
+    assert any("챔피언 긴급 점검" in t and c for t, c in msgs)
+
+
+def test_registry_respects_capacity_and_monthly_intake():
+    from collections import Counter
+    assert len(S.MEMBERS) <= S.CAPACITY
+    by_month = Counter(m.registered[:7] for m in S.MEMBERS if m.registered != S.FOUNDING_DATE)
+    assert all(n <= S.MAX_NEW_PER_MONTH for n in by_month.values()), by_month
+
+
 def test_history_is_one_row_per_day(tmp_path):
     p = tmp_path / "h.csv"
     S.append_history({"date": "2026-10-22", "i3_nav": 1}, p)

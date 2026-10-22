@@ -48,6 +48,10 @@ DAEMON_OUT = LOG_DIR / "daemon_stdout.log"
 # 기본값은 trend_config.UNIVERSE_MODE 와 반드시 일치시킬 것 — watchdog 은 .env 를 읽지 않고
 # 재기동 데몬에 env 를 주입하므로, 두 기본값이 갈리면 수동 기동과 자동 기동이 다른 유니버스로 돈다.
 UNIVERSE = os.environ.get("TREND_UNIVERSE", "largecap")
+# 추세추종 데몬 관리 여부 — 2026-10-22 추세추종 종료(운용자: "매도감시 하지 말고 진행").
+# off 면 MCP 서버 생존만 보장하고 데몬은 재기동하지 않는다(I3 가 MCP 를 쓴다).
+# watchdog 은 .env 를 읽지 않으므로 trend_watchdog.cmd 에서 주입한다.
+MANAGE_DAEMON = os.environ.get("TREND_WATCHDOG_DAEMON", "on").strip().lower() != "off"
 # 데몬이 실제로 쓰는 필수 MCP 포트(주문/시세/정보/투자자/포트폴리오)
 ESSENTIAL_PORTS = [8030, 8031, 8032, 8033, 8034]
 # MCP 기동 후 포트 바인딩 대기 — 고정 sleep 이 아니라 **뜰 때까지 폴링**한다.
@@ -216,6 +220,8 @@ def main() -> None:
                 f" (Windows Update 자동 재시작 등). 놓친 phase 는 데몬이 복구한다.")
         start_servers()          # 폴링 후 결과를 자체 로깅한다
 
+    if not MANAGE_DAEMON:
+        return                   # 추세추종 종료 — MCP 만 지킨다
     if not daemon_alive():
         start_daemon()
     elif heartbeat_stale():

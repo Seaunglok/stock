@@ -16,8 +16,8 @@ Windows 작업 스케줄러가 단발로 부른다(상주 데몬 아님 — hang
 - 주문 응답 불명은 **재전송하지 않는다** — 매매 후 잔고 대조로 확인하고 알린다.
   success:true 라도 return_code≠0 이면 거부로 본다(8005 유령 사고와 같은 규칙).
 - **매수는 지정가**(2026-10-22, 실주문 전환 직전 발견): 키움은 시장가 매수를 상한가 매수로 보고 증거금을
-  상한가(+30%)로 잡는다 — 자산의 99% 를 시장가로 사면 '주문가능금액 부족' 거부. 그래서 매수는 09:00 체결 뒤
-  **현재가 +1% 지정가**(5원 올림, 즉시 체결)로, 수량은 **실제 주문가능금액** 안으로 줄인다. 현재가·주문가능금액을
+  상한가(+30%)로 잡는다 — 자산의 99% 를 시장가로 사면 '주문가능금액 부족' 거부. 그래서 매수는 **09:05:30 이후**
+  (LP 호가 의무 시간) **현재가 +1% 지정가**(5원 올림, 즉시 체결)로, 수량은 **실제 주문가능금액** 안으로 줄인다. 현재가·주문가능금액을
   못 읽으면 사지 않고 알린다(추측 주문 금지). 매도는 시장가(증거금 무관, 08:50 동시호가).
 - 하루 한 번: 같은 날 판단·매매는 다시 돌려도 중복되지 않는다(상태 파일 기록).
 
@@ -52,6 +52,10 @@ TRADE_WINDOW = (dtime(8, 30), dtime(9, 20))
 MAX_PLAN_AGE_DAYS = 4
 CONSISTENCY_TOL = 0.005
 BUY_LIMIT_PCT = 0.01      # 매수 지정가 = 현재가 × 1.01 — 즉시 체결되면서 상한가 증거금을 피한다
+# 매수 시각 — ETF 유동성공급자(LP)의 호가 의무가 없는 09:00~09:05 를 피한다(호가 공백 시 +1% 상한까지 밀릴 수
+# 있다). 시가 체결 자체는 유지: lab_exec_timing(사전선언 c9534b4)에서 '다음 날 종가'(10시 이후의 끝점) −1.2%p,
+# '당일 종가' −2.8%p 로 둘 다 비열위 미달 — 매도는 08:50 동시호가(=검증의 시가) 그대로.
+BUY_AFTER = dtime(9, 5, 30)
 PRICE_STEP = 5            # 지정가 올림 단위 — ETF 호가 1원(머니마켓)·5원(KODEX200) 어느 쪽에도 유효
 FEE_BUF = 0.001           # 주문가능금액 대비 수수료·반올림 여유
 
@@ -422,21 +426,20 @@ async def _run_phase(phase: str) -> int:
         close = (st.get("last_decision") or {}).get("close") or {}
         prices = {c: float(close.get(c) or 0) for c in (K.BASE, K.CASH)}
 
-        async def wait_open():
-            target = datetime.combine(now.date(), dtime(9, 0, 30))
-            secs = (target - datetime.now()).total_seconds()
+        async def wait_until(t: dtime):
+            secs = (datetime.combine(now.date(), t) - datetime.now()).total_seconds()
             if secs > 0:
                 await asyncio.sleep(secs)
-        async def wait_settle():
-            await wait_open()
-            await asyncio.sleep(5)
+
+        async def wait_buy():
+            await wait_until(BUY_AFTER)        # 매도 대금 확보 + LP 호가 의무 시간에 현재가로 지정가
 
         async def settle():
-            await wait_open()                  # 동시호가 매도는 09:00 에 체결 — 그 전엔 대조하지 않는다
+            await wait_until(dtime(9, 0, 30))  # 동시호가 매도는 09:00 에 체결 — 그 전엔 대조하지 않는다
             await asyncio.sleep(15)
 
         res = await phase_trade(KiwoomBroker(), _notify, now, prices, dry_run=dry, halt=halt,
-                                wait_after_open=wait_settle, before_check=settle)
+                                wait_after_open=wait_buy, before_check=settle)
     log.info("[%s] %s", phase, json.dumps(res, ensure_ascii=False, default=str)[:500])
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
     return 0

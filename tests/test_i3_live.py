@@ -301,6 +301,12 @@ def test_real_trade_sells_first_then_waits_then_buys(paths):
     assert b.limits[0] is None and b.limits[-1] == LV.limit_price(90_000) == 90_900
 
 
+def test_buys_wait_for_lp_quoting_hours():
+    """09:00~09:05 는 ETF LP 호가 의무가 없다 — 매수는 그 뒤, 매매 시간대(시작 검사) 안."""
+    from datetime import time as dtime
+    assert dtime(9, 5) <= LV.BUY_AFTER < LV.TRADE_WINDOW[1]
+
+
 def test_limit_price_and_affordable():
     assert LV.limit_price(105_902) == 106_965                        # 106,961.02 → 5원 올림
     assert LV.limit_price(88_210) % 5 == 0 and LV.limit_price(88_210) >= 88_210 * 1.01

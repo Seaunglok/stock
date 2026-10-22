@@ -316,12 +316,21 @@ def _setup_logging() -> None:
 
 
 async def _main(phase: str) -> int:
-    dry = _env_bool("I3_DRY_RUN", True)
-    halt = _env_bool("I3_HALT", False)
-    now = datetime.now()
     if phase == "status":
         print(json.dumps(load_state(), ensure_ascii=False, indent=2))
         return 0
+    try:
+        return await _run_phase(phase)
+    except Exception as e:                      # 조용히 끝나면 '판단 없음'을 아무도 모른다
+        log.exception("[%s] 예외", phase)
+        await _notify(f"⛔ [I3] {phase} 단계 예외 — {type(e).__name__}: {str(e)[:150]}", critical=True)
+        return 1
+
+
+async def _run_phase(phase: str) -> int:
+    dry = _env_bool("I3_DRY_RUN", True)
+    halt = _env_bool("I3_HALT", False)
+    now = datetime.now()
     if phase == "decide":
         res = await phase_decide(KiwoomMarket(), KiwoomBroker(), _notify, now, dry_run=dry)
     else:

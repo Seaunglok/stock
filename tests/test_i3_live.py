@@ -314,6 +314,18 @@ def test_trade_aborts_when_holdings_unknown(paths):
     assert "abort" in r
 
 
+def test_phase_exception_alerts_critically(monkeypatch):
+    """★ 단계 중 예외는 조용히 끝나지 않는다 — critical 알림 + 종료코드 1."""
+    notes = Notes()
+    monkeypatch.setattr(LV, "_notify", notes)
+
+    async def boom(phase):
+        raise RuntimeError("FDR 조회 실패")
+    monkeypatch.setattr(LV, "_run_phase", boom)
+    assert run(LV._main("decide")) == 1
+    assert notes.msgs and notes.msgs[0][0] is True and "FDR" in notes.msgs[0][1]
+
+
 def test_dry_run_is_default():
     """★ 환경변수가 없으면 모의 — 실주문은 운용자가 명시적으로 켠다."""
     import os

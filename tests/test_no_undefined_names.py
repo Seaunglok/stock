@@ -26,6 +26,7 @@ TARGETS = [
     "scripts/i3_fills.py",
     "scripts/i3_shadow.py",
     "scripts/collect_i3_minutes.py",
+    "scripts/i3_notion_sync.py",
     "scripts/strategy_lab.py",
     "scripts/trend_runtime.py",
     "scripts/trend_kiwoom_io.py",

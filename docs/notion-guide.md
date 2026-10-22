@@ -1,0 +1,151 @@
+# Notion 정리 가이드 — 이 프로젝트에서 Notion 에 쓸 때 먼저 읽는다
+
+운용자(2026-10-22): "notion 정리 시에 notion 정리 스킬이나 정리하는 방법을 참고해서 정리해 줘. md 파일로 저장해서
+notion 작성 시 참고할 수 있도록." · "매일 추가해야 하는데 I3 페이지에만 추가하면 계속 길어진다. 한눈에 보기 좋게,
+매매일지·history 를 제대로 남기는 방법도."
+
+## 0. 근거
+
+활성화된 Notion 스킬은 없었다(`notion-get-enabled-skills` → 빈 목록). 그래서 Notion MCP 공식 문서와 검색한 정리법을 따른다.
+
+| 근거 | 읽는 법 / 출처 | 언제 |
+|---|---|---|
+| 페이지·DB 선택 기준 | `ReadMcpResourceTool(server="claude.ai Notion", uri="notion://docs/when-to-create-a-notion-page-or-database")` | 새 페이지·DB 를 만들기 전 |
+| Notion 마크다운 규격 | `ReadMcpResourceTool(… uri="notion://docs/notion-flavored-markdown-spec")` | 내용을 쓰기 전(표·callout·토글·mention) |
+| 뷰 설정 DSL | `notion://docs/view-dsl-spec` | 뷰(정렬·필터·차트·달력) 만들 때 |
+| 스킬 작성법 | `notion://docs/skills` | 이 가이드를 Notion 스킬로 올릴 때 |
+| 대시보드 = linked view | Notion Academy "Linked views" · "Organized workspace best practices" | 대시보드 설계 |
+| 매매일지 = DB 여러 개 | traderssecondbrain.com "Notion trading journal/dashboard"(제3자 블로그 — 참고만) | 매매·일지 구조 |
+
+> `notion-fetch` 에 `notion://docs/when-to-…` 를 넣으면 "Invalid URL" — 그 문서는 **MCP 리소스**로 읽는다.
+
+---
+
+## 1. 원칙 — 채팅은 생각, 페이지는 기억, DB 는 추적
+
+1. **매일 쌓이는 것은 페이지에 붙이지 않는다 — DB 의 행으로만 남긴다.** 페이지에 날짜별 토글·체크리스트를 쌓으면 계속
+   길어진다(10-22 I3 종합 정리가 그랬다). 같은 필드를 가진 항목이 5개 이상 쌓이고 날짜·상태·정렬이 중요하면 DB.
+2. **대시보드 페이지는 '보기'만 둔다.** 맨 위 요약 callout 2개 + 바로가기 + DB 의 필터된 보기(linked view). 숫자는 DB 가
+   채우므로 **페이지 자체는 매일 고치지 않는다** — 행을 넣으면 보기가 저절로 갱신된다.
+3. **설명·규칙·결론은 하위 페이지로.** 토글이 3개 넘게 쌓이거나 한 주제가 화면 두 장을 넘으면 하위 페이지로 뺀다.
+4. **원천은 저장소다.** `docs/*.md`·코드 상수·`data/` 가 정본이고 Notion 은 읽기 좋은 요약이다. 숫자는 파이썬이 계산한
+   것을 옮긴다 — LLM 이 Notion 에 쓰면서 산수하지 않는다.
+5. **매일 바뀌는 순위·평가손익 같은 '현재값'은 텔레그램**이 맡는다. Notion 에는 그날의 기록(행)만 남긴다.
+
+| 무엇 | 어디에 |
+|---|---|
+| 하루 판단·자산·성과·매매 요약 | **I3 일일 기록DB** (하루 1행, 자동) |
+| 체결 1건 | **주식 매매일지DB** (매매이유 "🛡️ I3 …", 자동) |
+| 월 합계·월 수익률 | **월별 결산DB** ("🛡️ I3 YYYY년 M월", 자동) |
+| 운용 결정·코드 변경·사고·리그 사건 | **I3 운영 이력DB** (사건 1행, 작업할 때 Claude 가 추가) |
+| 사전선언 연구 1회 | **I3 연구 기록DB** |
+| 리그 멤버(입장·탈락·승격) | **I3 리그 멤버DB** (월간 점검 때 상태 갱신) |
+| 할 일 | **Flow Task DB** (Project = I3) — 대시보드에 '열린 할 일' 보기 |
+| 규칙·검증·안전장치·명령 | 하위 페이지 「I3 운영 매뉴얼」 |
+
+## 2. 구조 지도 (ID)
+
+```
+대형주 추세추종 자동매매 (루트 2131459d6f58804eafe5cc39083ad7fc) — 날짜별 구현 기록 자식 페이지들(보존)
+└ 📈 주식 자동 매매 (허브 37d1459d6f5881949a57f1d60d1a5753)
+   ├ 📒 주식 매매일지DB   collection://63d8ae25-9910-4a36-ba3f-3dc942cb9733  (I3 행 = 매매이유 "🛡️ I3 …")
+   ├ 📅 월별 결산DB       collection://2c0f5ffd-e5d7-4587-a765-85ba9ec084dc  (I3 행 = "🛡️ I3 YYYY년 M월 (💰 실거래)")
+   ├ 대형주 추세추종 — 종합 정리 (37d1459d6f58817aa292e68d432201e5) — 2026-10-22 종료, 기록 보존(지우지 않는다)
+   └ 🛡️ I3 방어형 ETF 자동매매 — 대시보드 (4011459d6f5881b6a381ddb8bb623f8c)
+      ├ I3 일일 기록DB   collection://26cdda49-dc57-4939-bf5c-fbba413d50a2  (보기: 최근순 · 누적 수익 곡선 · 달력)
+      ├ I3 운영 이력DB   collection://43b09e78-2b69-43bd-bd44-e6bbd1fc2458
+      ├ (linked) I3 매매 — 매매일지DB 필터 · (linked) I3 열린 할 일 — Flow Task 필터
+      ├ 📘 I3 운영 매뉴얼 (4011459d6f5881fd97c7cdad8a4cb83a)
+      ├ 🏟️ I3 도전자 리그 (4011459d6f588196a2a4d99881a43aa0) — I3 리그 멤버DB collection://f36378bb-f4a6-4864-802b-8d2a05326801
+      └ 🔬 I3 연구 기록 (4011459d6f588170ba48f0f1e7ba74d8) — I3 연구 기록DB collection://b32048a7-1882-4926-b23c-1bce1ca61a11
+Flow (GTD, 87816d4e7ce84ce8a097bddf34a2f976)
+   ├ Project ds 5c0d93be-f314-4c01-9816-fcc890089267 — 제목 "Project "(끝 공백), 상태 "Status "(끝 공백)
+   ├ Task ds    7a976364-fb39-417d-8937-86785c20a917 — 제목 "Task", Status·Priority·Project 관계·Action Date·Quick Note
+   └ Note ds    781e32b5-8fd8-4ae9-b31b-1abb97ad771e — 제목 "Note"
+   I3 Project = 4011459d6f588167b7c0f85db6b37c75 · 추세추종 Project = 37d1459d6f58812db433de14b79789ec(Done)
+```
+
+## 3. 매일 자동 기록 (2026-10-22~) — 매매일지·history 를 남기는 방법
+
+```
+평일 15:50 I3Decide → i3_decide.cmd: 판단 → 리그 → 분봉 → scripts\i3_notion.cmd
+   prep   python scripts/i3_notion_sync.py prep   최근 10일을 Notion 행 모양으로 계산 → data/i3/notion_sync.json
+   agent  headless claude 가 scripts/i3_notion_task.md 대로: 일일 기록·매매일지는 **없는 행만** 추가, 월 결산 1행 갱신
+   check  python scripts/i3_notion_sync.py check  이번 실행 로그에 "결과:" 줄이 없거나 ❌ → 텔레그램 critical
+```
+
+- **멱등·자가 복구**: 매 실행이 최근 10일을 대조하므로 하루 실패해도 다음 날 메워진다(09-28 rate limit 사고의 교훈).
+- **계산은 파이썬**: 일간·누적 수익은 입출금을 뺀 **성과 지수**, 매도 실현손익은 **평균단가**(전체 체결 이력)·수수료 반영.
+  체결가를 못 읽은 체결은 행을 만들지 않고 경고로 보고한다(추정가로 장부를 쓰지 않는다).
+- **실패를 성공으로 보고하지 않는다**: 인증 만료면 에이전트는 `결과: ❌ …` 만 출력. 예약작업 결과 0x0 은 성공이 아니다.
+- 수동 실행: `scripts\i3_notion.cmd` · 로그 `%TEMP%\i3_notion.log` · 원천 `data/i3/{events.jsonl,state.json,fills.jsonl,shadow_history.csv}`.
+- **사람(Claude)이 남기는 history**: 코드 변경·운용 결정·사고는 작업을 커밋할 때 **I3 운영 이력DB 에 1행**(사건·날짜·종류·요약·
+  커밋·문서). 페이지의 '다음 할 일' 체크리스트에 완료 항목을 쌓지 않는다 — 완료는 이력 행, 남은 일은 Flow Task.
+
+## 4. 페이지 쓰는 법
+
+- **대시보드 순서**: 상태 callout → 규칙 한 줄 callout → 바로가기(하위 페이지 열) → 일일 기록 → 운영 이력 → 매매 → 열린 할 일.
+- **하위 페이지 순서**: 요약 callout → 본문(표·토글) → (DB) → 구분선 → "상세 문서" 경로.
+- **숫자에는 출처와 한계를 같이**: "학습 2015-07~2026-08", "미공개 2개월", "생존편향 포함". 백테스트 수치는
+  '검증한 것 / 아직 못 믿는 것'과 짝을 짓는다(운용자는 추세추종 백테스트 사고를 겪었다).
+- **결정은 누가 왜**: "운용자 결정(10-22)", "운용자 예외 — 규칙 밖 결정".
+- **한국어**. 코드 식별자·경로·커밋·명령만 원문(`code`).
+- 아이콘: 🛡️ I3 · 🏟️ 리그 · 🔬 연구 · 📘 매뉴얼 · 📊 상태 · ⚠️ 주의 · ✅ 할 일. callout 색: 상태 `blue_bg`, 원칙 `gray_bg`,
+  주의 `yellow_bg`, 리그·좋은 소식 `green_bg`, 위험 `red_bg`.
+- 다른 Notion 페이지 `<mention url="https://app.notion.com/p/…"/>`, DB `<mention url="…" type="database"/>`,
+  날짜 `<date start="YYYY-MM-DD" />`. 마크다운 링크 `[글](url)` 은 외부 URL 에만.
+- **추세추종 콘텐츠는 지우지 않는다**(운용자 지시). 종료·보존 표시만 붙인다.
+
+## 5. Notion 마크다운·API 함정 (실제로 걸린 것)
+
+| 함정 | 규칙 |
+|---|---|
+| `~` | 취소선으로 해석 → `2015\~2026` 처럼 `\~` |
+| 본문 `<` | 태그로 오인 → `\<` (fetch 결과에도 `\<` 로 보인다) |
+| **파일명 자동 링크** | `.md`·`.py` 는 국가 도메인이라 `lab_factors.py` 가 `http://factors.py` 링크가 된다 → DB 텍스트 속성·본문 모두 **백틱(`code`)** 으로 감싼다(10-22 연구 기록DB 17행 수정) |
+| 표 | 파이프 표 또는 `<table>` 중 하나만. 셀 서식이 필요하면 `<table>`. 셀은 인라인만(줄바꿈 `<br />`) |
+| 허용 태그 | `callout`·`toggle`·`table/tr/td`·`columns/column`·`page`·`database`·`mention`·`date`·`span color`·`b i s u`·`p`. **`<details>`·`<div>` 등은 글자 그대로 저장** |
+| 자식 페이지·DB | `replace_content` 에서 `<page>`·`<database>` 태그를 빼면 지워진다 — 그대로 둔다(옮기는 건 된다: 다른 위치에 같은 태그) |
+| DDL 형식 | `create-database` 의 텍스트 열은 `TEXT` 가 아니라 **`RICH_TEXT`** (`TEXT` 는 오류) |
+| linked view 위치 | `create-view(parent_page_id=…)` 는 **페이지 맨 끝**에 붙는다 → 제목을 먼저 끝에 넣고(`insert_content` end) 그다음 보기를 만든다 |
+| replace 후 순서 | `replace_content` 뒤 첫 제목이 맨 위로 올라간 적이 있다(10-22) → 구조를 바꿨으면 **반드시 다시 fetch** 해서 순서 확인 |
+| 제목 변경 | `update_content` 의 `properties` 는 무시된다 → 제목은 `update_properties` 로 따로 |
+| 인라인 DB | `<database … inline="true">` 로 바꾸면 페이지 안에 표로 보인다(full page 링크 대신) |
+| 차트 | 차트 보기 지원: `GROUP BY "일자"; CHART line AGGREGATE sum ON "누적(%)"` |
+
+## 6. 편집 절차
+
+1. **fetch 먼저** — 마지막 편집 시각 확인(다른 자동화가 고쳤을 수 있다).
+2. **가장 작은 편집** — `update_content`(찾아 바꾸기). `old_str` 는 fetch 결과에서 그대로 복사, 유일해야 한다.
+   `insert_content` 는 맨 앞/끝 추가에만. `replace_content` 는 구조를 갈아엎을 때만(옮길 내용은 **먼저** 하위 페이지·DB 로).
+3. **`allow_deleting_content: true` 는 운용자 확인 없이 쓰지 않는다.**
+4. **구조를 바꿨으면 다시 fetch** — 순서·중첩·자식 링크·인라인 여부.
+5. **실패를 성공으로 보고하지 않는다** — warnings·오류는 그대로 전한다.
+
+## 7. DB 쓰는 법
+
+- **스키마부터 fetch** — 속성 이름·형식을 그대로(Flow Project 의 `"Project "`·`"Status "` 는 끝 공백).
+- 날짜 `date:<속성>:start` + `date:<속성>:is_datetime`=0 · 관계 = 페이지 URL 배열 · 체크박스 `"__YES__"`/`"__NO__"` · 숫자는 숫자.
+- **추가 전에 중복 검사** — query 로 같은 키(날짜·종목·구분)를 확인하고 **없는 행만**. 기존 행 값이 다르면 고치지 말고 '불일치' 보고.
+- 행을 지우지 않는다 — 상태를 바꾼다(탈락·기각·Done).
+- 새 DB 는 기본 보기 정렬(최신 위)·보이는 열·빠른 필터를 바로 정한다(`update-view`).
+
+## 8. 언제 무엇을 고치나
+
+| 사건 | 고칠 곳 | 누가 |
+|---|---|---|
+| 판단·매매·입출금·리그 순위(매일) | 일일 기록DB · 매매일지DB · 월별 결산DB | **자동**(i3_notion.cmd) |
+| 코드 변경·운용 결정·사고 | 운영 이력DB 1행 (+ 필요하면 운영 매뉴얼 해당 절) | Claude, 커밋할 때 |
+| 연구 1회(사전선언 → 결과) | 연구 기록DB 1행 | Claude |
+| 리그 입장·탈락·승격 | 리그 멤버DB `상태`(월간 점검 때), 운영 이력DB 1행 | Claude |
+| 할 일 생김·끝남 | Flow Task(Project = I3) | Claude |
+| 전략 자체가 바뀜(승격) | 대시보드 '규칙 한 줄'·운영 매뉴얼·허브 '매매 원칙' | Claude, 운용자 승인 뒤 |
+
+## 9. 작성 뒤 점검표
+
+- [ ] 대시보드 페이지에 날짜별 내용을 붙이지 않았나(→ DB 행으로)
+- [ ] 숫자마다 구간·출처 꼬리표가 있나 · `docs/` 숫자와 같은가
+- [ ] 자식 페이지·DB 링크·순서가 살아 있나(다시 fetch)
+- [ ] 파일명·경로를 백틱으로 감쌌나(자동 링크)
+- [ ] 추세추종 내용을 지우지 않았나
+- [ ] 새 페이지·DB ID 를 §2 와 메모리(`notion-docs-workflow`)에 적었나

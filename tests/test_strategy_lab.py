@@ -169,6 +169,52 @@ def test_blend_reweights_latest_component_weights():
     assert t(2, "d2") == pytest.approx({"Y": 0.3, "Z": 0.7})   # b 는 직전 비중 유지
 
 
+def test_drawdown_grid_is_declared():
+    """★ 10-22 측정 전 선언."""
+    import lab_drawdown as H
+    assert H.DEFAULT == (10, 20) and len(H.GRID) == 15
+    assert {x for x, _ in H.GRID} == {5, 8, 10, 12, 15} and {n for _, n in H.GRID} == {10, 20, 40}
+
+
+def _dd_bars(closes):
+    return {f"2020-01-{k + 1:02d}": {"open": c, "close": c} for k, c in enumerate(closes)}
+
+
+def test_drawdown_exit_leaves_after_x_percent_from_peak():
+    """★ 진입 후 최고 종가 대비 −X% 에서 이탈 — 그 전엔 신호 없음."""
+    import lab_drawdown as H
+    bars = _dd_bars([100, 110, 104, 99, 98])           # 최고 110 → 99 는 −10%
+    t = H.drawdown_exit(bars, "A", 10, 2, "C")
+    days = sorted(bars)
+    assert t(0, days[0]) == {"A": 1.0}                 # 시작은 보유
+    assert t(1, days[1]) is None and t(2, days[2]) is None
+    assert t(3, days[3]) == {"C": 1.0}                 # 99 ≤ 110 × 0.9
+
+
+def test_drawdown_exit_reenters_on_new_n_day_high_only():
+    """현금 상태에서 직전 n일 최고 종가를 **넘어야** 재진입 — 같으면 안 된다."""
+    import lab_drawdown as H
+    bars = _dd_bars([100, 80, 85, 85, 86])
+    t = H.drawdown_exit(bars, "A", 10, 2, "C")
+    days = sorted(bars)
+    t(0, days[0])
+    assert t(1, days[1]) == {"C": 1.0}                 # −20% 이탈
+    assert t(2, days[2]) is None                       # 85 > max(100,80)? 아니다
+    assert t(3, days[3]) is None                       # 85 > max(80,85)? 같으면 아님
+    assert t(4, days[4]) == {"A": 1.0}                 # 86 > max(85,85)
+
+
+def test_drawdown_exit_no_lookahead():
+    import lab_drawdown as H
+    bars = _dd_bars([100, 110, 104, 99, 98])
+    days = sorted(bars)
+    t1 = H.drawdown_exit(bars, "A", 10, 2, "C")
+    r1 = [t1(i, d) for i, d in enumerate(days[:3])]
+    bars[days[4]]["close"] = 1.0                       # 미래 종가 변경
+    t2 = H.drawdown_exit(bars, "A", 10, 2, "C")
+    assert [t2(i, d) for i, d in enumerate(days[:3])] == r1
+
+
 def test_robustness_uses_median_not_best():
     """★ 가장 좋은 설정 하나가 아니라 중앙값으로 판정한다."""
     grid = [{"전체": _m(c, 15.0, -5.0), "박스권": _m(5.0), "강세장": _m(24.0)} for c in (5.0, 6.0, 40.0)]

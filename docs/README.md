@@ -17,6 +17,7 @@
 | 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
 | 8 | [2026-10-12-strategy-review.md](2026-10-12-strategy-review.md) | 전략 타당성 점검 — 월별·금리 국면·FOMC·켈리·구루 원칙 비교(설명용, 채택 아님) |
 | 9 | [2026-10-12-breakout-entry-declaration.md](2026-10-12-breakout-entry-declaration.md) | 진입 타점 A/B — 눌림 vs 돌파20/55. **미통과 → 눌림 유지**(돌파는 수익↑·MDD 18→29%·PF↓) |
+| 16 | [i3-improvement-backlog.md](i3-improvement-backlog.md) | **개선 백로그(살아 있는 문서)** — 세션마다 먼저 본다. 입출금 왜곡 위험 · 체결 비용 보정 · 분봉 수집 · 4세대 I3×TSMOM · ISA |
 | 15 | [2026-10-22-i3-league.md](2026-10-22-i3-league.md) | **도전자 리그 — 매일 발전하는 구조**. 챔피언(실전 I3) vs 도전자를 매일 주문 없이 기록, 승격 규칙 사전선언. 계보 1~3세대(R1~R7)와 교훈 |
 | 14 | [2026-10-22-etf-choice.md](2026-10-22-etf-choice.md) | I3 을 어느 ETF 에 쓸까 — 한미 비교 + **한국 ETF 전수 스크린**. KODEX200 유지(KOSPI200 계열 최상위, 그 안 차이는 소음) · 현금 자리는 머니마켓액티브가 연 +0.6~0.8%p → **10-22 전환** |
 | 13 | [2026-10-22-i3-live.md](2026-10-22-i3-live.md) | **현재 운용 — I3 실전**(KODEX200 ↔ 머니마켓액티브 — 10-22 현금 자리 변경, 재진입 확인 + 낙폭 예산). 실행 구조·안전장치·모의→실전 전환 절차 |

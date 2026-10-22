@@ -22,6 +22,19 @@
   E2 강점 유지 강세장 연수익 ≥ I3 + 1.0%p
   E3 약점 감소 장기(1998~ KOSPI) MDD ≤ R1 − 5%p **그리고** 미공개 수익 ≥ R1 + 3%p
 통과한 것은 i3_shadow.CHALLENGERS 에 오늘 날짜로 등록. 떨어진 것은 기록만 하고 같은 숫자로 다시 재지 않는다.
+
+2세대 결과(3a7594b 선언대로, 기본값): R3 13.37%·MDD 18.8%·강세장 16.7%·미공개 −2.7%·장기 MDD 39.2% → E3 장기
+0.9%p 차로 탈락. R4 11.24%·MDD 21.8%(E1 탈락) — 손절을 좁히면 급등장 흔들림에 털려 강세장까지 잃는다(이 방향 폐기).
+R5 10.52%·강세장 12.5%(E2 탈락).
+
+3세대 선언 (2세대 결과를 본 뒤 설계 — 측정 전 커밋)
+-------------------------------------------------
+진단: R3 의 장기 MDD 구간은 1999-07→2001-09(닷컴). 그 사이 100% 리셋 재진입 두 번(2000-07-10, 2001-08-14)이
+모두 **KOSPI 250일선이 내려가던 장기 하락장**. → 장기 하락장에선 손실을 용서하지 않는다.
+  R6 R3 + 장기 추세 조건  리셋은 KOSPI 250일선이 20영업일 전보다 높을 때만(아니면 I3 예산).
+  R7 R1 + 장기 추세 조건  1년 1회 제한 없이 추세 조건만으로 충분한가.
+  (R4 의 교훈대로 손절은 건드리지 않는다. 250·20 은 관습값 하나씩 — 격자 없음.)
+입장 조건은 2세대와 같다(E1·E2·E3, E3 는 원래 부모 R1 대비).
 """
 from __future__ import annotations
 
@@ -46,8 +59,12 @@ SPECS: dict[str, dict] = {           # 이름 → i3x 옵션
     "R3": {"reset": "once"},
     "R4": {"reset": "always", "tight_x": TIGHT_X, "tight_days": TIGHT_DAYS},
     "R5": {"reset": "once", "tight_x": TIGHT_X, "tight_days": TIGHT_DAYS},
+    "R6": {"reset": "once", "reset_trend_ma": 250, "reset_trend_lag": 20},
+    "R7": {"reset": "always", "reset_trend_ma": 250, "reset_trend_lag": 20},
 }
-NEW = ("R3", "R4", "R5")
+GEN2 = ("R3", "R4", "R5")
+GEN3 = ("R6", "R7")
+NEW = GEN2 + GEN3
 E2_BULL_GAIN_PP = 1.0
 E3_LONG_MDD_CUT_PP = 5.0
 E3_HO_GAIN_PP = 3.0
@@ -58,10 +75,13 @@ BASE, CASH = "069500", "153130"
 
 def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookback: int,
         reset: str = "none", tight_x: float | None = None, tight_days: int = 0,
+        reset_trend_ma: int | None = None, reset_trend_lag: int = 20,
         x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
         floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
     """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
-    tight_x: 재진입 후 tight_days 동안 엔진 이탈선(%). 엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
+    tight_x: 재진입 후 tight_days 동안 엔진 이탈선(%). reset_trend_ma: 리셋은 KOSPI 의 이 이동평균이
+    reset_trend_lag 영업일 전보다 높을 때만(장기 하락장에선 손실을 용서하지 않는다).
+    엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
     days = sorted(bars)
     pos = {d: k for k, d in enumerate(days)}
     closes = [bars[d]["close"] for d in days]
@@ -77,6 +97,17 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         if k is None or k + 1 < regime_ma:
             return False
         return kcl[k] > sum(kcl[k + 1 - regime_ma:k + 1]) / regime_ma
+
+    def long_up(d: str) -> bool:
+        if reset_trend_ma is None:
+            return True
+        k = kpos.get(d)
+        if k is None or k + 1 < reset_trend_ma + reset_trend_lag:
+            return False
+        now = sum(kcl[k + 1 - reset_trend_ma:k + 1]) / reset_trend_ma
+        j = k - reset_trend_lag
+        then = sum(kcl[j + 1 - reset_trend_ma:j + 1]) / reset_trend_ma
+        return now > then
 
     def engine(i: int, d: str):
         k = pos.get(d)
@@ -107,7 +138,8 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
             now_in = asset in sig
             if now_in and not st["in"] and reset != "none":
                 here = len(st["navs"]) - 1
-                if reset == "always" or st["last_reset"] is None or here - st["last_reset"] >= lookback:
+                yearly_ok = reset == "always" or st["last_reset"] is None or here - st["last_reset"] >= lookback
+                if yearly_ok and long_up(d):
                     st["ref"] = st["last_reset"] = here
                 else:
                     st["ref"] = None                     # 1년 1회 — 이번엔 용서하지 않는다(I3 예산)

@@ -108,6 +108,36 @@ def _reentry_weights(spec):
     return out
 
 
+def test_trend_condition_refuses_reset_in_long_downtrend():
+    """★ R6·R7 장치 — KOSPI 250일선이 내려가는 장에선 리셋하지 않는다(올라가면 R1 과 같다)."""
+    days, bars, _ = TR._scenario()
+    up = {d: {"open": 1000 + i, "close": 1000 + i} for i, d in enumerate(days)}
+    def kd(i):                                      # 240일 하락 뒤 완만한 반등 — 단기선 위(재진입 가능),
+        return 3000 - i if i < 240 else 2760 + (i - 240)   # 장기선(50일)은 아직 내려가는 중
+    down = {d: {"open": kd(i), "close": kd(i)} for i, d in enumerate(days)}
+
+    def reentry_w(kospi, spec):
+        t = C.i3x(bars, kospi, "A", "C", 6, 252, **spec)
+        nav, w, prev, seen0, got = 100.0, 1.0, None, False, None
+        for i, d in enumerate(days):
+            if prev is not None:
+                nav *= 1 + w * (bars[d]["close"] / bars[prev]["close"] - 1)
+            r = t(i, d, nav)
+            if r is not None:
+                nw = r.get("A", 0.0)
+                if seen0 and nw > 0 and w == 0.0 and got is None:
+                    got = nw
+                seen0 = seen0 or nw == 0.0
+                w = nw
+            prev = d
+        return got
+    short = {"reset_trend_ma": 50, "reset_trend_lag": 10}       # 시나리오가 짧아 250 대신 50 으로 장치만 시험
+    assert reentry_w(up, {"reset": "always", **short}) == pytest.approx(1.0)
+    w_down = reentry_w(down, {"reset": "always", "regime_ma": 5, **short})
+    w_i3 = reentry_w(down, {"reset": "none", "regime_ma": 5})
+    assert w_down is not None and w_down == pytest.approx(w_i3) and w_down < 0.9
+
+
 def test_once_per_year_reset_refuses_second_forgiveness():
     """★ R3 장치 — 252일 안의 두 번째 재진입은 리셋하지 않는다(연속 휩쏘 차단). 첫 재진입은 R1 과 같다."""
     once, always = _reentry_weights(C.SPECS["R3"]), _reentry_weights(C.SPECS["R1"])

@@ -301,6 +301,35 @@ def test_real_trade_sells_first_then_waits_then_buys(paths):
     assert b.limits[0] is None and b.limits[-1] == LV.limit_price(90_000) == 90_900
 
 
+def test_wait_broker_ready_retries_until_mcp_answers():
+    """★ 08:20 부팅·로그온 지연으로 MCP 가 늦게 떠도 매매를 건너뛰지 않는다 — 응답할 때까지 다시 본다."""
+    from datetime import timedelta
+    answers = [None, None, []]
+    slept = []
+
+    class B:
+        async def holdings(self):
+            return answers.pop(0)
+    t0 = datetime(2026, 10, 23, 8, 50)
+    clock = iter([t0 + timedelta(seconds=30 * i) for i in range(10)])
+
+    async def fake_sleep(s):
+        slept.append(s)
+    ok = run(LV.wait_broker_ready(B(), datetime(2026, 10, 23, 9, 15), fake_sleep, lambda: next(clock)))
+    assert ok is True and slept == [LV.BROKER_WAIT_EVERY] * 2
+
+
+def test_wait_broker_ready_gives_up_at_deadline():
+    class B:
+        async def holdings(self):
+            return None
+    times = iter([datetime(2026, 10, 23, 9, 14), datetime(2026, 10, 23, 9, 15, 1)])
+
+    async def fake_sleep(s):
+        pass
+    assert run(LV.wait_broker_ready(B(), datetime(2026, 10, 23, 9, 15), fake_sleep, lambda: next(times))) is False
+
+
 def test_buys_wait_for_lp_quoting_hours():
     """09:00~09:05 는 ETF LP 호가 의무가 없다 — 매수는 그 뒤, 매매 시간대(시작 검사) 안."""
     from datetime import time as dtime

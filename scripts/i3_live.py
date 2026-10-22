@@ -56,6 +56,10 @@ BUY_LIMIT_PCT = 0.01      # 매수 지정가 = 현재가 × 1.01 — 즉시 체�
 # 있다). 시가 체결 자체는 유지: lab_exec_timing(사전선언 c9534b4)에서 '다음 날 종가'(10시 이후의 끝점) −1.2%p,
 # '당일 종가' −2.8%p 로 둘 다 비열위 미달 — 매도는 08:50 동시호가(=검증의 시가) 그대로.
 BUY_AFTER = dtime(9, 5, 30)
+# 매매 단계 시작 때 MCP(계좌 조회)가 응답할 때까지 기다리는 한도 — PC 가 08:20 부팅, 로그온 뒤 워치독이 MCP 를
+# 띄운다(10-22 실측: 서버 기동 08:40). 로그온이 늦어도 매매를 건너뛰지 않게 30초 간격으로 이 시각까지 다시 본다.
+BROKER_WAIT_UNTIL = dtime(9, 15)
+BROKER_WAIT_EVERY = 30.0
 PRICE_STEP = 5            # 지정가 올림 단위 — ETF 호가 1원(머니마켓)·5원(KODEX200) 어느 쪽에도 유효
 FEE_BUF = 0.001           # 주문가능금액 대비 수수료·반올림 여유
 
@@ -403,6 +407,22 @@ def _setup_logging() -> None:
     log.setLevel(logging.INFO)
 
 
+async def wait_broker_ready(broker: Broker, deadline: datetime, sleep=asyncio.sleep, clock=datetime.now,
+                            every: float = BROKER_WAIT_EVERY) -> bool:
+    """계좌 조회가 될 때까지(None 이 아닐 때까지) every 초 간격으로 deadline 까지 기다린다. 못 되면 False —
+    그 뒤 phase_trade 가 '계좌 조회 실패 — 매매 중단' critical 로 멈춘다(추측으로 주문하지 않는다)."""
+    while True:
+        try:
+            if await broker.holdings() is not None:
+                return True
+        except Exception as e:
+            log.warning("[TRADE] 계좌 조회 대기 중 예외: %s", e)
+        if clock() >= deadline:
+            return False
+        log.info("[TRADE] MCP/계좌 조회 아직 안 됨 — %.0f초 뒤 다시(한도 %s)", every, deadline.strftime("%H:%M"))
+        await sleep(every)
+
+
 async def _main(phase: str) -> int:
     if phase == "status":
         print(json.dumps(load_state(), ensure_ascii=False, indent=2))
@@ -438,7 +458,11 @@ async def _run_phase(phase: str) -> int:
             await wait_until(dtime(9, 0, 30))  # 동시호가 매도는 09:00 에 체결 — 그 전엔 대조하지 않는다
             await asyncio.sleep(15)
 
-        res = await phase_trade(KiwoomBroker(), _notify, now, prices, dry_run=dry, halt=halt,
+        broker = KiwoomBroker()
+        if not halt and st.get("pending") and st.get("traded_on") != now.strftime("%Y-%m-%d") \
+                and TRADE_WINDOW[0] <= now.time() <= TRADE_WINDOW[1]:
+            await wait_broker_ready(broker, datetime.combine(now.date(), BROKER_WAIT_UNTIL))
+        res = await phase_trade(broker, _notify, now, prices, dry_run=dry, halt=halt,
                                 wait_after_open=wait_buy, before_check=settle)
     log.info("[%s] %s", phase, json.dumps(res, ensure_ascii=False, default=str)[:500])
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))

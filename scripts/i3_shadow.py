@@ -125,13 +125,17 @@ def _pack(res: L.SimResult, t, start: str, equity: float) -> dict:
             "trade_days": sorted(t.desired["trade_days"]), "nav_hist": dict(pts), "w": t.desired["w"] or 0.0}
 
 
-def std_run(build: Callable[[dict, list[str]], tuple[tuple[str, ...], Callable, bool]]):
-    """build(data, dates) → (자산 코드들, target, needs_nav) 인 연구 함수를 리그 실행기로."""
+def std_run(build: Callable[[dict, list[str]], tuple]):
+    """build(data, dates) → (자산 코드들, target, needs_nav[, 체결 방식]) 인 연구 함수를 리그 실행기로.
+    체결 방식 'SAME_CLOSE' 면 신호 낸 날 종가 체결(RSI2 처럼 원전이 종가 매매인 것)."""
     def run(data: dict, start: str, equity: float, upto: str) -> dict:
+        import lab_exec_timing as T
         dates = _calendar(data, upto)
-        codes, inner, needs_nav = build(data, dates)
+        codes, inner, needs_nav, *rest = build(data, dates)
+        fill = rest[0] if rest else None
         t = shadow_target(inner, start, equity, needs_nav)
-        res = L.simulate({c: L.Asset(c, data[c]) for c in codes}, dates, t, equity, pass_nav=True)
+        assets = {c: L.Asset(c, T.fill_bars(data[c], fill) if fill else data[c]) for c in codes}
+        res = L.simulate(assets, dates, t, equity, pass_nav=True)
         return _pack(res, t, start, equity)
     return run
 
@@ -206,6 +210,49 @@ def _run_trend(data: dict, start: str, equity: float, upto: str) -> dict:
     return {"curve": curve, "w_hist": {}, "trade_days": [], "nav_hist": dict(curve), "w": None}
 
 
+# ── 고전·펀드·논문·GitHub (lab_classics — 원 출처 파라미터 그대로) ─────────────────────────
+def month_ends_live(days: list[str]) -> set[str]:
+    """월말 영업일 — 마지막 날(오늘)은 다음 평일로 판단(매일 재실행에도 결과가 흔들리지 않게)."""
+    import lab_classics as C
+    nxt = next_weekday(days[-1])
+    return C.month_ends(days + [nxt]) - {nxt}
+
+
+def _b_classic(name: str):
+    def build(data, dates):
+        import lab_classics as C
+        k = data[K.BASE]
+        ends = month_ends_live(sorted(k))
+        qends = {d for d in ends if int(d[5:7]) in (3, 6, 9, 12)}
+        one = (K.BASE, K.CASH)
+        table = {
+            "FABER10": (one, C.faber10(k, K.BASE, ends), None),
+            "TSMOM": ((*C.TSMOM_ASSETS, K.CASH), C.tsmom({a: data[a] for a in C.TSMOM_ASSETS}, ends), None),
+            "VOLMGD": (one, C.volmgd(k, K.BASE, ends), None),
+            "ALLWTHR": ((*C.AW_WEIGHTS, K.CASH), C.all_weather(qends), None),
+            "TURTLE55": (one, C.turtle(k, K.BASE), None),
+            "RSI2": (one, C.rsi2(k, K.BASE), "SAME_CLOSE"),
+            "BOLLMR": (one, C.bollinger_mr(k, K.BASE), None),
+            "GCROSS": (one, C.golden_cross(k, K.BASE), None),
+        }
+        codes, t, fill = table[name]
+        return codes, cash_fill(t), False, fill
+    return build
+
+
+def _run_vbreak(data: dict, start: str, equity: float, upto: str) -> dict:
+    """래리 윌리엄스 변동성 돌파(k=0.5) — 고가·저가가 필요해 OHLC 를 따로 쓴다. 출발일엔 사지 않는다."""
+    import lab_classics as C
+    ohlc = data[f"ohlc:{K.BASE}"]
+    dates = _calendar(data, upto)
+    d, v, _, buys = C.vbreak_curve(ohlc, data[K.CASH], dates, equity, start=start, no_trade_on_start=True)
+    curve = [(x, round(y)) for x, y in zip(d, v)]
+    bset = set(buys)
+    w_hist = {x: (1.0 if x in bset else 0.0) for x in d}
+    return {"curve": curve, "w_hist": w_hist, "trade_days": sorted(bset), "nav_hist": dict(curve),
+            "w": w_hist.get(d[-1], 0.0) if d else 0.0}
+
+
 @dataclass(frozen=True)
 class Member:
     name: str
@@ -235,6 +282,38 @@ MEMBERS: tuple[Member, ...] = (
     Member("추세추종", "종목 추세추종", _D, _OP, "06~10월 실전 운용 후 종료한 대형주 추세추종(라이브 설정 그대로)",
            (K.BASE, KOSPI), _run_trend),
 )
+_CL = "운용자 결정(10-22): 고전·펀드·논문·GitHub 알고리즘, 원 출처 파라미터 그대로(lab_classics b09a202)"
+_TS = ("069500", "133690", "148070", "132030", "138230")
+_AW = ("069500", "148070", "114260", "132030")
+MEMBERS = MEMBERS + (
+    Member("Faber10", "논문 추세", _D, _CL, "Faber(2007) 월말 10개월선", (K.BASE, K.CASH, KOSPI), std_run(_b_classic("FABER10"))),
+    Member("TSMOM", "논문 모멘텀", _D, _CL, "Moskowitz·Ooi·Pedersen(2012) 5자산 12개월, 롱온리",
+           (*_TS, K.CASH, KOSPI), std_run(_b_classic("TSMOM"))),
+    Member("변동성관리", "논문 변동성", _D, _CL, "Moreira·Muir(2017) 1/전월분산, 상한 1",
+           (K.BASE, K.CASH, KOSPI), std_run(_b_classic("VOLMGD"))),
+    Member("올웨더", "펀드 자산배분", _D, _CL, "브리지워터 올웨더 대중판 30/40/15/15 분기 재조정",
+           (*_AW, K.CASH, KOSPI), std_run(_b_classic("ALLWTHR"))),
+    Member("터틀", "추세 돌파", _D, _CL, "터틀 시스템2 55/20(종가 돈치안)", (K.BASE, K.CASH, KOSPI), std_run(_b_classic("TURTLE55"))),
+    Member("RSI2", "단기 역추세", _D, _CL, "Connors(2009) 200일선 위 RSI(2)<10, 종가 매매",
+           (K.BASE, K.CASH, KOSPI), std_run(_b_classic("RSI2"))),
+    Member("볼린저", "단기 역추세", _D, _CL, "볼린저 20일 2σ 역추세", (K.BASE, K.CASH, KOSPI), std_run(_b_classic("BOLLMR"))),
+    Member("골든크로스", "추세", _D, _CL, "50/200일선", (K.BASE, K.CASH, KOSPI), std_run(_b_classic("GCROSS"))),
+    Member("변동성돌파", "단타", _D, _CL, "래리 윌리엄스 k=0.5, 돌파 매수 → 다음 날 시가 매도",
+           (K.BASE, K.CASH, KOSPI, f"ohlc:{K.BASE}"), _run_vbreak),
+)
+
+
+# ── 데이터 점검 (운용자 10-22: "이번엔 백테스트 제대로 하는 거지?") ───────────────────────
+AUDIT_TOL = 0.005                # 장기 이력(FDR)과 키움 원자료가 겹치는 날 종가 차이 한도 — 실전 판단과 같은 값
+
+
+def audit_sources(hist: dict, recent: dict, upto: str) -> float | None:
+    """겹치는 날(오늘 제외 최근 20일) 시가·종가 최대 상대 차이. 겹치는 날이 5일 미만이면 None."""
+    common = sorted(d for d in recent if d in hist and d < upto)[-20:]
+    if len(common) < 5:
+        return None
+    return max(abs(recent[d][f] / hist[d][f] - 1) for d in common for f in ("open", "close")
+               if hist[d].get(f) and recent[d].get(f))
 
 
 def run_league(data: dict, start: str, equity: float, upto: str,
@@ -310,23 +389,45 @@ def append_history(row: dict, path: Path = HISTORY_FILE) -> None:
     tmp.replace(path)
 
 
-async def _load_data(today: str) -> dict:
-    """멤버가 쓰는 종목: 장기 이력 FDR + 최근·오늘 일봉 키움(실전 판단과 같은 출처)."""
+async def _recent_ohlc(code: str) -> dict:
+    """키움 최근 일봉(고가·저가 포함) — 실전 코드(i3_live)는 건드리지 않고 리그에서만 쓴다."""
+    from trend_config import MARKET_URL
+    from trend_kiwoom_io import _kiwoom_call, _num
+    d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "get_daily_chart", {"stock_code": code, "limit": 150})
+    out = {}
+    for r in d.get("stk_dt_pole_chart_qry") or []:
+        dt = str(r.get("dt", ""))
+        c = _num(r, "cur_prc", abs_val=True)
+        if len(dt) == 8 and c > 0:
+            o = _num(r, "open_pric", abs_val=True) or c
+            out[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = {"open": o, "high": _num(r, "high_pric", abs_val=True) or max(o, c),
+                                                   "low": _num(r, "low_pric", abs_val=True) or min(o, c), "close": c}
+    return out
+
+
+async def _load_data(today: str) -> tuple[dict, dict]:
+    """멤버가 쓰는 종목: 장기 이력 FDR + 최근·오늘 일봉 키움(실전 판단과 같은 출처).
+    두 출처를 겹치는 날로 대조한 결과(audit)도 돌려준다 — 어긋나면 그날 리그 기록은 믿을 수 없다."""
     import i3_live as LV
+    import lab_classics as C
     m = LV.KiwoomMarket()
     codes = sorted({c for mb in MEMBERS for c in mb.codes})
-    data = {}
+    data, audit = {}, {}
     for c in codes:
         if c == KOSPI:
-            data[c] = {**await m.kospi_bars(), **await m.recent("KOSPI")}
+            hist, rec = await m.kospi_bars(), await m.recent("KOSPI")
+        elif c.startswith("ohlc:"):
+            code = c.split(":", 1)[1]
+            hist, rec = C.load_ohlc(code, "2010-01-01", today), await _recent_ohlc(code)
         else:
             hist = L.load_bars(c, "2010-01-01", today)
             try:
                 rec = await m.recent(c)
             except Exception:
                 rec = {}
-            data[c] = {**hist, **rec}
-    return data
+        audit[c] = audit_sources(hist, rec, today)
+        data[c] = {**hist, **rec}
+    return data, audit
 
 
 def summary_line(rec: dict) -> str:
@@ -351,7 +452,11 @@ async def main_async(now: datetime) -> int:
         return 0
     start, equity = navs[0][0], float(navs[0][1])
     today = now.strftime("%Y-%m-%d")
-    data = await _load_data(today)
+    data, audit = await _load_data(today)
+    bad = {c: x for c, x in audit.items() if x is not None and x > AUDIT_TOL}
+    if bad:
+        await LV._notify("⛔ [I3 리그] 데이터 출처 불일치 — 오늘 리그 기록은 믿을 수 없다: "
+                         + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
     base, kospi = data[K.BASE], data[KOSPI]
     # 장중엔 오늘 일봉이 미완성 — 15:35 전이면 어제까지만 본다
     upto = (today if now.time() >= AFTER_CLOSE and today in base and today in kospi
@@ -377,7 +482,8 @@ async def main_async(now: datetime) -> int:
             promo[mb.name] = promotion(champ, r, max(start, mb.registered))
     rec = {"asof": upto, "start": start, "equity": round(equity),
            "live": {"nav": round(live_nav), "ret": round((live_nav / equity - 1) * 100, 3), "date": navs[-1][0]},
-           "models": models, "promotion": promo}
+           "models": models, "promotion": promo,
+           "audit": {c: (None if x is None else round(x, 6)) for c, x in audit.items()}, "audit_ok": not bad}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SHADOW_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")

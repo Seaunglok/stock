@@ -115,7 +115,22 @@ def league_data():
         pytest.skip("검증 캐시 없음")
     data = {c: L.load_bars(c, "2010-01-01", e) for c, e in codes.items()}
     data[S.KOSPI] = L.load_bars("^KS11", "1996-01-01", "2026-08-24")
+    if not (cache / "ohlc_069500_2026-10-21.json").exists():
+        pytest.skip("OHLC 캐시 없음")
+    import lab_classics as C
+    data["ohlc:069500"] = C.load_ohlc("069500", "2010-01-01", "2026-10-21")
     return data
+
+
+def test_audit_catches_source_mismatch():
+    """★ 일부러 깨뜨리기 — 키움 원자료가 장기 이력과 1% 어긋나면 잡아낸다(한도 0.5%)."""
+    hist = {f"2026-10-{d:02d}": {"open": 100.0, "close": 100.0} for d in range(1, 21)}
+    same = {k: dict(v) for k, v in hist.items()}
+    off = {k: {"open": 101.0, "close": 101.0} for k in hist}
+    assert S.audit_sources(hist, same, "2026-10-30") == 0.0
+    gap = S.audit_sources(hist, off, "2026-10-30")
+    assert gap == pytest.approx(0.01) and gap > S.AUDIT_TOL
+    assert S.audit_sources(hist, {k: hist[k] for k in list(hist)[:3]}, "2026-10-30") is None
 
 
 def test_every_member_starts_from_the_same_line(league_data):

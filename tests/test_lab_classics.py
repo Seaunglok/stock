@@ -33,7 +33,7 @@ def test_vbreak_buys_at_level_and_sells_next_open():
     o = {d[0]: {"open": 100, "high": 110, "low": 90, "close": 105},
          d[1]: {"open": 100, "high": 112, "low": 99, "close": 111},      # 기준가 100+0.5×20=110 돌파
          d[2]: {"open": 115, "high": 116, "low": 114, "close": 115}}
-    dd, vv, n = C.vbreak_curve(o, None, d, 1000.0)
+    dd, vv, n, _ = C.vbreak_curve(o, None, d, 1000.0)
     bc, sc = L._side_cost(False, False), L._side_cost(False, True)
     assert n == 1
     assert vv[2] == pytest.approx(1000.0 * 115 * (1 - sc) / (110 * (1 + bc)))
@@ -44,7 +44,7 @@ def test_vbreak_no_breakout_keeps_cash_then_buys():
     o = {d[0]: {"open": 100, "high": 110, "low": 90, "close": 105},
          d[1]: {"open": 120, "high": 121, "low": 119, "close": 120},      # 기준가 120+0.5×20=130 미도달 → 안 산다
          d[2]: {"open": 120, "high": 140, "low": 119, "close": 135}}      # 기준가 120+0.5×2=121 → 121 체결
-    _, vv, n = C.vbreak_curve(o, None, d, 1000.0)
+    _, vv, n, _ = C.vbreak_curve(o, None, d, 1000.0)
     assert n == 1 and vv[1] == 1000.0
 
 

@@ -242,11 +242,14 @@ def golden_cross(bars, asset, fast: int = 50, slow: int = 200):
 
 
 def vbreak_curve(ohlc: dict, cash: dict | None, dates: list[str], equity: float, k: float = VB_K,
-                 start: str | None = None) -> tuple[list[str], list[float], int]:
+                 start: str | None = None, no_trade_on_start: bool = False, costs: bool = True
+                 ) -> tuple[list[str], list[float], int, list[str]]:
     """변동성 돌파 자산곡선 — 돌파한 날 그 가격에 사서 다음 날 시가에 판다. 안 산 날은 현금 자리 수익.
-    비용: 매수·매도 각각 수수료+슬리피지(ETF 매도세 없음, strategy_lab._side_cost 와 같은 값)."""
-    buy_c, sell_c = L._side_cost(False, False), L._side_cost(False, True)
-    nav, out_d, out_v, trades = equity, [], [], 0
+    비용: 매수·매도 각각 수수료+슬리피지(ETF 매도세 없음, strategy_lab._side_cost 와 같은 값).
+    no_trade_on_start: 리그용 — 출발일(판단 종가)엔 사지 않는다(그날 장중 매수는 출발선보다 앞선다).
+    반환: (날짜, 자산, 매매 수, 돌파 매수한 날)."""
+    buy_c, sell_c = (L._side_cost(False, False), L._side_cost(False, True)) if costs else (0.0, 0.0)
+    nav, out_d, out_v, trades, buys = equity, [], [], 0, []
     held = None                                         # 전날 돌파 매수가
     prev = None
     for d in dates:
@@ -261,17 +264,18 @@ def vbreak_curve(ohlc: dict, cash: dict | None, dates: list[str], equity: float,
         elif cash is not None and prev in cash and d in cash and out_d:
             nav *= cash[d]["close"] / cash[prev]["close"]   # 안 산 날은 현금 자리 수익
         mark = nav
-        if b and held is None and prev in ohlc:          # 2) 오늘 돌파하면 그 가격에 산다
-            p = ohlc[prev]
+        if b and held is None and prev in ohlc and not (no_trade_on_start and d == start):
+            p = ohlc[prev]                              # 2) 오늘 돌파하면 그 가격에 산다
             level = b["open"] + k * (p["high"] - p["low"])
             if b["high"] >= level:
                 held = max(b["open"], level)
                 trades += 1
+                buys.append(d)
                 mark = nav * b["close"] * (1 - sell_c) / (held * (1 + buy_c))   # 장부는 종가 평가
         out_d.append(d)
         out_v.append(mark)
         prev = d
-    return out_d, out_v, trades
+    return out_d, out_v, trades, buys
 
 
 # ── 측정 ─────────────────────────────────────────────────────────────────────
@@ -334,9 +338,11 @@ def main() -> int:
             lr = _sim({"IDX": ks}, long_dates, long_b(ks, le), same_close)
             long_m = L.metrics(lr.dates, lr.curve)
         record(name, res.dates, res.curve, res.trades, long_m)
-    vd, vv, vt = vbreak_curve(px[BASE], px[CASH], dates, EQUITY)
-    ld, lv, _ = vbreak_curve(ks, None, long_dates, EQUITY)
+    vd, vv, vt, _ = vbreak_curve(px[BASE], px[CASH], dates, EQUITY)
+    ld, lv, _, _ = vbreak_curve(ks, None, long_dates, EQUITY)
     record("VBREAK", vd, vv, vt, L.metrics(ld, lv))
+    gd, gv, gt, _ = vbreak_curve(px[BASE], px[CASH], dates, EQUITY, costs=False)
+    record("(참고)VBREAK비용0", gd, gv, gt, None)
 
     print("=" * 118)
     print(f"고전·펀드·논문·GitHub 1차 — 원 출처 파라미터, 예탁 {EQUITY:,.0f}원, 2015-07~2026-08 (+미공개 08-25~10-21)")

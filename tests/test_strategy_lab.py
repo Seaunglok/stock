@@ -268,6 +268,51 @@ def test_reentry_requires_regime_up():
         assert t(2, days[2]) == expect                        # 85 > 80 돌파 — 레짐에 따라
 
 
+def test_holdout_is_after_training_and_declared():
+    """★ 미공개 구간은 학습 구간이 끝난 **뒤**여야 한다 — 겹치면 검증이 아니다."""
+    assert L.HOLDOUT == ("2026-08-25", "2026-10-21")
+    assert L.FULL[1] < L.HOLDOUT[0]
+    assert (L.HO_MDD_RATIO, L.HO_MIN_RET_PCT) == (0.5, -10.0)
+
+
+@pytest.mark.parametrize("s, failed", [
+    ({"total": -16.0, "mdd": 5.0}, "HO① 수익 ≥ 지수"),
+    ({"total": -2.0, "mdd": 10.0}, "HO② 낙폭 ≤ 지수×½"),
+    ({"total": -11.0, "mdd": 5.0}, "HO③ 수익 ≥ −10%"),
+])
+def test_judge_holdout_each_criterion_fails(s, failed):
+    """★ 규칙 3 — 미공개 기준도 하나씩 일부러 깨뜨린다. 지수 = 수익 −15%, MDD 19%."""
+    b = {"total": -15.0, "mdd": 19.0}
+    rows = {n: ok for n, ok, _ in L.judge_holdout(s, b)}
+    assert rows[failed] is False
+    assert L.passed(L.judge_holdout({"total": -2.0, "mdd": 5.0}, b))
+
+
+def test_i3_grid_declared_and_recovers_after_lookback():
+    """★ I3 — 바닥에 닿으면 비중 0, **최근 L일** 최고치가 내려오면 다시 위험을 진다(현금 고착 방지)."""
+    import lab_holdout as H3
+    assert H3.I3_DEFAULT == (6, 252) and len(H3.I3_GRID) == 9
+    days = [f"2020-01-{k + 1:02d}" for k in range(8)]
+    bars = {d: {"open": 100.0, "close": 100.0} for d in days}       # 엔진은 계속 보유
+    t = H3.i3(bars, bars, "A", "C", m=6, lookback=3, x_pct=50)
+    navs = [100, 82, 82, 82, 82, 82]
+    ws = [t(i, d, nv) for i, (d, nv) in enumerate(zip(days, navs))]
+    assert ws[0] == {"A": 1.0}                                       # 최고치에서 m×18% ≥ 1
+    assert ws[1] == {"C": 1.0}                                       # 바닥(−18%) → 0
+    assert ws[2] is None                                             # 창 안에 아직 100 → 0 유지
+    assert ws[3] == {"A": 1.0}                                       # 최근 3일 최고치 82 → 다시 보유
+
+
+def test_i3_respects_engine_exit():
+    import lab_holdout as H3
+    days = ["2020-01-01", "2020-01-02", "2020-01-03"]
+    bars = {d: {"open": c, "close": c} for d, c in zip(days, [100, 100, 85])}   # −15% → 엔진 이탈
+    t = H3.i3(bars, bars, "A", "C", m=6, lookback=252, x_pct=10)
+    t(0, days[0], 100.0)
+    t(1, days[1], 100.0)
+    assert t(2, days[2], 100.0) == {"C": 1.0}
+
+
 def test_robustness_uses_median_not_best():
     """★ 가장 좋은 설정 하나가 아니라 중앙값으로 판정한다."""
     grid = [{"전체": _m(c, 15.0, -5.0), "박스권": _m(5.0), "강세장": _m(24.0)} for c in (5.0, 6.0, 40.0)]

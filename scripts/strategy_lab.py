@@ -61,6 +61,15 @@ PERIODS: dict[str, tuple[str, str]] = {
 FULL = ("2015-07-28", "2026-08-24")
 LONG = ("1997-01-03", "2026-08-24")     # 지수형 장기 스트레스(①② 만)
 
+# ── 미공개 검증 구간 (2026-10-22 운용자 결정) ────────────────────────────────
+# 1~5차 설계는 전부 FULL(~2026-08-24)까지의 데이터로만 쟀다. 그 뒤 2개월은 어떤 전략도 측정하지 않았다
+# — '학습 70 / 검증 30' 의 검증 구간처럼 쓴다. 40영업일 남짓이라 연 수익률은 못 재고, '급락을 견디나'
+# 를 본다(이 구간 KODEX200 약 −19% 하락). 한계: 10월 급락이 있었다는 사실 자체는 일지로 알고 있었다
+# (설계를 이 구간 데이터에 맞춘 적은 없다).
+HOLDOUT = ("2026-08-25", "2026-10-21")
+HO_MDD_RATIO = 0.5        # HO② 미공개 구간 MDD ≤ KODEX200 의 절반
+HO_MIN_RET_PCT = -10.0    # HO③ 미공개 구간 수익 ≥ −10%
+
 _CACHE_DIR = _ROOT / "docs_cache" / "lab"
 
 
@@ -263,6 +272,19 @@ def judge_long(m: dict) -> list[tuple[str, bool, str]]:
         ("장기 ① 최대낙폭", m["mdd"] <= MAX_MDD_PCT, f"{m['mdd']:.1f}% ≤ {MAX_MDD_PCT:g}%"),
         ("장기 ② 최악 연도", m["worst_year"] >= MIN_YEAR_RET_PCT,
          f"{m['worst_year']:+.1f}% ≥ {MIN_YEAR_RET_PCT:+g}%"),
+    ]
+
+
+def judge_holdout(s: dict, b: dict) -> list[tuple[str, bool, str]]:
+    """미공개 구간 판정 — s/b 는 그 구간을 잘라 잰 metrics(전략·KODEX200).
+
+    HO① 수익 ≥ KODEX200  HO② MDD ≤ KODEX200 × HO_MDD_RATIO  HO③ 수익 ≥ HO_MIN_RET_PCT
+    """
+    return [
+        ("HO① 수익 ≥ 지수", s["total"] >= b["total"], f"{s['total']:+.1f}% ≥ {b['total']:+.1f}%"),
+        ("HO② 낙폭 ≤ 지수×½", s["mdd"] <= b["mdd"] * HO_MDD_RATIO,
+         f"{s['mdd']:.1f}% ≤ {b['mdd'] * HO_MDD_RATIO:.1f}%"),
+        ("HO③ 수익 ≥ −10%", s["total"] >= HO_MIN_RET_PCT, f"{s['total']:+.1f}% ≥ {HO_MIN_RET_PCT:+g}%"),
     ]
 
 

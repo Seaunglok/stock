@@ -46,19 +46,40 @@ def test_withdrawal_is_detected_and_not_seen_as_loss():
     assert K.budget_exposure([3_647_500, idx]) == 1.0                # 예산이 비중을 깎지 않는다
 
 
-def test_unexplained_gain_is_kept_as_performance_but_flagged():
-    """분배금·입금·SK이노 매도 — 양수 차이는 성과로 두고 알림만(입금이면 운용자가 기록)."""
+def test_gain_is_auto_deposit_unless_it_looks_like_a_distribution():
+    """입금·SK이노 매도 대금 → 자동 입금. KODEX200 분배금 지급기(2·5·8·11월 초)에 평가액 3% 이하면 분배금(성과)."""
     snap = F.snapshot(_hold(40, 90_000, 0, 0), 3_640_000, CODES)
-    flow, how, resid = F.detect_flow(snap, _hold(40, 90_000, 0, 0), 3_640_000 + 142_200, traded_since=False)
-    assert how == "unexplained-gain" and flow == 0 and resid == pytest.approx(142_200)
+    flow, how, resid = F.detect_flow(snap, _hold(40, 90_000, 0, 0), 3_640_000 + 142_200, False, day="2026-10-27")
+    assert how == "auto-deposit" and flow == pytest.approx(142_200)
+    flow, how, _ = F.detect_flow(snap, _hold(40, 90_000, 0, 0), 3_640_000 + 50_000, False, day="2027-05-04")
+    assert how == "distribution" and flow == 0                      # 5월 초 · 360만원의 1.4% → 분배금
+    flow, how, _ = F.detect_flow(snap, _hold(40, 90_000, 0, 0), 3_640_000 + 500_000, False, day="2027-05-04")
+    assert how == "auto-deposit"                                     # 3% 넘으면 분배금이 아니다
     flow, how, _ = F.detect_flow(snap, _hold(40, 90_000, 0, 0), 3_640_000 + 142_200, False, declared=142_200)
-    assert how == "declared" and flow == 142_200                    # 운용자가 입금으로 기록하면 반영
+    assert how == "declared" and flow == 142_200                    # 운용자 기록이 있으면 그것만
 
 
-def test_trade_day_skips_auto_detection_but_applies_declared():
+def test_trade_day_uses_fills_to_detect_flows():
+    """★ 매매가 있던 날도 체결 기록으로 계산 — 머니마켓 34주 팔고 KODEX200 40주 산 날 30만원 출금을 잡는다."""
+    snap = F.snapshot(_hold(0, 0, 34, 105_900), 3_647_500, CODES)
+    trades = [{"side": "sell", "code": K.CASH, "fill_qty": 34, "fill_price": 105_910.0},
+              {"side": "buy", "code": K.BASE, "fill_qty": 40, "fill_price": 89_000.0}]
+    after = F.apply_trades(snap, trades)
+    hold_now = _hold(40, 89_500, 0, 0)
+    nav_ok = after["cash"] + 40 * 89_500
+    flow, how, _ = F.detect_flow(snap, hold_now, nav_ok, traded_since=True, trades=trades, day="2026-10-27")
+    assert how == "none" and flow == 0                               # 매매만 있었다 — 입출금 없음
+    flow, how, _ = F.detect_flow(snap, hold_now, nav_ok - 300_000, True, trades=trades, day="2026-10-27")
+    assert how == "auto-withdrawal" and flow == pytest.approx(-300_000)
+
+
+def test_trade_day_without_fills_skips_auto_detection_but_applies_declared():
     snap = F.snapshot(_hold(0, 0, 34, 105_900), 3_647_500, CODES)
     flow, how, _ = F.detect_flow(snap, _hold(39, 90_000, 0, 0), 3_100_000, traded_since=True, declared=-500_000)
     assert how == "skip-trade" and flow == -500_000
+    unknown = [{"side": "buy", "code": K.BASE, "fill_qty": None, "fill_price": None}]
+    _, how, _ = F.detect_flow(snap, _hold(39, 90_000, 0, 0), 3_100_000, True, trades=unknown)
+    assert how == "skip-trade"                                       # 체결가를 모르면 추측하지 않는다
 
 
 def test_small_noise_is_ignored_and_first_day():

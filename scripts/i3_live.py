@@ -177,7 +177,10 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     declared_rows = [f for f in st.get("flows_declared", []) if f.get("applied_on") in (None, today)]
     declared = sum(float(f["amount"]) for f in declared_rows)
     traded_since = bool(acct_base) and st.get("traded_on", "") > acct_base["date"]
-    flow, how, resid = F.detect_flow(acct_base["snap"] if acct_base else None, hold, nav, traded_since, declared)
+    last_trade = st.get("last_trade") or {}
+    trades = (last_trade.get("fills") if traded_since and last_trade.get("date", "") > acct_base["date"] else None)
+    flow, how, resid = F.detect_flow(acct_base["snap"] if acct_base else None, hold, nav, traded_since, declared,
+                                     trades, today)
     idx, units = F.apply_flow(acct_base["index"] if acct_base else None,
                               acct_base["units"] if acct_base else None, nav, flow)
     for f in declared_rows:
@@ -207,9 +210,11 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     if how == "auto-withdrawal":
         await notify(f"⚠️ [I3] 출금으로 보고 자동 보정 — 설명 안 되는 감소 {-resid:,.0f}원(매매 없는 날). "
                      f"낙폭 예산(성과 지수)은 영향 없음. 출금한 적이 없다면 HTS 로 확인 필요", critical=True)
-    elif how == "unexplained-gain":
-        await notify(f"ℹ️ [I3] 설명 안 되는 증가 {resid:,.0f}원 — 분배금이면 그대로 두면 되고, 입금·다른 종목 매도라면 "
-                     f"`python scripts/i3_live.py --phase flow --amount {resid:.0f}` 로 기록")
+    elif how == "auto-deposit":
+        await notify(f"ℹ️ [I3] 입금으로 보고 자동 반영 — +{resid:,.0f}원(입금·I3 밖 종목 매도 대금). 성과 지수 영향 없음. "
+                     f"분배금이었다면 알려 달라")
+    elif how == "distribution":
+        await notify(f"ℹ️ [I3] KODEX200 분배금으로 보고 성과에 포함 — +{resid:,.0f}원")
     return rec
 
 

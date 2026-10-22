@@ -366,6 +366,37 @@ def test_without_flow_correction_a_withdrawal_would_cut_exposure():
     assert K.budget_exposure([3_400_000.0, 2_900_000.0]) < 0.25
 
 
+def test_deposit_is_recorded_automatically(paths):
+    """★ 운용자 요청(입출금 기록 자동) — SK이노 매도 대금 14만원이 들어와도 기록 없이 입금으로 반영된다."""
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    r, st, notes = _two_days(paths, 3_400_000.0, 3_542_200.0, hold)
+    assert r["flow"]["how"] == "auto-deposit" and r["flow"]["amount"] == 142_200
+    assert st["navs"][-1][1] == pytest.approx(st["navs"][0][1])
+    assert any("입금" in m for _, m in notes.msgs)
+
+
+def test_trade_day_flow_uses_recorded_fills(paths):
+    """판단 → 매매(체결 기록) → 다음 판단: 매매 영향은 빼고, 그날 출금만 입출금으로 잡는다(실제 경계 — 쓰는 쪽·읽는 쪽 둘 다)."""
+    days = _days()
+    d1, d2 = days[-2], days[-1]
+    hold1 = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    run(LV.phase_decide(FakeMarket(days[:-1], d1), FakeBroker(holdings=hold1, equity=(3_400_000.0, 0.0)), Notes(),
+                        datetime.fromisoformat(d1 + "T15:50:00"), *paths))
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    st["pending"] = {"decided_on": d1, "w": 0.5, "reason": "t"}
+    paths[0].write_text(json.dumps(st), encoding="utf-8")
+    b = FakeBroker(holdings=hold1, equity=(3_400_000.0, 0.0))
+    run(LV.phase_trade(b, Notes(), datetime.fromisoformat(d2 + "T08:50:00"), PRICES, *paths, dry_run=False))
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    fills = st["last_trade"]["fills"]
+    after = LV.F.apply_trades(st["acct"]["snap"], fills)
+    hold2 = [{"symbol": c, "qty": q, "cur": PRICES[c], "name": "x", "avg": 0} for c, q in after["q"].items() if q > 0]
+    nav2 = after["cash"] + sum(h["qty"] * h["cur"] for h in hold2) - 200_000          # 매매 + 20만원 출금
+    r = run(LV.phase_decide(FakeMarket(days, d2), FakeBroker(holdings=hold2, equity=(nav2, 0.0)), Notes(),
+                            datetime.fromisoformat(d2 + "T15:50:00"), *paths))
+    assert r["flow"]["how"] == "auto-withdrawal" and r["flow"]["amount"] == pytest.approx(-200_000, abs=1)
+
+
 def test_declared_deposit_is_applied(paths):
     """운용자가 입금(SK이노 매도 대금 등)을 기록하면 다음 판단에서 성과 지수에 안 섞인다."""
     hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]

@@ -257,6 +257,19 @@ def test_d5a_member_is_the_declared_design_and_marked_as_exception(league_data):
     assert checked > 50 and held_def > 0 and partial > 0, (checked, held_def, partial)
 
 
+def test_t6c_member_is_the_declared_gen6_design(league_data):
+    """T6c 는 lab_gen6 선언(1406001)의 설계 그대로 — 같은 i3x 에 선언한 배수만 얹는다. 등록일은 선언한 11월 첫 영업일.
+    배수만 다르므로 엔진이 빠져 있는 날(비중 0)은 챔피언과 같아야 한다."""
+    import lab_gen6 as G6
+    t6c = next(m for m in S.MEMBERS if m.name == "T6c")
+    assert t6c.registered == G6.REGISTER_ON
+    assert G6.SPECS6["T6c"] == {"reset": "none", "m_up": 8, "m_down": 4, "m_trend_ma": 250, "m_trend_lag": 20}
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], t6c))
+    i3, x = res["I3"]["w_hist"], res["T6c"]["w_hist"]
+    assert set(i3) == set(x) and all((i3[d] == 0) == (x[d] == 0) for d in i3)
+    assert any(abs(i3[d] - x[d]) > 0.05 for d in i3)              # 그리고 실제로 다르게 행동한 날이 있다
+
+
 def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
     """종목형 팩터 멤버(저베타·퀄리티) — 대형주 데이터는 합성으로 바꿔 끼워 배선만 시험: 같은 출발선, 월말에만 매매,
     주식 비중 0~100%, 매도세 있는 자산으로 취급."""

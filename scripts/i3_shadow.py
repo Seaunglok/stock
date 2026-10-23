@@ -173,6 +173,16 @@ def _b_i3x(spec: str):
     return build
 
 
+def _b_gen6(spec: str):
+    """6세대(lab_gen6 선언 1406001) — 같은 i3x 에 선언한 배수 옵션만 얹는다(다시 구현하지 않는다)."""
+    def build(data, dates):
+        import lab_challengers as CH
+        import lab_gen6 as G6
+        return ((K.BASE, K.CASH),
+                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **G6.SPECS6[spec]), True)
+    return build
+
+
 def _b_d5a(data, dates):
     """5세대 D5a — lab_gen5 선언(c9f5dfd) 그대로: I3 × 남는 돈은 방어 자산 TSMOM. 연구의 현금(153130)만 리그 현금 자리로."""
     import lab_classics as C
@@ -376,6 +386,13 @@ MEMBERS = MEMBERS + (
            "운용자 예외(10-22): 입장 조건 G3(미공개 ≥ I3 −1%p)만 미달 — 규칙 밖 결정으로 입장, 정원 20→25 도 같은 결정",
            "5세대: I3 × 남는 돈은 국고채10년·금·달러 중 12개월 수익 > 0 인 것에 1/3씩 — 학습에서 위험은 I3 와 같고 연 +1.6%p",
            (K.BASE, *_DEF3, K.CASH, KOSPI), std_run(_b_d5a)),
+)
+MEMBERS = MEMBERS + (
+    Member("T6c", "I3 계보", "2026-11-02",
+           "6세대 입장 조건 E1·G2·G3·G6 전부 통과(lab_gen6 선언 1406001 → 측정) — 10월 신규 상한이 차서 11월 등록",
+           "6세대: 낙폭 예산 배수를 KOSPI 250일선 방향으로 — 상승 8 · 그 외 4. 학습 연 13.8%·MDD 18.6%(I3 12.6%·19.8%), "
+           "단 6월 갭 급락 −11.5%(I3 −10.5%)",
+           (K.BASE, K.CASH, KOSPI), std_run(_b_gen6("T6c"))),
 )
 
 

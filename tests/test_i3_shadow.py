@@ -276,6 +276,21 @@ def test_t6c_member_is_the_declared_gen6_design(league_data):
     assert any(abs(i3[d] - x[d]) > 0.05 for d in i3)              # 그리고 실제로 다르게 행동한 날이 있다
 
 
+def test_v7a_member_is_the_declared_gen7_design(league_data):
+    """V7a 는 lab_gen7 선언(ef2d207) 그대로 — T6c 에 브레이크만 얹는다. 등록일은 선언한 11월 첫 영업일.
+    배수만 다르므로 엔진이 빠져 있는 날은 챔피언과 같고, T6c 와 실제로 다르게 행동한 날이 있어야 한다."""
+    import lab_gen6 as G6
+    import lab_gen7 as G7
+    v7a = next(m for m in S.MEMBERS if m.name == "V7a")
+    assert v7a.registered == G7.REGISTER_ON == "2026-11-02"
+    assert G7.SPECS7["V7a"] == {**G6.SPECS6["T6c"], "vol_short": 20, "vol_long": 252, "m_min": 2}
+    t6c = next(m for m in S.MEMBERS if m.name == "T6c")
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], t6c, v7a))
+    i3, t6, x = res["I3"]["w_hist"], res["T6c"]["w_hist"], res["V7a"]["w_hist"]
+    assert all((i3[d] == 0) == (x[d] == 0) for d in i3)
+    assert any(abs(t6[d] - x[d]) > 0.05 for d in t6)
+
+
 def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
     """종목형 팩터 멤버(저베타·퀄리티) — 대형주 데이터는 합성으로 바꿔 끼워 배선만 시험: 같은 출발선, 월말에만 매매,
     주식 비중 0~100%, 매도세 있는 자산으로 취급."""

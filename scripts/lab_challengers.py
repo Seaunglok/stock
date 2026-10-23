@@ -78,6 +78,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         reset_trend_ma: int | None = None, reset_trend_lag: int = 20,
         m_trend_ma: int | None = None, m_trend_lag: int = 20,
         m_up: float | None = None, m_down: float | None = None,
+        vol_short: int | None = None, vol_long: int = 252, m_min: float = 0.0,
         x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
         floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
     """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
@@ -85,6 +86,8 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
     reset_trend_lag 영업일 전보다 높을 때만(장기 하락장에선 손실을 용서하지 않는다).
     m_trend_ma(6세대): 낙폭 예산 배수를 KOSPI 장기선 방향으로 바꾼다 — 올라가면 m_up, 아니면 m_down
     (각각 없으면 m). 지정하지 않으면 m 하나(I3 그대로).
+    vol_short(7세대): 변동성 브레이크 — KOSPI 일간 수익률의 최근 vol_short 일 표준편차가 vol_long 일보다 크면 그 비율만큼
+    배수를 줄인다(배수 × min(1, σ_long/σ_short), 하한 m_min). 조용한 장에선 배수를 늘리지 않는다.
     엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
     days = sorted(bars)
     pos = {d: k for k, d in enumerate(days)}
@@ -92,6 +95,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
     kdays = sorted(kospi)
     kpos = {d: k for k, d in enumerate(kdays)}
     kcl = [kospi[d]["close"] for d in kdays]
+    kret = [0.0] + [kcl[j] / kcl[j - 1] - 1 for j in range(1, len(kcl))]
     out_w = {cash: 1.0} if cash else {}
     eng = {"in": True, "peak": None, "started": False, "entry_i": None}
     st: dict = {"in": True, "navs": [], "w": None, "ref": None, "last_reset": None}
@@ -115,12 +119,25 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
     def long_up(d: str) -> bool:
         return True if reset_trend_ma is None else trend_up(d, reset_trend_ma, reset_trend_lag)
 
+    def sd(k: int, w: int) -> float:
+        xs = kret[k + 1 - w:k + 1]
+        mu = sum(xs) / w
+        return (sum((x - mu) ** 2 for x in xs) / w) ** 0.5
+
     def mult(d: str) -> float:
         if m_trend_ma is None:
-            return m
-        if trend_up(d, m_trend_ma, m_trend_lag):
-            return m if m_up is None else m_up
-        return m if m_down is None else m_down
+            base = m
+        elif trend_up(d, m_trend_ma, m_trend_lag):
+            base = m if m_up is None else m_up
+        else:
+            base = m if m_down is None else m_down
+        if vol_short is not None:
+            k = kpos.get(d)
+            if k is not None and k >= vol_long:                     # 이력이 모자라면 브레이크 없음(그날까지의 값만)
+                s_short, s_long = sd(k, vol_short), sd(k, vol_long)
+                if s_short > 0:
+                    base = max(m_min, base * min(1.0, s_long / s_short))
+        return base
 
     def engine(i: int, d: str):
         k = pos.get(d)

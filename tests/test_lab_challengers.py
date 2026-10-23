@@ -180,6 +180,62 @@ def test_trend_multiplier_scales_budget_only_by_long_trend():
     assert t6c_dn == pytest.approx(base_dn * 4 / 6)
 
 
+def _vol_world(first: float, last: float, switch: int = 380, n: int = 400):
+    """KOSPI 일간 수익률이 ±first 로 흔들리다 switch 일부터 ±last. 자산은 꾸준히 올라 엔진은 계속 보유."""
+    days = [f"{2020 + i // 336}-{1 + (i % 336) // 28:02d}-{1 + i % 28:02d}" for i in range(n)]
+    rets = [0.0] + [(1 if j % 2 else -1) * (first if j < switch else last) for j in range(1, n)]
+    cl, c = [], 1000.0
+    for r in rets:
+        c *= 1 + r
+        cl.append(c)
+    kospi = {d: {"open": v, "close": v} for d, v in zip(days, cl)}
+    bars = {d: {"open": 100.0 + i, "close": 100.0 + i} for i, d in enumerate(days)}
+    return days, bars, kospi, rets
+
+
+def _weight_after_drop(world, drop_day: int, spec: dict) -> float:
+    """drop_day 에 계좌가 1년 최고치의 90% 로 떨어졌을 때의 목표 비중(그 전엔 최고치 그대로)."""
+    days, bars, kospi, _ = world
+    t = C.i3x(bars, kospi, "A", "C", 6, 252, **spec)
+    w = None
+    for i, d in enumerate(days[:drop_day + 1]):
+        r = t(i, d, 100.0 if i < drop_day else 90.0)
+        if r is not None:
+            w = r.get("A", 0.0)
+    return w
+
+
+def test_vol_brake_only_cuts_the_multiplier_when_short_vol_exceeds_long():
+    """★ 7세대 장치 — σ20 > σ252 면 배수 × σ252/σ20(하한 m_min), 조용하거나 흔들림이 가라앉으면 그대로(늘리지 않는다).
+    기댓값은 statistics.pstdev 로 따로 계산한다."""
+    import statistics as stt
+    brake = {"reset": "none", "vol_short": 20, "vol_long": 252, "m_min": 2}
+    plain = {"reset": "none"}
+    cushion = (90.0 - 0.82 * 100.0) / 90.0
+    k = 395
+    calm = _vol_world(0.005, 0.005)
+    assert _weight_after_drop(calm, k, brake) == pytest.approx(_weight_after_drop(calm, k, plain)) == pytest.approx(6 * cushion)
+    settled = _vol_world(0.02, 0.005)                          # 흔들리다 가라앉음 — σ20 < σ252 → 늘리지 않는다
+    assert _weight_after_drop(settled, k, brake) == pytest.approx(6 * cushion)
+    spike = _vol_world(0.005, 0.02)                            # 조용하다 흔들림 — 비율만큼 줄인다
+    rets = spike[3]
+    ratio = stt.pstdev(rets[k - 251:k + 1]) / stt.pstdev(rets[k - 19:k + 1])
+    assert 2 / 6 < ratio < 1
+    assert _weight_after_drop(spike, k, brake) == pytest.approx(6 * ratio * cushion)
+    big = _vol_world(0.005, 0.06)                              # 아주 크게 흔들림 — 하한 2
+    assert _weight_after_drop(big, k, brake) == pytest.approx(2 * cushion)
+
+
+def test_gen7_specs_are_the_declared_numbers():
+    """7세대 선언(lab_gen7) — 20 = 엔진 n, 252 = L, 하한 2 = I2 격자 최솟값. V7a 는 T6c 그대로 + 브레이크."""
+    import lab_dd_control as I
+    import lab_gen6 as G6
+    import lab_gen7 as G7
+    import lab_holdout as H
+    assert G7.BRAKE == {"vol_short": 20, "vol_long": H.I3_DEFAULT[1], "m_min": min(I.I2_GRID)}
+    assert {k: v for k, v in G7.SPECS7["V7a"].items() if k in G6.SPECS6["T6c"]} == G6.SPECS6["T6c"]
+
+
 def test_gen6_specs_are_the_declared_numbers():
     """6세대 선언(lab_gen6) — 숫자는 I3 격자 끝값(8·4)과 R6 장기 추세(250·20), 새 숫자 없음. T6b 는 R6 그대로 + 배수."""
     import lab_gen6 as G6

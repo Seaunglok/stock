@@ -754,7 +754,8 @@ def weekly_table(rec: dict) -> str:
     lines = [f"📊 [I3 리그 주간] {rec['asof']} · 실계좌 {rec['live']['ret']:+.2f}% (시작 {rec['start']})"]
     for i, (n, v) in enumerate(rows, 1):
         w = "-" if v.get("w") is None else f"{v['w']:.0%}"
-        lines.append(f"{i:>2}. {'👑' if n == CHAMPION else ''}{n} {v['ret']:+.2f}% · MDD {v['mdd']:.1f}% · 비중 {w}")
+        lag = f" ({v['asof'][5:]} 기준)" if v.get("asof") and v["asof"] != rec["asof"] else ""   # 데이터가 늦은 멤버
+        lines.append(f"{i:>2}. {'👑' if n == CHAMPION else ''}{n} {v['ret']:+.2f}%{lag} · MDD {v['mdd']:.1f}% · 비중 {w}")
     gone = [n for n, v in rec["models"].items() if "retired" in v]
     if gone:
         lines.append("탈락: " + ", ".join(gone))

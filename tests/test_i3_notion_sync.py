@@ -88,7 +88,25 @@ def test_daily_rows_skip_and_abort_and_dry_run():
     assert rows[1]["판단"] == "판단 중단" and "0.9%" in rows[1]["특이사항"] and rows[1]["매매"] == "🧪 모의 — 주문 미전송"
 
 
-def test_league_text_ranks_from_each_first_value():
+def test_league_text_counts_late_members_from_the_common_start():
+    """★ 10-23 결함 재현 — 출발 다음 날 추가된 멤버(첫 기록이 10-23)도 공통 출발 자산 대비로 잰다.
+    열마다 첫 값을 쓰면 T6c 의 첫날 −0.11% 가 0% 가 되어 챔피언 위로 올라갔다(13위 → 17위로 잘못 표시)."""
+    rows = [{"date": "2026-10-22", "live_nav": "100", "i3_nav": "100", "tsmom_nav": "100", "t6c_nav": ""},
+            {"date": "2026-10-23", "live_nav": "99.97", "i3_nav": "99.89", "tsmom_nav": "102", "t6c_nav": "99.89"}]
+    names = {"i3": N.TRACK, "tsmom": N.DISPLAY["TSMOM"], "t6c": N.DISPLAY["T6c"]}
+    assert (N.league_text(rows, "2026-10-23", names)
+            == "1위 시계열 모멘텀(TSMOM) +2.00% · 방어형 ETF 자동매매(I3) 2위/3 · 실계좌 -0.03%")
+
+
+def test_league_text_ties_below_display_precision():
+    """1원도 안 되는 차이(한미반반 0.57원)는 순위를 가르지 않는다 — 표시(0.01%p)가 같으면 같은 순위."""
+    rows = [{"date": "2026-10-22", "live_nav": "3647503", "i3_nav": "3647503", "한미반반_nav": "3647503"},
+            {"date": "2026-10-23", "live_nav": "3646361", "i3_nav": "3643361", "한미반반_nav": "3643361.5685"}]
+    txt = N.league_text(rows, "2026-10-23", {"i3": N.TRACK, "한미반반": "한미반반"})
+    assert txt.startswith("공동 1위 2개 -0.11%") and "방어형 ETF 자동매매(I3) 1위/2" in txt
+
+
+def test_league_text_ranks_from_the_common_start():
     rows = [{"date": "2026-10-22", "live_nav": "100", "i3_nav": "100", "tsmom_nav": "100", "저베타_nav": ""},
             {"date": "2026-10-23", "live_nav": "101", "i3_nav": "101", "tsmom_nav": "102", "저베타_nav": "100"},
             {"date": "2026-10-24", "live_nav": "102", "i3_nav": "102", "tsmom_nav": "101", "저베타_nav": "105"}]

@@ -336,6 +336,16 @@ def test_summary_line_ranks_members():
     assert line.index("R1") < line.index("👑I3") and "오류 고장" in line
 
 
+def test_weekly_table_marks_members_whose_data_lags():
+    """주간표 — 데이터가 하루 늦은 멤버(종목형)는 '(MM-DD 기준)' 을 단다. 표시가 없으면 0% 가 '오늘 0%' 로 읽힌다."""
+    rec = {"asof": "2026-10-23", "start": "2026-10-22", "live": {"ret": -0.03},
+           "models": {"I3": {"ret": -0.11, "mdd": 0.1, "w": 0.0, "asof": "2026-10-23"},
+                      "추세추종": {"ret": 0.0, "mdd": 0.0, "w": None, "asof": "2026-10-22"}}}
+    lines = S.weekly_table(rec).splitlines()
+    assert any("추세추종 +0.00% (10-22 기준)" in ln for ln in lines)
+    assert not any("I3" in ln and "기준)" in ln for ln in lines)
+
+
 def test_decide_task_runs_league_after_decide_and_keeps_its_exit_code():
     """리그는 판단 뒤에 돌고, 작업 결과 코드는 판단의 것이어야 한다(리그 실패가 판단 실패로 보이면 안 된다)."""
     txt = (_ROOT / "scripts" / "i3_decide.cmd").read_text(encoding="utf-8")

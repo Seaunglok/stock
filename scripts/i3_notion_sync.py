@@ -85,7 +85,10 @@ def _pct(a: float | None, b: float | None) -> float | None:
 # ── 리그 ────────────────────────────────────────────────────────────────────
 def league_text(rows: list[dict], day: str, slug_names: dict[str, str], champion: str = TRACK) -> str | None:
     """shadow_history.csv 의 그날 행 → '1위 X +a% · 방어형 ETF 자동매매(I3) n위/m · 실계좌 +b%'.
-    수익은 각 열의 첫 값 대비. slug_names 는 열 이름 → Notion 표시 이름(champion 도 표시 이름)."""
+    slug_names 는 열 이름 → Notion 표시 이름(champion 도 표시 이름).
+    수익의 기준은 **공통 출발 자산**(첫 live_nav = 실전 시작일 자산) — 리그 멤버는 모두 그날 그 자산으로 출발한다.
+    열마다 첫 값을 기준으로 삼으면 나중에 추가한 멤버(첫 기록이 출발 다음 날)의 첫날 손익이 0 으로 사라진다
+    (10-23 T6c·V7a·D5a 가 −0.11% 인데 0% 로 보여 챔피언 순위가 13 → 17위로 잘못 나온 결함). live_nav 가 없으면 열마다 첫 값."""
     first: dict[str, float] = {}
     today = None
     for r in rows:
@@ -96,17 +99,19 @@ def league_text(rows: list[dict], day: str, slug_names: dict[str, str], champion
             today = r
     if not today:
         return None
+    common = first.get("live_nav")
     rets = {}
     for k, v in today.items():
         if k.endswith("_nav") and k != "live_nav" and v not in ("", None) and first.get(k):
-            rets[slug_names.get(k[:-4], k[:-4])] = (float(v) / first[k] - 1) * 100
+            rets[slug_names.get(k[:-4], k[:-4])] = (float(v) / (common or first[k]) - 1) * 100
     if not rets:
         return None
-    best = max(rets.values())
-    tops = sorted(n for n, r in rets.items() if r >= best - 1e-9)
+    rets = {n: round(r, 2) for n, r in rets.items()}   # 표시 정밀도(0.01%p)로 순위 — 1원 미만 차이가 순위를 가르지 않게
+    best = max(rets.values())                          # (10-23 한미반반이 원 단위 미만 0.57원 많아 챔피언 위로 셌다)
+    tops = sorted(n for n, r in rets.items() if r == best)
     txt = f"1위 {tops[0]} {best:+.2f}%" if len(tops) == 1 else f"공동 1위 {len(tops)}개 {best:+.2f}%"
     if champion in rets:                     # 동률은 같은 순위(첫날처럼 모두 같으면 1위)
-        rank = 1 + sum(r > rets[champion] + 1e-9 for r in rets.values())
+        rank = 1 + sum(r > rets[champion] for r in rets.values())
         txt += f" · {champion} {rank}위/{len(rets)}"
     lv = today.get("live_nav")
     if lv not in ("", None) and first.get("live_nav"):

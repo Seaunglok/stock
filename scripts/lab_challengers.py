@@ -76,11 +76,15 @@ BASE, CASH = "069500", "153130"
 def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookback: int,
         reset: str = "none", tight_x: float | None = None, tight_days: int = 0,
         reset_trend_ma: int | None = None, reset_trend_lag: int = 20,
+        m_trend_ma: int | None = None, m_trend_lag: int = 20,
+        m_up: float | None = None, m_down: float | None = None,
         x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
         floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
     """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
     tight_x: 재진입 후 tight_days 동안 엔진 이탈선(%). reset_trend_ma: 리셋은 KOSPI 의 이 이동평균이
     reset_trend_lag 영업일 전보다 높을 때만(장기 하락장에선 손실을 용서하지 않는다).
+    m_trend_ma(6세대): 낙폭 예산 배수를 KOSPI 장기선 방향으로 바꾼다 — 올라가면 m_up, 아니면 m_down
+    (각각 없으면 m). 지정하지 않으면 m 하나(I3 그대로).
     엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
     days = sorted(bars)
     pos = {d: k for k, d in enumerate(days)}
@@ -98,16 +102,25 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
             return False
         return kcl[k] > sum(kcl[k + 1 - regime_ma:k + 1]) / regime_ma
 
-    def long_up(d: str) -> bool:
-        if reset_trend_ma is None:
-            return True
+    def trend_up(d: str, ma: int, lag: int) -> bool:
+        """KOSPI ma 일선이 lag 영업일 전보다 높은가(그날까지의 값만)."""
         k = kpos.get(d)
-        if k is None or k + 1 < reset_trend_ma + reset_trend_lag:
+        if k is None or k + 1 < ma + lag:
             return False
-        now = sum(kcl[k + 1 - reset_trend_ma:k + 1]) / reset_trend_ma
-        j = k - reset_trend_lag
-        then = sum(kcl[j + 1 - reset_trend_ma:j + 1]) / reset_trend_ma
+        now = sum(kcl[k + 1 - ma:k + 1]) / ma
+        j = k - lag
+        then = sum(kcl[j + 1 - ma:j + 1]) / ma
         return now > then
+
+    def long_up(d: str) -> bool:
+        return True if reset_trend_ma is None else trend_up(d, reset_trend_ma, reset_trend_lag)
+
+    def mult(d: str) -> float:
+        if m_trend_ma is None:
+            return m
+        if trend_up(d, m_trend_ma, m_trend_lag):
+            return m if m_up is None else m_up
+        return m if m_down is None else m_down
 
     def engine(i: int, d: str):
         k = pos.get(d)
@@ -148,7 +161,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         floor = (1 - floor_dd / 100.0) * peak
         if st["ref"] is not None:
             floor = (1 - floor_dd / 100.0) * max(st["navs"][st["ref"]:][-lookback:])
-        e = min(1.0, max(0.0, m * (nav - floor) / nav)) if nav > 0 else 0.0
+        e = min(1.0, max(0.0, mult(d) * (nav - floor) / nav)) if nav > 0 else 0.0
         w = e if st["in"] else 0.0
         if (st["w"] is not None and sig is None and abs(w - st["w"]) < band
                 and not (w == 0.0 and st["w"] > 0)):

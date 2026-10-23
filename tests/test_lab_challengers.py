@@ -138,6 +138,57 @@ def test_trend_condition_refuses_reset_in_long_downtrend():
     assert w_down is not None and w_down == pytest.approx(w_i3) and w_down < 0.9
 
 
+def _reentry_on_same_navs(kospi, spec, regime_ma=None):
+    """I3 로 굴린 같은 자산 경로를 두 판단에 똑같이 넣고, I3 의 첫 재진입일 목표 비중을 비교한다
+    (자산 경로가 같아야 쿠션이 같아 배수만의 효과가 보인다)."""
+    days, bars, _ = TR._scenario()
+    extra = {} if regime_ma is None else {"regime_ma": regime_ma}
+    base = C.i3x(bars, kospi, "A", "C", 6, 252, reset="none", **extra)
+    nav, w, prev, navs, ws = 100.0, 1.0, None, [], []
+    for i, d in enumerate(days):
+        if prev is not None:
+            nav *= 1 + w * (bars[d]["close"] / bars[prev]["close"] - 1)
+        navs.append(nav)
+        r = base(i, d, nav)
+        if r is not None:
+            w = r.get("A", 0.0)
+        ws.append(w)
+        prev = d
+    k = next(i for i in range(1, len(days)) if ws[i - 1] == 0.0 and ws[i] > 0)
+    t = C.i3x(bars, kospi, "A", "C", 6, 252, **spec, **extra)
+    got = None
+    for i, d in enumerate(days[:k + 1]):
+        r = t(i, d, navs[i])
+        if r is not None:
+            got = r.get("A", 0.0)
+    return got, ws[k]
+
+
+def test_trend_multiplier_scales_budget_only_by_long_trend():
+    """★ 6세대 장치 — 장기선이 오르면 배수 m_up(재진입 비중 = I3 × 8/6, 상한 1), 내려가면 I3 그대로(T6a)·
+    m_down(T6c, I3 × 4/6). 배수만 바뀌고 엔진·바닥선은 그대로여야 한다."""
+    days, _, _ = TR._scenario()
+    up = {d: {"open": 1000 + i, "close": 1000 + i} for i, d in enumerate(days)}
+    down = {d: {"open": (3000 - i if i < 240 else 2760 + (i - 240)),
+                "close": (3000 - i if i < 240 else 2760 + (i - 240))} for i, d in enumerate(days)}
+    short = {"m_trend_ma": 50, "m_trend_lag": 10}                 # 시나리오가 짧아 250 대신 50 — 장치만 시험
+    t6a, base = _reentry_on_same_navs(up, {"reset": "none", "m_up": 8, **short})
+    assert base < 0.75 and t6a == pytest.approx(min(1.0, base * 8 / 6))
+    t6a_dn, base_dn = _reentry_on_same_navs(down, {"reset": "none", "m_up": 8, **short}, regime_ma=5)
+    assert t6a_dn == pytest.approx(base_dn) and base_dn > 0
+    t6c_dn, _ = _reentry_on_same_navs(down, {"reset": "none", "m_up": 8, "m_down": 4, **short}, regime_ma=5)
+    assert t6c_dn == pytest.approx(base_dn * 4 / 6)
+
+
+def test_gen6_specs_are_the_declared_numbers():
+    """6세대 선언(lab_gen6) — 숫자는 I3 격자 끝값(8·4)과 R6 장기 추세(250·20), 새 숫자 없음. T6b 는 R6 그대로 + 배수."""
+    import lab_gen6 as G6
+    import lab_holdout as H
+    assert {m for m, _ in H.I3_GRID} >= {G6.M_UP, G6.M_DOWN_C, H.I3_DEFAULT[0]}
+    assert G6.TREND == {"m_trend_ma": C.SPECS["R6"]["reset_trend_ma"], "m_trend_lag": C.SPECS["R6"]["reset_trend_lag"]}
+    assert {k: v for k, v in G6.SPECS6["T6b"].items() if k in C.SPECS["R6"]} == C.SPECS["R6"]
+
+
 def test_once_per_year_reset_refuses_second_forgiveness():
     """★ R3 장치 — 252일 안의 두 번째 재진입은 리셋하지 않는다(연속 휩쏘 차단). 첫 재진입은 R1 과 같다."""
     once, always = _reentry_weights(C.SPECS["R3"]), _reentry_weights(C.SPECS["R1"])

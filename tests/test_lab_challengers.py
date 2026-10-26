@@ -226,6 +226,51 @@ def test_vol_brake_only_cuts_the_multiplier_when_short_vol_exceeds_long():
     assert _weight_after_drop(big, k, brake) == pytest.approx(2 * cushion)
 
 
+def _release_world():
+    """조용하다 380일부터 ±2% 로 흔들리고, 가끔 크게 오르는 날(새 20일 고점 · 20일선 위)이 섞인다."""
+    n = 400
+    days = [f"{2020 + i // 336}-{1 + (i % 336) // 28:02d}-{1 + i % 28:02d}" for i in range(n)]
+    bump = {386: 0.06, 391: 0.03, 395: 0.05}
+    rets = [0.0] + [bump.get(j, (1 if j % 2 else -1) * (0.005 if j < 380 else 0.02)) for j in range(1, n)]
+    cl, c = [], 1000.0
+    for r in rets:
+        c *= 1 + r
+        cl.append(c)
+    kospi = {d: {"open": v, "close": v} for d, v in zip(days, cl)}
+    bars = {d: {"open": 100.0 + i, "close": 100.0 + i} for i, d in enumerate(days)}
+    return days, bars, kospi, cl
+
+
+def test_brake_release_follows_the_recovery_definition_day_by_day():
+    """★ 8세대 장치 — 회복 확인(KOSPI 종가 > 직전 20일 최고 / > 20일선)인 날엔 브레이크가 없는 비중, 아니면 브레이크 비중.
+    기댓값(회복 여부)은 종가 목록으로 따로 계산한다. 20일선 해제가 20일 고점 해제보다 자주 풀려야 한다(속도 대조).
+    매매 밴드(10%p)는 0 으로 — 밴드가 있으면 전날 낸 비중이 남아 배수 장치만의 효과가 흐려진다."""
+    world = _release_world()
+    cl = world[3]
+    brake = {"reset": "none", "vol_short": 20, "vol_long": 252, "m_min": 2, "band": 0.0}
+    plain = {"reset": "none", "band": 0.0}
+    seen = {"high": [0, 0], "ma": [0, 0]}
+    for k in range(382, 400):
+        w_brake, w_free = _weight_after_drop(world, k, brake), _weight_after_drop(world, k, plain)
+        assert w_brake < w_free                                       # 이 구간은 늘 브레이크가 걸릴 만큼 흔들린다
+        rec = {"high": cl[k] > max(cl[k - 20:k]), "ma": cl[k] > sum(cl[k - 19:k + 1]) / 20}
+        for key, opt in (("high", {"brake_off_high": 20}), ("ma", {"brake_off_ma": 20})):
+            got = _weight_after_drop(world, k, {**brake, **opt})
+            assert got == pytest.approx(w_free if rec[key] else w_brake), (k, key)
+            seen[key][rec[key]] += 1
+    assert seen["high"][1] >= 1 and seen["high"][0] >= 1 and seen["ma"][1] > seen["high"][1]
+
+
+def test_gen8_specs_are_the_declared_numbers():
+    """8세대 선언(lab_gen8) — V7a 그대로 + 해제 조건 하나(20 = 엔진의 20일 고점 n)."""
+    import lab_gen7 as G7
+    import lab_gen8 as G8
+    assert G8.RELEASE_N == 20
+    for name, key in (("V8a", "brake_off_high"), ("V8b", "brake_off_ma")):
+        spec = dict(G8.SPECS8[name])
+        assert spec.pop(key) == 20 and spec == G7.SPECS7["V7a"], name
+
+
 def test_gen7_specs_are_the_declared_numbers():
     """7세대 선언(lab_gen7) — 20 = 엔진 n, 252 = L, 하한 2 = I2 격자 최솟값. V7a 는 T6c 그대로 + 브레이크."""
     import lab_dd_control as I

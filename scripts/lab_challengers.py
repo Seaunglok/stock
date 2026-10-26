@@ -79,6 +79,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         m_trend_ma: int | None = None, m_trend_lag: int = 20,
         m_up: float | None = None, m_down: float | None = None,
         vol_short: int | None = None, vol_long: int = 252, m_min: float = 0.0,
+        brake_off_high: int | None = None, brake_off_ma: int | None = None,
         x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
         floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
     """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
@@ -88,6 +89,8 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
     (각각 없으면 m). 지정하지 않으면 m 하나(I3 그대로).
     vol_short(7세대): 변동성 브레이크 — KOSPI 일간 수익률의 최근 vol_short 일 표준편차가 vol_long 일보다 크면 그 비율만큼
     배수를 줄인다(배수 × min(1, σ_long/σ_short), 하한 m_min). 조용한 장에선 배수를 늘리지 않는다.
+    brake_off_high / brake_off_ma(8세대): 회복이 확인된 날엔 브레이크를 걸지 않는다 — KOSPI 종가가 직전 n일 최고 종가보다
+    높을 때(엔진 재진입의 n일 고점과 같은 정의) / n일 이동평균보다 높을 때.
     엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
     days = sorted(bars)
     pos = {d: k for k, d in enumerate(days)}
@@ -124,6 +127,18 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         mu = sum(xs) / w
         return (sum((x - mu) ** 2 for x in xs) / w) ** 0.5
 
+    def recovered(d: str) -> bool:
+        """회복 확인(브레이크 해제) — 그날까지의 KOSPI 종가만."""
+        k = kpos.get(d)
+        if k is None:
+            return False
+        if brake_off_high is not None and k >= brake_off_high and kcl[k] > max(kcl[k - brake_off_high:k]):
+            return True
+        if brake_off_ma is not None and k + 1 >= brake_off_ma and \
+                kcl[k] > sum(kcl[k + 1 - brake_off_ma:k + 1]) / brake_off_ma:
+            return True
+        return False
+
     def mult(d: str) -> float:
         if m_trend_ma is None:
             base = m
@@ -131,7 +146,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
             base = m if m_up is None else m_up
         else:
             base = m if m_down is None else m_down
-        if vol_short is not None:
+        if vol_short is not None and not recovered(d):
             k = kpos.get(d)
             if k is not None and k >= vol_long:                     # 이력이 모자라면 브레이크 없음(그날까지의 값만)
                 s_short, s_long = sd(k, vol_short), sd(k, vol_long)

@@ -223,20 +223,25 @@ def paths(tmp_path):
 
 # ─── 판단 단계 ────────────────────────────────────────────────────────────────
 def test_decide_refuses_before_close(paths):
+    """장 마감 전 수동 실행 — 판단하지 않고, 알림도 보내지 않는다(예약 실행이 아니다)."""
     days = _days()
     today = days[-1]
     now = datetime.fromisoformat(today + "T14:00:00")
-    r = run(LV.phase_decide(FakeMarket(days, today), FakeBroker(), Notes(), now, *paths))
-    assert "skip" in r and not paths[0].exists()
+    notes = Notes()
+    r = run(LV.phase_decide(FakeMarket(days, today), FakeBroker(), notes, now, *paths))
+    assert "skip" in r and not paths[0].exists() and notes.msgs == []
 
 
 def test_decide_skips_when_today_bar_missing(paths):
-    """휴장·미갱신 — 오늘 일봉이 없으면 판단하지 않는다."""
+    """휴장·미갱신 — 오늘 일봉이 없으면 판단하지 않고, '판단 건너뜀'을 일반 알림으로 알린다(운용자 10-26).
+    조용히 건너뛰면 평일 데이터 지연을 모르고 지나가 다음 날 매매도 빠진다."""
     days = _days()
     m = FakeMarket(days[:-1], days[-1])
     now = datetime.fromisoformat(days[-1] + "T15:50:00")
-    r = run(LV.phase_decide(m, FakeBroker(), Notes(), now, *paths))
+    notes = Notes()
+    r = run(LV.phase_decide(m, FakeBroker(), notes, now, *paths))
     assert "skip" in r and not paths[0].exists()
+    assert len(notes.msgs) == 1 and notes.msgs[0][0] is False and "판단 건너뜀" in notes.msgs[0][1]
 
 
 def test_decide_aborts_on_source_mismatch(paths):
@@ -537,6 +542,30 @@ def test_trade_guards(paths, kw, seed_extra, now, reason):
     b = FakeBroker(allow_orders=False)
     r = run(LV.phase_trade(b, Notes(), now, PRICES, *paths, dry_run=False, **kw))
     assert reason in r.get("skip", "")
+
+
+@pytest.mark.parametrize("kw, seed, now, word", [
+    ({}, False, NOW, "매매 없음"),                               # 예약 시간대 · 대기 판단 없음 → 한 줄
+    ({"halt": True}, True, NOW, "매매 정지 중"),                  # 정지 중이면 매일 아침 상기
+    ({"halt": True}, True, datetime(2026, 10, 22, 10, 30), None),  # 시간대 밖 수동 실행 — 조용히
+    ({}, False, datetime(2026, 10, 22, 10, 30), None),
+    ({}, "traded", NOW, None),                                   # 같은 날 두 번째 실행 — 조용히
+])
+def test_morning_notice_only_for_scheduled_quiet_days(paths, kw, seed, now, word):
+    """아침 알림(운용자 10-26) — 할 일이 없거나 정지 중이면 예약 시간대에 일반 알림 한 줄. 수동·재실행엔 울리지 않는다.
+    주문은 어떤 경우에도 나가지 않는다."""
+    if seed == "traded":
+        _seed(paths[0], traded_on="2026-10-22")
+    elif seed:
+        _seed(paths[0])
+    b = FakeBroker(allow_orders=False)
+    notes = Notes()
+    r = run(LV.phase_trade(b, notes, now, PRICES, *paths, dry_run=False, **kw))
+    assert "skip" in r
+    if word is None:
+        assert notes.msgs == []
+    else:
+        assert len(notes.msgs) == 1 and notes.msgs[0][0] is False and word in notes.msgs[0][1]
 
 
 def test_stale_plan_is_dropped(paths):

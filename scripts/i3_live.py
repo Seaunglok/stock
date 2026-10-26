@@ -149,6 +149,9 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     rb, rk = await market.recent(K.BASE), await market.recent("KOSPI")
     if today not in rb or today not in rk:
         log_event("decide_skip", {"reason": "오늘 일봉 없음(휴장·미갱신)"}, events_path)
+        # 운용자(10-26): 조용히 건너뛰면 평일 데이터 지연을 모르고 지나간다 — 휴장일엔 정상이라 일반 알림
+        await notify(f"ℹ️ [I3] {today} 판단 건너뜀 — 오늘 일봉이 없다. 휴장일이면 정상, 평일이면 데이터 미갱신 확인 "
+                     f"필요(이 경우 내일 아침 매매도 없다)")
         return {"skip": "오늘 일봉 없음 — 휴장이거나 데이터 미갱신"}
     for name, lh, rc in (("KODEX200", long_base, rb), ("KOSPI", long_kospi, rk)):
         bad = check_consistency(lh, rc, today)
@@ -255,13 +258,18 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
                       dry_run: bool = True, halt: bool = False, wait_after_open=None,
                       before_check=None, fills_path: Path | None = None) -> dict:
     today = now.strftime("%Y-%m-%d")
+    in_window = TRADE_WINDOW[0] <= now.time() <= TRADE_WINDOW[1]
+    # 아침 알림(운용자 10-26 "1번 2번 다"): 할 일이 없거나 정지 중이어도 예약 시간대엔 한 줄 — 수동 실행엔 울리지 않는다
     if halt:
+        if in_window:
+            await notify(f"⏸️ [I3] {today} 매매 정지 중(I3_HALT=true) — 주문 안 함. 다시 켜려면 .env 에서 false")
         return {"skip": "I3_HALT=true"}
-    if not (TRADE_WINDOW[0] <= now.time() <= TRADE_WINDOW[1]):
+    if not in_window:
         return {"skip": f"매매 시간대({TRADE_WINDOW[0]:%H:%M}~{TRADE_WINDOW[1]:%H:%M}) 밖"}
     st = load_state(state_path)
     plan = st.get("pending")
     if not plan:
+        await notify(f"ℹ️ [I3] {today} 매매 없음 — 대기 중인 판단 없음(전날 판단이 '매매 없음'). 정상")
         return {"skip": "대기 중인 판단 없음"}
     if st.get("traded_on") == today:
         return {"skip": "오늘 이미 매매함"}

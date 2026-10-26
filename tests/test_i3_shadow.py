@@ -313,6 +313,27 @@ def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
                                        for d in r["trade_days"])
 
 
+def test_factor_members_stop_where_stock_data_ends(league_data, monkeypatch):
+    """★ 10-23 결함 — 종목 시세가 KODEX 달력보다 하루 늦으면 그 날까지만 돈다(기준일 = 시세 마지막 날).
+    전엔 오늘 칸을 가격 없이 채워 수익 0·기준일 '오늘'로 보였다. 시세가 출발일 이전에 끝나면 출발선 한 점만."""
+    import backtest_trend_portfolio as P
+    import lab_factors as F
+    days = sorted(d for d in league_data["069500"] if "2023-01-01" <= d <= UPTO)
+    synth = {f"S{i:02d}": {d: {"open": 1000 + i + k * (0.1 + i / 100), "close": 1000 + i + k * (0.1 + i / 100)}
+                           for k, d in enumerate(days[:-1])} for i in range(25)}          # 마지막 날 시세 없음
+    monkeypatch.setattr(P, "_load", lambda *a, **k: (days[:-1], synth, {}, {}))
+    monkeypatch.setattr(F, "load_fund", lambda: {c: {"2022": {"avail": "2023-03-01", "equity": 100 + i,
+                                                              "net_income": 10 + i, "assets": 300, "op_income": 12 + i,
+                                                              "liabilities": 100 - i}} for i, c in enumerate(synth)})
+    members = tuple(m for m in S.MEMBERS if m.name in ("저베타", "퀄리티"))
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, members)
+    for name in ("저베타", "퀄리티"):
+        assert res[name]["curve"][-1][0] == days[-2], name                    # 오늘(UPTO)이 아니라 시세 마지막 날
+    late = S.run_league(league_data, UPTO, 3_640_000.0, UPTO, members)        # 출발일(오늘)에 시세가 아직 없다
+    for name in ("저베타", "퀄리티"):
+        assert late[name]["curve"] == [(UPTO, 3_640_000)], name                # 출발선 한 점 — 오류 아님
+
+
 def test_one_failing_member_does_not_stop_the_league(league_data):
     def boom(*a):
         raise RuntimeError("데이터 없음")

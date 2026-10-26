@@ -325,7 +325,13 @@ def _run_factor(kind: str):
         ends = month_ends_live(sorted(data[K.BASE]))
         inner = (F.bab_target(bars, data[KOSPI], ends) if kind == "BAB"
                  else F.qmj_target(bars, F.load_fund(), ends))
-        dates = _calendar(data, upto)
+        # 종목 시세(FDR 날짜표 기준)는 15:50 에 하루 늦다 — KODEX 달력(오늘까지)으로 돌리면 오늘 칸이 가격 없이 0 이 되고
+        # 기준일만 '오늘'로 보였다(10-23 저베타·퀄리티 0.00%). 시세가 있는 날까지만 돌려 기준일을 정직하게(추세추종과 같게).
+        last = max((max(b) for b in bars.values() if b), default="")
+        dates = [d for d in _calendar(data, upto) if d <= last]
+        if not dates or dates[-1] < start:
+            return {"curve": [(start, round(equity))], "w_hist": {}, "trade_days": [], "nav_hist": {start: equity},
+                    "w": None}
         t = shadow_target(cash_fill(inner), start, equity, needs_nav=False)
         assets = {c: L.Asset(c, b, True) for c, b in bars.items()}
         assets[K.CASH] = L.Asset(K.CASH, data[K.CASH])

@@ -16,6 +16,11 @@ REM Minute bars (Kiwoom keeps only ~900 recent bars - collect daily or lose them
 echo ---- minutes %TIME% >> logs\i3\i3_task.log
 "D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\collect_i3_minutes.py >> logs\i3\i3_task.log 2>&1
 echo minutes_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
+REM Aggressive league (shadow, no orders: ORB + fear buy) - after minutes, since ORB needs today's minute bars.
+REM Does not change RC.
+echo ---- aggr %TIME% >> logs\i3\i3_task.log
+"D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\aggr_shadow.py >> logs\i3\i3_task.log 2>&1
+echo aggr_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
 REM Notion daily records (DB rows only - see docs\notion-guide.md). Last, so it sees decide+league. Does not change RC;
 REM its own check step sends a Telegram alert when the sync did not finish.
 echo ---- notion %TIME% >> logs\i3\i3_task.log

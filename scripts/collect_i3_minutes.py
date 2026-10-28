@@ -22,7 +22,9 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-CODES = ("069500", "488770", "229200")     # KODEX200 · KODEX 머니마켓액티브 · KODEX 코스닥150
+CODES = ("069500", "488770", "229200",     # KODEX200 · KODEX 머니마켓액티브 · KODEX 코스닥150
+         # 공격형 트랙(10-28 운용자 결정 — 양방향·단타): 레버리지 · 200선물인버스2X · 인버스 · 코스닥150 레버리지·선물인버스
+         "122630", "252670", "114800", "233740", "251340")
 OUT_DIR = _ROOT / "data" / "minute"
 SESSION_END = dtime(15, 31)
 MIN_FULL_BARS = 300                         # 정규장 1분봉은 약 381개 — 이보다 크게 적으면 경고(휴장·반일장 제외)

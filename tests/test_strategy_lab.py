@@ -31,6 +31,66 @@ def test_prune_live_cache_keeps_research_dates(tmp_path):
     assert L.prune_live_cache("X", "2026-10-21", tmp_path) == 0          # 연구 기준일 이하로는 아무것도 안 지운다  # noqa: E402
 
 
+def test_prune_also_removes_meta_of_old_live_caches(tmp_path):
+    for n in ("X_2026-10-22.json", "X_2026-10-22.meta.json", "X_2026-10-21.meta.json", "X_2026-10-24.meta.json"):
+        (tmp_path / n).write_text("{}", encoding="utf-8")
+    assert L.prune_live_cache("X", "2026-10-24", tmp_path) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["X_2026-10-21.meta.json", "X_2026-10-24.meta.json"]
+
+
+def _fake_source(first: str, value: float = 1.0):
+    """first 이후 매일 값이 있는 가짜 출처 + 호출 기록."""
+    import datetime as dt
+    calls = []
+
+    def fetch(code, start, end):
+        calls.append(start)
+        d, out = dt.date.fromisoformat(max(start, first)), {}
+        while d.isoformat() <= end:
+            out[d.isoformat()] = {"open": value, "close": value}
+            d += dt.timedelta(days=1)
+        return out
+    return fetch, calls
+
+
+def test_load_bars_extends_cache_when_asked_from_earlier(tmp_path, monkeypatch):
+    """★ 10-29 결함 재현: 2003 부터 받아 둔 캐시를 1998 부터 달라고 하면 예전엔 조용히 2003 부터 줬다."""
+    fetch, calls = _fake_source("1990-01-01")
+    monkeypatch.setattr(L, "_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(L, "_fetch", fetch)
+    a = L.load_bars("^NDX", "2003-01-01", "2003-01-10")
+    assert min(a) == "2003-01-01" and calls == ["2003-01-01"]
+    b = L.load_bars("^NDX", "2002-12-01", "2003-01-10")
+    assert min(b) == "2002-12-01" and calls == ["2003-01-01", "2002-12-01"]     # 다시 받아 앞쪽을 보탰다
+    L.load_bars("^NDX", "2002-12-01", "2003-01-10")
+    L.load_bars("^NDX", "2002-12-20", "2003-01-10")
+    assert len(calls) == 2                                                     # 이미 덮은 범위 — 네트워크 없음
+
+
+def test_load_bars_keeps_cached_values_on_overlap(tmp_path, monkeypatch):
+    """앞쪽만 보탠다 — 겹치는 날은 처음 받은 값 그대로(출처가 나중에 값을 바꿔도 지난 연구가 재현된다)."""
+    monkeypatch.setattr(L, "_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(L, "_fetch", _fake_source("1990-01-01", 1.0)[0])
+    L.load_bars("X", "2003-01-01", "2003-01-05")
+    monkeypatch.setattr(L, "_fetch", _fake_source("1990-01-01", 2.0)[0])
+    r = L.load_bars("X", "2002-12-01", "2003-01-05")
+    assert r["2002-12-01"]["close"] == 2.0 and r["2003-01-03"]["close"] == 1.0
+
+
+def test_load_bars_symbol_that_starts_later_is_fetched_once(tmp_path, monkeypatch):
+    """출처에 더 앞 자료가 없으면(늦은 상장·출처 상한) 한 번 확인하고 meta 로 기억 — 매번 받지 않는다.
+    연휴 여유(COVER_TOL_DAYS) 안의 차이는 다시 받지 않는다."""
+    fetch, calls = _fake_source("2014-07-28")
+    monkeypatch.setattr(L, "_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(L, "_fetch", fetch)
+    L.load_bars("069500", "2014-07-25", "2014-08-10")
+    L.load_bars("069500", "2014-07-20", "2014-08-10")           # 첫 날보다 8일 앞 — 여유 안
+    assert calls == ["2014-07-25"]
+    L.load_bars("069500", "2010-01-01", "2014-08-10")
+    L.load_bars("069500", "2010-01-01", "2014-08-10")
+    assert calls == ["2014-07-25", "2010-01-01"]
+
+
 def _bars(prices: list[tuple[float, float]], start_day: int = 1, month: str = "2020-01") -> dict:
     return {f"{month}-{start_day + i:02d}": {"open": o, "close": c} for i, (o, c) in enumerate(prices)}
 

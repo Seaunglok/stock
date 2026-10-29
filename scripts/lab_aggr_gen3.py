@@ -31,6 +31,24 @@
     · 장기 스트레스(1998~, ^KS11 일간 2배 합성 + ^NDX×원/달러 — 비용·괴리 없는 낙관 쪽) · 미공개(오염) · 월 +10% 달 · 최악 달.
     · 부모 줄: 한미 반반 I3(1배)를 같은 기계(50만원)로 다시 잰 값 · KR 2배 G1 단독.
   통과하면 공격형 리그(그림자)에 등록. 떨어지면 같은 숫자로 다시 재지 않는다.
+
+구현 수정(10-29, 첫 측정 직후 — 보고 항목만, 판정 숫자 불변): 장기 스트레스가 실제로는 2003-12 부터였다.
+  ① strategy_lab.load_bars 캐시가 시작일을 무시(lab_asset_compare 가 2003 부터 받아 둔 ^NDX 를 그대로 줬다 — 로더 수정)
+  ② FDR USD/KRW 는 2003-12 부터 → 환율을 FRED DEXKOUS(1990~)로. 닷컴 붕괴가 들어가야 '1998~'이다(assert 로 잠금).
+
+결과 (c516e22 선언대로, 기준 수정 없음) — **HH1·HH2 둘 다 탈락**
+                  연수익   MDD   박스권  강세장  3년최악 | 장기(1998~) MDD · 30%사건 · 3년최악 | 세후≈
+  한미반반 I3     12.94%  12.0%   5.7%  16.3%  +15.8%
+  G1(한국 2배)    17.64%  33.1%   7.6%  22.4%  −19.9%
+  HH1 기본        16.53%  18.7%   6.8%  21.2%   +9.7% | 26.4% · 0회 · −24.6% | 15.5%  P1·P4 O, P2·P3·P5 X
+  HH2 기본        20.82%  20.9%   8.8%  26.6%  +12.2% | 58.0% · 1회 · −55.3% | 19.2%  P1·P3·P4 O, P2(−0.93%p)·P5 X
+  HH1 격자(연수익/MDD): 13.6/12 · 15.0/15 · 16.8/15 · 15.6/15 · 16.5/19 · 19.2/22 · 16.6/19 · 19.5/22 · 21.3/25
+진단(판정에 안 씀):
+  ① **줄이 올라갔다** — HH1 격자의 연수익÷MDD 0.85~1.13(2세대 G1 0.5~0.65). 다른 자산이 줄 자체를 올린다는 가설은 맞았다.
+  ② **처음으로 P4(롤링 3년 > 0)를 넘었다**(2015~2026) — 하지만 1998~ 장기에선 HH1 −24.6% — 2000~2002·2008 을 겪으면 못 넘는다.
+  ③ **HH2 는 나스닥 호황의 산물** — 미국 쪽을 그냥 들면 2015~2026 은 좋지만 닷컴이 다시 오면 MDD 58%. 미국 쪽 엔진은 필요하다.
+  ④ 남은 약점은 수익(HH1 16.5% < 21.75%). 더 높은 (m, f) 가 격자 끝(21.3%/25%)에 보이지만, 그걸 보고 기본값을 옮기는 건
+    결과 보고 고르기다 — 같은 자료로는 안 한다. 미국 2배 ETF(2021-12~)는 이력이 짧아 앞으로의 기록으로만 잴 수 있다.
 """
 from __future__ import annotations
 
@@ -59,6 +77,7 @@ GRID, DEFAULT = G2.GRID, G2.DEFAULT
 SIDE_COST = (C.FEE_BPS + C.SLIPPAGE_BPS) / 10_000.0
 US_TAX = 0.154
 REF_EQUITY = 3_650_000.0              # 보고만 — 계좌 전체로 잰 값(정수 주식수 영향 비교)
+FX_LONG = "FRED:DEXKOUS"              # 장기 스트레스 환율(1990~) — 10-29 구현 수정, 보고 항목이라 판정 무관
 
 
 def combine(a: L.SimResult, b: L.SimResult, side_cost: float = SIDE_COST) -> L.SimResult:
@@ -110,12 +129,28 @@ def after_tax_cagr(total: L.SimResult, us: L.SimResult) -> float:
     return full - US_TAX * 0.5 * max(0.0, us_c)
 
 
+def krw_ndx_long(ks: dict) -> dict[str, dict]:
+    """^NDX(1990~) × 원/달러 — 한국 영업일에 맞춰 직전 값으로 채움. 환율은 FRED DEXKOUS(1990~):
+    FDR 의 USD/KRW 는 2003-12 부터라 닷컴 붕괴(2000~2002)가 빠진다(10-29 발견)."""
+    ix = L.load_bars("^NDX", "1990-01-01", A.END)
+    fx = L.load_bars(FX_LONG, "1990-01-01", A.END)
+    out, li, lf = {}, None, None
+    for d in sorted(ks):
+        if d in ix:
+            li = ix[d]["close"]
+        if d in fx:
+            lf = fx[d]["close"]
+        if li and lf:
+            out[d] = {"open": li * lf, "close": li * lf}
+    return out
+
+
 def run_long(spec: str, p: tuple) -> dict:
     """장기 스트레스(보고만) — 한국 = ^KS11 일간 2배 합성(G1 규칙), 미국 = ^NDX × 원/달러(1배). 현금 이자 0."""
-    import lab_asset_compare as AC
     ks = L.load_bars("^KS11", "1996-01-01", A.END)
-    ndx = AC.krw_index("^NDX", ks)
+    ndx = krw_ndx_long(ks)
     dates = [d for d in L.calendar(ks, *I.LONG_STRESS) if d in ndx]
+    assert dates and dates[0] <= "1998-01-31", f"장기 스트레스가 {dates[0] if dates else '-'} 부터 — 닷컴 구간이 빠졌다"
     kr = L.simulate({"UP": L.Asset("UP", L.leveraged_bars(ks, 2.0))}, dates,
                     G2.make_target("G1", p, ks, ks, "UP", None), 0.0, pass_nav=True)
     us = L.simulate({"US": L.Asset("US", ndx)}, dates, us_target(US_MODE[spec], ndx, "US", None), 0.0, pass_nav=True)

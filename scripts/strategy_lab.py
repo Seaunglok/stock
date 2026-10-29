@@ -74,30 +74,64 @@ _CACHE_DIR = _ROOT / "docs_cache" / "lab"
 
 
 # ── 데이터 ───────────────────────────────────────────────────────────────────
+COVER_TOL_DAYS = 10             # 요청 시작일이 캐시 첫 날보다 이만큼 넘게 이르면 '덜 받은 캐시'로 본다(연휴 여유)
+
+
+def _fetch(code: str, start: str, end: str) -> dict[str, dict]:
+    """FDR 일봉 → {date: {open, close}}. 시가가 0 이거나 없는 행(초기 지수 데이터)은 종가로 대체한다 —
+    다음 날 시가 체결이 0원이 되면 수량이 무한대가 된다."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(code, start, end)
+    col = "Close" if "Close" in df.columns else df.columns[0]      # FRED 시계열은 열이 하나(예: DEXKOUS)
+    rows = {}
+    for d, r in df.iterrows():
+        c = float(r[col])
+        if not c == c or c <= 0:
+            continue
+        o = float(r.get("Open", c) or c)
+        rows[d.strftime("%Y-%m-%d")] = {"open": o if o == o and o > 0 else c, "close": c}
+    return rows
+
+
+def _write_json(path: Path, obj) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    tmp.replace(path)
+
+
 def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31") -> dict[str, dict]:
-    """{date: {open, close}} — FDR, 디스크 캐시(같은 code·end 재호출 시 네트워크 없음).
+    """{date: {open, close}} — FDR, 디스크 캐시(같은 code·end·더 늦은 시작 재호출 시 네트워크 없음).
 
     ⚠️ KRX 지수 심볼(KS11)은 인증 요구로 실패한다 — `^KS11`(캐럿) 을 쓸 것(backtest_dynamic 과 같음).
-    시가가 0 이거나 없는 행(초기 지수 데이터)은 종가로 대체한다 — 다음 날 시가 체결이 0원이 되면
-    수량이 무한대가 된다.
+
+    캐시는 (종목, 종료일)별 한 파일 + `.meta.json` 의 fetched_from(어디부터 받았나). 요청 시작일이 그보다
+    이르면 다시 받아 **앞쪽 날만 보탠다** — 겹치는 날은 캐시 값을 그대로 둔다(지난 연구 재현성).
+    (2026-10-29 결함: 파일 이름에 시작일이 없어, lab_asset_compare 가 2003 부터 받아 둔 ^NDX·USD/KRW 를
+    '1998~ 장기 스트레스'가 조용히 2003-12 부터 썼다. meta 가 없는 옛 캐시는 첫 날을 fetched_from 으로 본다.)
     """
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    safe = code.replace("^", "IDX_").replace("/", "_")
+    safe = code.replace("^", "IDX_").replace("/", "_").replace(":", "_")      # 'FRED:…' — 윈도 파일 이름에 ':' 불가
     path = _CACHE_DIR / f"{safe}_{end}.json"
+    meta = _CACHE_DIR / f"{safe}_{end}.meta.json"
     if path.exists():
         rows = json.loads(path.read_text(encoding="utf-8"))
+        covered = (json.loads(meta.read_text(encoding="utf-8"))["fetched_from"] if meta.exists()
+                   else min(rows, default=end))
+        from datetime import date, timedelta
+        if start < covered and \
+                date.fromisoformat(start) + timedelta(days=COVER_TOL_DAYS) < date.fromisoformat(covered[:10]):
+            more = _fetch(code, start, end)
+            earlier = {d: v for d, v in more.items() if d not in rows}
+            if earlier:
+                rows = {**earlier, **rows}
+                rows = {d: rows[d] for d in sorted(rows)}
+                _write_json(path, rows)
+            _write_json(meta, {"fetched_from": start})
     else:
-        with contextlib.redirect_stdout(io.StringIO()):
-            import FinanceDataReader as fdr
-            df = fdr.DataReader(code, start, end)
-        rows = {}
-        for d, r in df.iterrows():
-            c = float(r["Close"])
-            if not c == c or c <= 0:
-                continue
-            o = float(r.get("Open", c) or c)
-            rows[d.strftime("%Y-%m-%d")] = {"open": o if o == o and o > 0 else c, "close": c}
-        path.write_text(json.dumps(rows), encoding="utf-8")
+        rows = _fetch(code, start, end)
+        _write_json(path, rows)
+        _write_json(meta, {"fetched_from": start})
         prune_live_cache(safe, end)
     return {d: v for d, v in rows.items() if start <= d <= end}
 
@@ -108,7 +142,7 @@ def prune_live_cache(prefix: str, keep_end: str, cache_dir: Path | None = None) 
     import re
     if keep_end <= HOLDOUT[1]:
         return 0
-    pat = re.compile(rf"^{re.escape(prefix)}_(\d{{4}}-\d{{2}}-\d{{2}})\.json$")
+    pat = re.compile(rf"^{re.escape(prefix)}_(\d{{4}}-\d{{2}}-\d{{2}})(?:\.meta)?\.json$")
     gone = 0
     for p in (cache_dir or _CACHE_DIR).glob(f"{prefix}_*.json"):
         m = pat.match(p.name)

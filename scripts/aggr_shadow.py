@@ -6,7 +6,9 @@ I3 리그(i3_shadow)와 따로 둔다 — I3 리그는 입장 조건(E1~E3)·정
 
   멤버  ORB-B1 · ORB-B2 (lab_orb 5분 시가 범위 돌파, 10-29 부터 저장 분봉으로)
         FEAR-V1 · FEAR-V2 · FEAR-K1 · FEAR-K2 (lab_fear 공포 매수, 10-28 종가 판단 → 10-29 시가 첫 체결)
-  조건  모두 50만원 출발. 판정은 각 lab 의 선언(ORB: 60영업일 누적>0·MDD≤30% / FEAR: lab_fear.verdict).
+        HH1 (lab_aggr_gen3 한미 반반 × 한국 2배 — **운용자 예외**(10-29 "넣어줘"), 10-29 종가 판단 → 10-30 시가 첫 체결)
+  조건  모두 50만원 출발. 판정은 각 lab 의 선언(ORB: 60영업일 누적>0·MDD≤30% / FEAR: lab_fear.verdict /
+        HH1: ORB 와 같은 60영업일·누적>0·MDD≤30% — 입장 조건 P2·P3·P5 미달을 알고 넣었으니 앞으로의 기록만이 근거).
 
 - **주문과 무관하다.** i3_decide.cmd 가 분봉 수집 뒤 실행(ORB 는 그날 분봉이 있어야 한다) — 실패해도 실전 판단·
   매매·I3 리그에 영향 없다. 멤버 하나가 실패해도 나머지는 기록한다.
@@ -40,8 +42,14 @@ AFTER_CLOSE = dtime(15, 35)
 EQUITY = F.F_EQUITY
 STOP_PCT = F.F_MAX_MDD_PCT
 KOSPI, VIX = "^KS11", "^VIX"
-DAILY = (F.BASE, F.LONGS["2"], F.CASH)
-MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS
+NDQ = "133690"
+DAILY = (F.BASE, F.LONGS["2"], F.CASH, NDQ)
+HH_START = "2026-10-29"
+EXCEPTIONS = {   # 입장 조건 밖으로 들어온 멤버 — 운용자 결정만(I3 리그 INTAKE_EXCEPTIONS 와 같은 방식)
+    "HH1": "운용자 예외(10-29): '넣어줘' — 3세대 P2(연 16.5% < 21.75%)·P3·P5 미달. 연수익÷MDD 0.85~1.13 · "
+           "P4(롤링 3년 > 0) 첫 통과라 앞으로의 기록으로 본다. 1998~ 장기 MDD 26.4%·3년 최악 −24.6% 를 알고 넣음",
+}
+MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS + ("HH1",)
 
 
 # ── 멤버 실행 ────────────────────────────────────────────────────────────────
@@ -65,6 +73,27 @@ def orb_verdict(curve: list[tuple[str, float]]) -> dict:
     mdd = L.metrics([d for d, _ in curve], vals)["mdd"]
     checks = {"누적>0": vals[-1] > vals[0], f"MDD≤{B.B_MAX_MDD_PCT:g}%": mdd <= B.B_MAX_MDD_PCT}
     return {"judged": True, "pass": all(checks.values()), "checks": checks}
+
+
+def hh1_run(px: dict, upto: str, equity: float = EQUITY, start: str = HH_START) -> dict:
+    """HH1 — lab_aggr_gen3 선언 기본 그대로: 한국 절반 = G1(122630, KODEX200·KOSPI 로 판단, m 3·바닥 30%),
+    미국 절반 = 나스닥100 I3(자기 120일선), 매년 첫 거래일 50:50 재조정(비용 차감). 현금 자리는 머니마켓(리그 공통).
+    엔진·예산은 i3_shadow.std_run 으로 과거부터 재생하고 start 일에 새로 출발(I3 리그 한미반반과 같은 기계)."""
+    import i3_shadow as SH
+    import lab_aggr_gen2 as G2
+    import lab_aggr_gen3 as G3
+
+    def kr(d, dates):
+        return (G3.LEV2, F.CASH), G2.make_target("G1", G3.DEFAULT, d[F.BASE], d[KOSPI], G3.LEV2, F.CASH), True
+
+    def us(d, dates):
+        return (NDQ, F.CASH), G3.us_target("i3", d[NDQ], NDQ, F.CASH), True
+    if upto < start:
+        return {"curve": [], "w_kr": None, "w_us": None}
+    a, b = SH.std_run(kr)(px, start, equity / 2, upto), SH.std_run(us)(px, start, equity / 2, upto)
+    r = G3.combine(L.SimResult(dates=[d for d, _ in a["curve"]], curve=[v for _, v in a["curve"]]),
+                   L.SimResult(dates=[d for d, _ in b["curve"]], curve=[v for _, v in b["curve"]]))
+    return {"curve": list(zip(r.dates, r.curve)), "w_kr": a["w"], "w_us": b["w"]}
 
 
 def _record(curve: list[tuple[str, float]], equity: float) -> dict:
@@ -102,6 +131,13 @@ def run_members(px: dict, upto: str, equity: float = EQUITY, replay=B.replay) ->
                          "verdict": F.verdict(r["curve"], r["held"], px[F.BASE], r["dates"])}
         except Exception as e:      # noqa: BLE001
             out[name] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        r = hh1_run(px, upto, equity)
+        today = (None if r["w_kr"] is None else f"한국2배 {r['w_kr']:.0%}·나스닥 {r['w_us']:.0%}")
+        out["HH1"] = {**_record(r["curve"], equity), "today": today, "exception": EXCEPTIONS["HH1"],
+                      "verdict": orb_verdict(r["curve"])}
+    except Exception as e:          # noqa: BLE001
+        out["HH1"] = {"error": f"{type(e).__name__}: {e}"}
     return out
 
 

@@ -42,7 +42,7 @@ def test_declared_constants_reuse_downside_defaults():
     assert F.LONGS == {"1": "069500", "2": "122630"} and F.CASH == "488770"
     assert (F.ANCHOR, F.F_EQUITY, F.F_JUDGE_DAYS, F.F_MIN_HELD, F.F_MAX_MDD_PCT) == \
         ("2026-10-28", 500_000.0, 60, 20, 30.0)
-    assert S.MEMBERS == ("ORB-B1", "ORB-B2") + F.MEMBERS and S.STOP_PCT == 30.0
+    assert S.MEMBERS == ("ORB-B1", "ORB-B2") + F.MEMBERS + ("HH1",) and S.STOP_PCT == 30.0
 
 
 def test_fear_buys_next_open_and_exits_when_fear_ends():
@@ -102,6 +102,24 @@ def test_summary_before_start_shows_tomorrow_plan():
            "models": {"FEAR-K1": {"ret": 0.0, "on_today": True}, "FEAR-V1": {"ret": 0.0, "on_today": False}}}
     line = S.summary_line(rec)
     assert "기록 준비" in line and "FEAR-K1 매수" in line and "FEAR-V1" not in line.split("내일 시가:")[1]
+
+
+def test_hh1_is_an_operator_exception_member():
+    assert "HH1" in S.MEMBERS and S.HH_START == "2026-10-29"
+    assert "운용자 예외" in S.EXCEPTIONS["HH1"] and set(S.EXCEPTIONS) == {"HH1"}      # 예외는 운용자 결정 건만
+
+
+def test_hh1_starts_fresh_on_start_day_and_holds_both_halves():
+    """엔진·예산은 과거부터 재생하고 start 일에 50만원으로 새로 출발 — 다음 날 시가에 한국 2배 90%·나스닥 100% 체결."""
+    days = _days("2026-08-01", 100)
+    rise = {d: {"open": 100.0 + k, "close": 100.0 + k} for k, d in enumerate(days)}
+    flat = {d: {"open": 100.0, "close": 100.0} for d in days}
+    px = {F.BASE: rise, F.LONGS["2"]: rise, S.NDQ: rise, F.CASH: flat, "^KS11": rise}
+    start, upto = "2026-10-29", days[-1]
+    r = S.hh1_run(px, upto, 500_000, start)
+    assert r["curve"][0] == (start, 500_000) and r["curve"][-1][1] > 500_000
+    assert abs(r["w_kr"] - 0.9) < 1e-9 and r["w_us"] == 1.0                     # 한국 3 × 30% · 나스닥 min(1, 6 × 18%)
+    assert S.hh1_run(px, "2026-10-28", 500_000, start)["curve"] == []            # 시작 전엔 기록 없음
 
 
 def test_decide_task_runs_aggr_league_after_minutes_and_keeps_decide_exit_code():

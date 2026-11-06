@@ -137,6 +137,42 @@ def test_notion_row_needs_close_and_uses_full_names():
     assert "VIX" not in [k for k in r if k == "VIX"]                       # 줄임말 단독 속성 없음
 
 
+def test_prev_trading_day_uses_exchange_calendar():
+    days = ["2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09"]
+    assert M.prev_trading_day("2026-11-09", days) == "2026-11-06"           # 주말 건너뜀
+    assert M.prev_trading_day("2026-11-10", days) == "2026-11-09"
+    assert M.prev_trading_day("2026-11-04", days) is None
+
+
+def test_notion_row_ignores_preliminary_flows():
+    morning, close = _day_rec()
+    prelim_only = {k: v for k, v in close.items() if k not in ("kospi", "program")}
+    prelim_only["flows_prelim"] = {"kospi": close["kospi"], "program": close["program"]}
+    assert M.notion_row("2026-11-06", {"morning": morning, "close": prelim_only}) is None   # 잠정치로 행을 만들지 않는다
+
+
+def test_fill_final_flows_writes_prev_day_and_heals_recent_gaps(tmp_path, monkeypatch):
+    """전 거래일엔 파일이 없어도 만들고, 그 전 날은 '일지 파일이 있는데 확정 수급이 빠진 날'만 다시 채운다."""
+    import asyncio
+    tds = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]
+    monkeypatch.setattr(M, "_trading_days", lambda day: tds)
+    calls = []
+
+    async def fake(d):
+        calls.append(d)
+        return {"kospi": {**M.index_flows([KOSPI_ROW]), "지수": float(d[-2:])}, "kospi_nxt": None, "kosdaq": None,
+                "program": None}
+    monkeypatch.setattr(M, "fetch_flows", fake)
+    M.save_section("2026-11-04", "close", {"news": [], "dart": []}, tmp_path)               # 확정 수급 빠짐 → 다시 채움
+    M.save_section("2026-11-05", "close", {"kospi": {"지수": 1.0}}, tmp_path)              # 이미 있음 → 건드리지 않음
+    prev, errs = asyncio.run(M.fill_final_flows("2026-11-09", datetime(2026, 11, 9, 8, 30), tmp_path))
+    assert prev == "2026-11-06" and errs == [] and sorted(calls) == ["2026-11-04", "2026-11-06"]
+    assert M.load_day("2026-11-04", tmp_path)["close"]["news"] == []                         # 덧쓰기 — 뉴스는 그대로
+    assert M.load_day("2026-11-04", tmp_path)["close"]["kospi"]["지수"] == 4.0
+    assert M.load_day("2026-11-05", tmp_path)["close"]["kospi"] == {"지수": 1.0}
+    assert not (tmp_path / "2026-11-03.json").exists()                                         # 일지 없던 날은 만들지 않음
+
+
 def test_decide_task_runs_journal_before_notion_and_keeps_decide_exit_code():
     """Notion 단계가 그날 시장 일지 행을 넣으려면 장 마감 수집이 먼저 끝나야 한다. 실패해도 판단 결과 코드는 그대로."""
     txt = (_ROOT / "scripts" / "i3_decide.cmd").read_text(encoding="utf-8")

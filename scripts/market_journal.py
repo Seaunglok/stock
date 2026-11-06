@@ -7,16 +7,19 @@
 '그날 아침에 알 수 있었던 뉴스'는 시점이 흐려진다(11-05 반도체 급락을 S&P500·나스닥만 보고 놓친 일). 이 자료로 전략을
 만들 때는 지금처럼 **사전 선언 + 앞으로의 기록**으로만 검증한다.
 
-  morning  평일 08:30(예약작업 MarketJournalMorning) — 밤사이 해외(S&P500·나스닥·필라델피아 반도체·VIX·미국 10년물·
-           원/달러) · 밤사이 뉴스(전날 15:30~) · 다가오는 일정 → data/market_journal/YYYY-MM-DD.json 의 morning
-           + 텔레그램 아침 요약(어제 한국 수급 포함)
-  close    평일 판단 배치(i3_decide.cmd)에서 공격형 리그 뒤 — 시장 수급(ka10051 종합 지수 투자자별 순매수 · ka90010 프로그램
-           매매·선물 베이시스) · 오늘 뉴스(08:30~) · DART 주요사항보고 → close. Notion 1행은 i3_notion 파이프라인이 넣는다.
+  morning  평일 08:30(예약작업 MarketJournalMorning) — ① 전 거래일 **확정** 수급(ka10051 종합 지수 투자자별 순매수 KRX·
+           대체거래소 · ka90010 프로그램 매매·선물 베이시스)을 그날 파일 close 에 ② 밤사이 해외(S&P500·나스닥·필라델피아
+           반도체·VIX·미국 10년물·원/달러) · 밤사이 뉴스(전 거래일 15:30~) · 다가오는 일정 → 오늘 파일 morning
+           ③ 텔레그램 아침 요약(전 거래일 확정 수급 포함)
+  close    평일 판단 배치(i3_decide.cmd)에서 공격형 리그 뒤 — 오늘 뉴스(08:30~) · DART 주요사항보고 · **잠정** 수급
+           (flows_prelim) → 오늘 파일 close. Notion 1행은 i3_notion 파이프라인이 넣는다 — 확정 수급이 들어온 뒤라
+           **하루 늦게**(D 의 행은 D+1 15:5x 에).
 
 - 실패해도 실전·리그에 영향 없다. 한 묶음이 실패해도 나머지는 기록하고 errors 에 남긴다.
 - 원자료를 그대로 남긴다(뉴스 제목·링크·시각, API 원값 + 단위). 요약은 규칙(키워드별 건수·대표 제목)만.
-- 단위: ka10051 금액 = 억원(11-06 투자자 합 ≈ 0 · 같은 날 프로그램 매매 −1.48조와 크기가 맞아 추정, 뉴스 대조 예정),
-  ka90010 금액 = 백만원.
+- 수급 기준·단위(11-06 기사와 대조해 확정): ka10051 금액 = **억원**, 기준은 **KRX**(stex_tp 1 — 보도와 같다, 기관 +1.71조 일치).
+  통합(3) = KRX + 대체거래소(2). 15:55 값은 시간외 거래 전 잠정치(외국인 잠정 −2.77조 ↔ 확정 −2.69조)라 확정치는 다음 날
+  아침에 받는다. 지난 날짜도 받을 수 있다(2010-01-04 까지 확인). ka90010 금액 = 백만원.
 """
 from __future__ import annotations
 
@@ -230,9 +233,10 @@ def _level_of(ov: dict, sym: str):
 
 
 def notion_row(day: str, rec: dict) -> dict | None:
-    """Notion 시장 일지DB 한 행 — 장 마감 수급(close.kospi)이 있는 날만. Notion 쪽은 '없는 행만 추가'라 반쪽 행을 넣으면
-    나중에 채워지지 않는다(수급 조회 실패는 run_close 가 텔레그램으로 알린다). 속성 이름은 Notion 줄임말 규칙
-    (「풀네임(줄임말)」)을 따른다. 값이 없으면 넣지 않는다."""
+    """Notion 시장 일지DB 한 행 — **확정** 수급(close.kospi, 다음 날 아침 fill_final_flows)이 들어온 날만. Notion 쪽은
+    '없는 행만 추가'라 잠정치나 반쪽 행을 넣으면 나중에 고쳐지지 않는다(잠정 flows_prelim 은 쓰지 않는다). 확정 수급이
+    빠진 날은 다음 아침들이 최근 10거래일을 다시 채운다. 속성 이름은 Notion 줄임말 규칙(「풀네임(줄임말)」)을 따른다.
+    값이 없으면 넣지 않는다."""
     close, morning = rec.get("close"), rec.get("morning") or {}
     if not close or not close.get("kospi"):
         return None
@@ -291,9 +295,21 @@ def save_section(day: str, section: str, data: dict, journal_dir: Path = JOURNAL
     return p
 
 
+def update_section(day: str, section: str, patch: dict, journal_dir: Path = JOURNAL_DIR) -> Path:
+    """그날 파일의 한 묶음에 키 몇 개만 덧쓴다(나머지 키는 그대로) — 다음 날 아침 확정 수급을 전 거래일 close 에 넣을 때."""
+    cur = load_day(day, journal_dir).get(section) or {}
+    return save_section(day, section, {**cur, **patch}, journal_dir)
+
+
 def prev_journal_day(day: str, journal_dir: Path = JOURNAL_DIR) -> str | None:
     days = sorted(p.stem for p in journal_dir.glob("????-??-??.json") if p.stem < day)
     return days[-1] if days else None
+
+
+def prev_trading_day(day: str, trading_days) -> str | None:
+    """day 보다 앞선 마지막 거래일 — 거래소 달력(KODEX200 일봉 날짜)으로. 평일 휴장일을 거래일로 착각하지 않게."""
+    ds = [d for d in trading_days if d < day]
+    return max(ds) if ds else None
 
 
 # ── 수집(네트워크) ────────────────────────────────────────────────────────────
@@ -377,20 +393,26 @@ async def fetch_dart(day: str) -> list[dict]:
              "rcept_no": x.get("rcept_no")} for x in j.get("list", [])]
 
 
-async def fetch_flows(day: str) -> tuple[dict | None, dict | None, dict | None]:
-    """키움 직접 호출(조회만) — ka10051 코스피·코스닥 종합 투자자별 순매수 · ka90010 프로그램 매매 일자별."""
+async def fetch_flows(day: str) -> dict:
+    """키움 직접 호출(조회만) — 그날(base_dt) 종합 지수 투자자별 순매수(ka10051)와 프로그램 매매(ka90010).
+    kospi·kosdaq = **KRX**(stex_tp 1 — 보도와 같은 기준), kospi_nxt = 대체거래소(2). 통합(3) = 둘의 합이라 따로 받지 않는다.
+    지난 날짜도 확정치를 준다(2010-01-04 까지 확인, 11-06)."""
     from src.mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client import KiwoomRESTAPIClient
     c = KiwoomRESTAPIClient()
     d = day.replace("-", "")
+
+    async def ix(mrkt: str, stex: str):
+        r = await c.call_api("ka10051", {"mrkt_tp": mrkt, "amt_qty_tp": "0", "base_dt": d, "stex_tp": stex})
+        return index_flows(r.get("inds_netprps") or [])
     try:
-        kp = await c.call_api("ka10051", {"mrkt_tp": "0", "amt_qty_tp": "0", "base_dt": d, "stex_tp": "3"})
-        kq = await c.call_api("ka10051", {"mrkt_tp": "1", "amt_qty_tp": "0", "base_dt": d, "stex_tp": "3"})
-        pg = await c.call_api("ka90010", {"date": d, "amt_qty_tp": "1", "mrkt_tp": "P00101", "min_tic_tp": "0", "stex_tp": "1"})
+        out = {"kospi": await ix("0", "1"), "kospi_nxt": await ix("0", "2"), "kosdaq": await ix("1", "1")}
+        pg = await c.call_api("ka90010", {"date": d, "amt_qty_tp": "1", "mrkt_tp": "P00101", "min_tic_tp": "0",
+                                          "stex_tp": "1"})
+        out["program"] = program_flows(pg.get("prm_trde_trnsn") or [], day)
     finally:
         if hasattr(c, "close"):
             await c.close()
-    return (index_flows(kp.get("inds_netprps") or []), index_flows(kq.get("inds_netprps") or []),
-            program_flows(pg.get("prm_trde_trnsn") or [], day))
+    return out
 
 
 def _err(e: Exception) -> str:
@@ -409,10 +431,42 @@ def morning_since(day: str, prev: str | None) -> datetime:
     return datetime.fromisoformat(f"{base} {MORNING_FROM}")
 
 
+def _trading_days(day: str) -> list[str]:
+    """거래소 달력 — KODEX200 일봉 날짜(FDR). 아침엔 오늘 봉이 없다."""
+    import strategy_lab as L
+    return sorted(L.load_bars("069500", (date.fromisoformat(day) - timedelta(days=40)).isoformat(), day))
+
+
+async def fill_final_flows(day: str, now: datetime, journal_dir: Path = JOURNAL_DIR) -> tuple[str | None, list[str]]:
+    """전 거래일 확정 수급을 그날 파일의 close 에 넣는다 + 최근 10거래일 중 **일지 파일이 있는데** 확정 수급이 빠진 날도
+    다시 채운다(하루 실패해도 다음 아침이 메운다 — Notion 행은 확정 수급이 들어온 뒤에 생긴다). → (전 거래일, 실패 목록)."""
+    tds = _trading_days(day)
+    prev = prev_trading_day(day, tds)
+    targets = [d for d in tds if d < day][-10:]
+    targets = [d for d in targets if d == prev or ((journal_dir / f"{d}.json").exists()
+                                                   and not (load_day(d, journal_dir).get("close") or {}).get("kospi"))]
+    errors = []
+    for d in targets:
+        try:
+            flows = await fetch_flows(d)
+            if not flows.get("kospi"):
+                errors.append(f"확정 수급 {d[5:]}(종합 행 없음)")
+                continue
+            update_section(d, "close", {**flows, "flows_final_at": now.isoformat(timespec="seconds")}, journal_dir)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"확정 수급 {d[5:]}({_err(e)})")
+    return prev, errors
+
+
 async def run_morning(now: datetime, notify: bool = True) -> dict:
     day = now.strftime("%Y-%m-%d")
-    prev = prev_journal_day(day)
     rec, errors = {"collected_at": now.isoformat(timespec="seconds")}, []
+    try:
+        prev, ferr = await fill_final_flows(day, now)
+        errors += ferr
+    except Exception as e:  # noqa: BLE001 — 거래소 달력 조회 실패
+        prev = prev_journal_day(day)
+        errors.append(f"확정 수급({_err(e)})")
     try:
         rec["overseas"], rec["overseas_asof"] = collect_overseas(day)
     except Exception as e:  # noqa: BLE001 — 한 묶음 실패가 나머지를 막지 않게
@@ -437,14 +491,14 @@ async def run_morning(now: datetime, notify: bool = True) -> dict:
 
 
 async def run_close(now: datetime, notify: bool = True) -> dict:
+    """장 마감 직후 — 뉴스·공시 + **잠정** 수급(flows_prelim). 확정 수급(kospi 등)은 다음 날 아침 fill_final_flows 가 넣는다
+    (15:55 값은 시간외 거래 전 잠정치 — 11-06 외국인 잠정 −2.77조 ↔ 확정 −2.69조)."""
     day = now.strftime("%Y-%m-%d")
     rec, errors = {"collected_at": now.isoformat(timespec="seconds")}, []
     try:
-        rec["kospi"], rec["kosdaq"], rec["program"] = await fetch_flows(day)
-        if rec["kospi"] is None:
-            errors.append("수급(종합 행 없음)")
+        rec["flows_prelim"] = await fetch_flows(day)
     except Exception as e:  # noqa: BLE001
-        errors.append(f"수급({type(e).__name__})")
+        errors.append(f"잠정 수급({_err(e)})")
     try:
         start = datetime.fromisoformat(f"{day} {CLOSE_FROM}")
         by_kw, capped = await fetch_news(start)
@@ -459,13 +513,12 @@ async def run_close(now: datetime, notify: bool = True) -> dict:
         errors.append(f"공시({_err(e)})")
     rec["calendar"] = calendar_events(day, _manual_calendar())
     rec["errors"] = errors
-    p = save_section(day, "close", rec)
-    print(f"[market_journal close] {day} {flows_text(rec)} · 뉴스 {len(rec.get('news', []))}건 · "
+    p = update_section(day, "close", rec)            # 덧쓰기 — 다음 날 아침에 넣은 확정 수급을 지우지 않는다
+    print(f"[market_journal close] {day} 잠정 {flows_text(rec.get('flows_prelim'))} · 뉴스 {len(rec.get('news', []))}건 · "
           f"공시 {len(rec.get('dart', []))}건 · 실패 {errors or '없음'} → {p}")
     if errors and notify:
         from trend_runtime import notify as tg
-        await tg(f"⚠️ [시장 일지] {day} 장 마감 조회 실패: {', '.join(errors)}"
-                 + (" — 수급이 없어 오늘 Notion 시장 일지 행은 만들지 않는다" if not rec.get("kospi") else ""))
+        await tg(f"⚠️ [시장 일지] {day} 장 마감 조회 실패: {', '.join(errors)}")
     return rec
 
 

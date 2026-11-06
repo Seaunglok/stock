@@ -437,22 +437,41 @@ def _trading_days(day: str) -> list[str]:
     return sorted(L.load_bars("069500", (date.fromisoformat(day) - timedelta(days=40)).isoformat(), day))
 
 
-async def fill_final_flows(day: str, now: datetime, journal_dir: Path = JOURNAL_DIR) -> tuple[str | None, list[str]]:
+def _ks_window(day: str) -> dict[str, float]:
+    """날짜 대조용 FDR ^KS11 종가(최근 40일) — market_flows 의 가드와 같은 기준."""
+    import market_flows as MF
+    return MF.ks_closes((date.fromisoformat(day) - timedelta(days=40)).isoformat(), day)
+
+
+async def fill_final_flows(day: str, now: datetime, journal_dir: Path = JOURNAL_DIR,
+                           flows_file: Path | None = None) -> tuple[str | None, list[str]]:
     """전 거래일 확정 수급을 그날 파일의 close 에 넣는다 + 최근 10거래일 중 **일지 파일이 있는데** 확정 수급이 빠진 날도
-    다시 채운다(하루 실패해도 다음 아침이 메운다 — Notion 행은 확정 수급이 들어온 뒤에 생긴다). → (전 거래일, 실패 목록)."""
+    다시 채운다(하루 실패해도 다음 아침이 메운다 — Notion 행은 확정 수급이 들어온 뒤에 생긴다). 받은 날은 연구용 이력
+    data/market_flows/daily.csv 에도 한 줄(날짜 대조 가드 포함, market_flows). → (전 거래일, 실패 목록)."""
+    import market_flows as MF
     tds = _trading_days(day)
     prev = prev_trading_day(day, tds)
     targets = [d for d in tds if d < day][-10:]
     targets = [d for d in targets if d == prev or ((journal_dir / f"{d}.json").exists()
                                                    and not (load_day(d, journal_dir).get("close") or {}).get("kospi"))]
     errors = []
+    try:
+        ks = _ks_window(day)
+    except Exception as e:  # noqa: BLE001 — 대조값이 없으면 check='unchecked' 로 남긴다
+        ks = {}
+        errors.append(f"대조 종가({_err(e)})")
     for d in targets:
         try:
             flows = await fetch_flows(d)
             if not flows.get("kospi"):
                 errors.append(f"확정 수급 {d[5:]}(종합 행 없음)")
                 continue
-            update_section(d, "close", {**flows, "flows_final_at": now.isoformat(timespec="seconds")}, journal_dir)
+            stamp = now.isoformat(timespec="seconds")
+            update_section(d, "close", {**flows, "flows_final_at": stamp}, journal_dir)
+            row = MF.row_from(d, flows.get("kospi"), flows.get("kosdaq"), flows.get("program"), ks.get(d), stamp)
+            MF.upsert([row], flows_file or MF.FLOWS_FILE)
+            if row["check"] not in ("ok", "unchecked"):
+                errors.append(f"확정 수급 {d[5:]} 날짜 대조 {row['check']}")
         except Exception as e:  # noqa: BLE001
             errors.append(f"확정 수급 {d[5:]}({_err(e)})")
     return prev, errors

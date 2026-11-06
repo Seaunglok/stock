@@ -28,6 +28,7 @@ TARGETS = [
     "scripts/collect_i3_minutes.py",
     "scripts/aggr_shadow.py",
     "scripts/market_journal.py",
+    "scripts/market_flows.py",
     "scripts/lab_fear.py",
     "scripts/lab_orb.py",
     "scripts/lab_downside.py",

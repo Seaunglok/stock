@@ -163,10 +163,16 @@ def test_fill_final_flows_writes_prev_day_and_heals_recent_gaps(tmp_path, monkey
         return {"kospi": {**M.index_flows([KOSPI_ROW]), "지수": float(d[-2:])}, "kospi_nxt": None, "kosdaq": None,
                 "program": None}
     monkeypatch.setattr(M, "fetch_flows", fake)
+    monkeypatch.setattr(M, "_ks_window", lambda day: {"2026-11-04": 4.0, "2026-11-06": 9.0})   # 11-06 은 일부러 어긋나게
     M.save_section("2026-11-04", "close", {"news": [], "dart": []}, tmp_path)               # 확정 수급 빠짐 → 다시 채움
     M.save_section("2026-11-05", "close", {"kospi": {"지수": 1.0}}, tmp_path)              # 이미 있음 → 건드리지 않음
-    prev, errs = asyncio.run(M.fill_final_flows("2026-11-09", datetime(2026, 11, 9, 8, 30), tmp_path))
-    assert prev == "2026-11-06" and errs == [] and sorted(calls) == ["2026-11-04", "2026-11-06"]
+    ff = tmp_path / "flows.csv"
+    prev, errs = asyncio.run(M.fill_final_flows("2026-11-09", datetime(2026, 11, 9, 8, 30), tmp_path, ff))
+    assert prev == "2026-11-06" and sorted(calls) == ["2026-11-04", "2026-11-06"]
+    assert errs == ["확정 수급 11-06 날짜 대조 bad:-33.33%"]                                   # 가드가 실제로 걸린다
+    import market_flows as MF                                                                  # 연구용 이력에도 한 줄씩
+    rows = MF.load_rows(ff)
+    assert list(rows) == ["2026-11-04", "2026-11-06"] and rows["2026-11-04"]["check"] == "ok"
     assert M.load_day("2026-11-04", tmp_path)["close"]["news"] == []                         # 덧쓰기 — 뉴스는 그대로
     assert M.load_day("2026-11-04", tmp_path)["close"]["kospi"]["지수"] == 4.0
     assert M.load_day("2026-11-05", tmp_path)["close"]["kospi"] == {"지수": 1.0}

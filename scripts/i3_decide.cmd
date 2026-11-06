@@ -21,6 +21,11 @@ REM Does not change RC.
 echo ---- aggr %TIME% >> logs\i3\i3_task.log
 "D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\aggr_shadow.py >> logs\i3\i3_task.log 2>&1
 echo aggr_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
+REM Market journal close (market-wide flows, news, DART - read only). Before notion, which adds its Notion row.
+REM Does not change RC.
+echo ---- journal %TIME% >> logs\i3\i3_task.log
+"D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\market_journal.py --phase close >> logs\i3\i3_task.log 2>&1
+echo journal_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
 REM Notion daily records (DB rows only - see docs\notion-guide.md). Last, so it sees decide+league. Does not change RC;
 REM its own check step sends a Telegram alert when the sync did not finish.
 echo ---- notion %TIME% >> logs\i3\i3_task.log

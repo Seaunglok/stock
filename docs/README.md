@@ -17,6 +17,8 @@
 | 7 | [2026-09-09-kelly-declaration.md](2026-09-09-kelly-declaration.md) | 켈리 기준 사전 선언 — 사이징 아님, 감시용 |
 | 8 | [2026-10-12-strategy-review.md](2026-10-12-strategy-review.md) | 전략 타당성 점검 — 월별·금리 국면·FOMC·켈리·구루 원칙 비교(설명용, 채택 아님) |
 | 9 | [2026-10-12-breakout-entry-declaration.md](2026-10-12-breakout-entry-declaration.md) | 진입 타점 A/B — 눌림 vs 돌파20/55. **미통과 → 눌림 유지**(돌파는 수익↑·MDD 18→29%·PF↓) |
+| 19 | [2026-11-06-market-journal.md](2026-11-06-market-journal.md) | **시장 일지** — 매일 수급(키움 투자자별·프로그램 매매)·뉴스(네이버)·공시(DART)·밤사이 미국·일정을 모은다. 텔레그램 아침 요약 + Notion 하루 1행. 예측이 아니라 다시 못 구하는 기록 |
+| 18 | [2026-10-28-aggressive-track.md](2026-10-28-aggressive-track.md) | **공격형 트랙** — 1~3세대(양방향·레버리지×예산·한미 반반) 탈락, 하락 예측 판정대 탈락, 공격형 리그(ORB·공포 매수·HH1 예외) 그림자 기록 |
 | 17 | [notion-guide.md](notion-guide.md) | **Notion 정리 가이드** — Notion 에 쓰기 전에 읽는다. 매일 쌓이는 것은 DB 행으로만(대시보드는 보기만), 매일 자동 기록(`i3_notion.cmd`)·운영 이력·ID 지도·마크다운 함정 |
 | 16 | [i3-improvement-backlog.md](i3-improvement-backlog.md) | **개선 백로그(살아 있는 문서)** — 세션마다 먼저 본다. 입출금 왜곡 위험 · 체결 비용 보정 · 분봉 수집 · 4세대 I3×TSMOM · ISA |
 | 15 | [2026-10-22-i3-league.md](2026-10-22-i3-league.md) | **도전자 리그 — 매일 발전하는 구조**. 챔피언(실전 I3) vs 도전자를 매일 주문 없이 기록, 승격 규칙 사전선언. 계보 1~3세대(R1~R7)와 교훈 |

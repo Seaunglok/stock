@@ -166,9 +166,15 @@ def test_prep_reads_real_writers(tmp_path):
     S.append_history(row, tmp_path / "shadow_history.csv")
     (tmp_path / "fills.jsonl").write_text(json.dumps(_fill("2026-10-23", "buy", "488770", 34, 105950.0)) + "\n",
                                           encoding="utf-8")
+    import market_journal as MJ                      # 시장 일지도 실제 writer(save_section) → prep
+    jd = tmp_path / "journal"
+    MJ.save_section("2026-10-22", "close", {"kospi": {"지수": 3500.0, "등락(%)": -1.0, "외국인": -100.0, "기관": 50.0,
+                                                    "개인": 50.0}}, jd)
+    MJ.save_section("2026-10-23", "morning", {"overseas": {}}, jd)          # 아침만 있는 날은 행 없음
     out = tmp_path / "out.json"
-    p = N.prep(datetime(2026, 10, 23, 16, 30), data_dir=tmp_path, out=out)
+    p = N.prep(datetime(2026, 10, 23, 16, 30), data_dir=tmp_path, out=out, journal_dir=jd)
     assert json.loads(out.read_text(encoding="utf-8")) == p
     assert p["daily"][0]["일자"] == "2026-10-22" and p["daily"][0]["리그"].endswith("· 실계좌 +0.00%")
     assert p["trades"][0]["체결수량"] == 34 and p["months"][0]["key"] == "2026-10"
-    assert "결과:" not in N.prep_summary(p)
+    assert [r["일자"] for r in p["journal"]] == ["2026-10-22"] and p["journal"][0]["외국인 순매수(억원)"] == -100.0
+    assert "결과:" not in N.prep_summary(p) and "시장 일지 1행" in N.prep_summary(p)

@@ -68,6 +68,7 @@ notion 작성 시 참고할 수 있도록." · "매일 추가해야 하는데 I3
 | 사전선언 연구 1회 | **연구 기록DB** |
 | 리그 멤버(입장·탈락·승격) | **도전자 리그 멤버DB** (월간 점검 때 상태 갱신) |
 | 할 일 | **Flow Task DB** (Project = 방어형 ETF 자동매매(I3)) — 대시보드에 '열린 할 일' 보기 |
+| 그날 시장 수급·뉴스·밤사이 미국·일정 | **📰 시장 일지DB** (하루 1행, 자동 — `market_journal.py`, 11-06~) |
 | 규칙·검증·안전장치·명령 | 하위 페이지 「운영 매뉴얼 — 방어형 ETF 자동매매(I3)」 |
 
 ## 2. 구조 지도 (ID)
@@ -83,6 +84,7 @@ notion 작성 시 참고할 수 있도록." · "매일 추가해야 하는데 I3
 │  ├ 📘 운영 매뉴얼 — 방어형 ETF 자동매매(I3) (4011459d6f5881fd97c7cdad8a4cb83a)
 │  ├ 🏟️ 도전자 리그 — 방어형 ETF 자동매매(I3) (4011459d6f588196a2a4d99881a43aa0) — 도전자 리그 멤버DB collection://f36378bb-f4a6-4864-802b-8d2a05326801
 │  └ 🔬 연구 기록 — 방어형 ETF 자동매매(I3) (4011459d6f588170ba48f0f1e7ba74d8) — 연구 기록 — 사전선언 연구DB collection://b32048a7-1882-4926-b23c-1bce1ca61a11
+├ 📰 시장 일지 — 매일 수급·뉴스·해외·일정 DB  collection://107443d9-eec1-40fe-92ad-75d37eb741f5  (11-06~, 하루 1행 자동)
 ├ 📒 주식 매매일지DB   collection://63d8ae25-9910-4a36-ba3f-3dc942cb9733  (이 전략 행 = 매매이유 "🛡️ 방어형 ETF 자동매매(I3) …", 추세추종 = "🤖 …")
 ├ 📅 월별 결산DB       collection://2c0f5ffd-e5d7-4587-a765-85ba9ec084dc  (이 전략 행 = "🛡️ 방어형 ETF 자동매매(I3) YYYY년 M월 (💰 실거래)")
 └ 👑 대형주 추세추종 자동매매 (종료 · 기록 보존) (2131459d6f58804eafe5cc39083ad7fc) — 지우지 않는다
@@ -99,7 +101,8 @@ Flow (GTD, 87816d4e7ce84ce8a097bddf34a2f976)
 ## 3. 매일 자동 기록 (2026-10-22~) — 매매일지·history 를 남기는 방법
 
 ```
-평일 15:50 I3Decide → i3_decide.cmd: 판단 → 리그 → 분봉 → scripts\i3_notion.cmd
+평일 15:50 I3Decide → i3_decide.cmd: 판단 → 리그 → 분봉 → 공격형 리그 → 시장 일지(close) → scripts\i3_notion.cmd
+   (11-06~ prep 이 시장 일지 행(journal)도 만들고, 에이전트가 i3_notion_task.md D절대로 시장 일지DB 에 없는 행만 추가)
    prep   python scripts/i3_notion_sync.py prep   최근 10일을 Notion 행 모양으로 계산 → data/i3/notion_sync.json
    agent  headless claude 가 scripts/i3_notion_task.md 대로: 일일 기록·매매일지는 **없는 행만** 추가, 월 결산 1행 갱신
    check  python scripts/i3_notion_sync.py check  이번 실행 로그에 "결과:" 줄이 없거나 ❌ → 텔레그램 critical

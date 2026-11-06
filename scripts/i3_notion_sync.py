@@ -328,12 +328,15 @@ def _league_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = OUT_FILE) -> dict:
+def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = OUT_FILE,
+         journal_dir: Path | None = None) -> dict:
     import i3_shadow as S
     st = json.loads((data_dir / "state.json").read_text(encoding="utf-8")) if (data_dir / "state.json").exists() else {}
     payload = build_payload(_read_jsonl(data_dir / "events.jsonl"), st.get("navs") or [],
                             _read_jsonl(data_dir / "fills.jsonl"), _league_rows(data_dir / "shadow_history.csv"),
                             {S._slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now())
+    import market_journal as MJ                       # 시장 일지DB(11-06) — 같은 대조 창으로 없는 행만
+    payload["journal"] = MJ.notion_rows(payload["since"], journal_dir or MJ.JOURNAL_DIR)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -345,7 +348,7 @@ def prep_summary(payload: dict) -> str:
     """로그 한 줄. **결과 태그를 쓰지 않는다** — check 가 이 줄을 에이전트 결과로 오인하면 안 된다."""
     w = f" · 경고 {len(payload['warnings'])}" if payload["warnings"] else ""
     return (f"[i3_notion prep] {payload['since']}~ 일일 {len(payload['daily'])}행 · 매매 {len(payload['trades'])}행"
-            f" · 결산월 {','.join(m['key'] for m in payload['months'])}{w}")
+            f" · 결산월 {','.join(m['key'] for m in payload['months'])} · 시장 일지 {len(payload.get('journal', []))}행{w}")
 
 
 # ── check ───────────────────────────────────────────────────────────────────

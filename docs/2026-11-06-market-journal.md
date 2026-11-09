@@ -54,6 +54,8 @@
 
 운용자 "채워줘"(11-06): 키움 시장 수급은 지난 날짜도 확정치를 주므로 **2010-01-04 부터 한꺼번에 채웠다**
 (`python scripts/market_flows.py --backfill`, 이어받기 가능). 그 뒤로는 매일 아침 `fill_final_flows` 가 전 거래일을 덧붙인다.
+**채우기는 예약작업 `MarketFlowsBackfill`(`scripts/market_flows_backfill.cmd`)로 돌린다** — 11-06 밤 Claude 세션에서 띄운
+프로세스는 세션이 끝날 때 같이 죽어 150일에서 멈췄다(11-09 이어받기). 수동: `schtasks /run /tn MarketFlowsBackfill`.
 
 - 한 줄 = 한 거래일: 코스피·코스닥 종가·등락, 투자자별 순매수(외국인·기관·개인·기타법인·금융투자·연기금, `_eok` = 억원, KRX),
   코스피 프로그램 매매(차익·비차익·전체, 백만원) · KOSPI200 · 선물 베이시스.

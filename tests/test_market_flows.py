@@ -51,6 +51,23 @@ def test_unchecked_rows_are_rechecked_when_close_appears():
     assert F.recheck_unchecked(have, {}) == []                        # 아직 종가가 없으면 그대로
 
 
+def test_verified_day_is_ok_only_for_the_confirmed_close():
+    """★ 2021-05-06: 대조값(FDR·키움 일봉 3,160.43)이 틀린 날 — 마감 기사로 확인한 3,178.74 와 **같을 때만** ok.
+    다른 값(예: 전날 3,147.37 을 준 응답)은 여전히 bad — 확인 목록이 가드를 끄는 구멍이 되면 안 된다."""
+    day = "2021-05-06"
+    assert F.VERIFIED[day][0] == 3178.74 and "뉴데일리" in F.VERIFIED[day][1]
+    ok = F.row_from(day, {**KOSPI, "지수": 3178.74}, KOSDAQ, PROG, 3160.43, "t")
+    stale = F.row_from(day, {**KOSPI, "지수": 3147.37}, KOSDAQ, PROG, 3160.43, "t")
+    assert ok["check"] == "ok" and stale["check"].startswith("bad")
+    assert F.check_row("2021-05-07", 3178.74, 3160.43).startswith("bad")         # 목록 밖 날짜는 그대로
+    have = {day: {**ok, "kospi": "3178.74", "check": "bad:+0.58%"},
+            "2021-05-07": {**ok, "date": "2021-05-07", "kospi": "3178.74", "check": "bad:+0.58%"},
+            "2021-05-03": {**stale, "date": "2021-05-03", "kospi": "3147.37", "check": "bad:-0.41%"}}
+    assert [(r["date"], r["check"]) for r in F.recheck_verified(have)] == [(day, "ok")]
+    have[day]["kospi"] = "3147.37"
+    assert F.recheck_verified(have) == []
+
+
 def test_upsert_replaces_same_date_and_sorts(tmp_path):
     p = tmp_path / "d.csv"
     F.upsert([F.row_from("2026-11-06", KOSPI, KOSDAQ, PROG, 5059.69, "t1")], p)

@@ -33,6 +33,10 @@ CALL_PAUSE_S = 0.05
 RETRIES = 3
 INVESTORS = {"외국인": "foreign", "기관": "inst", "개인": "indiv", "기타법인": "corp", "금융투자": "fininv",
              "연기금": "pension"}
+VERIFIED: dict[str, tuple[float, str]] = {   # 대조값(FDR ^KS11)이 틀린 날 — 다른 출처로 확인한 KOSPI 종가 · 근거
+    "2021-05-06": (3178.74, "뉴데일리 2021-05-06 마감 기사 3,178.74(+1.00%)·코스닥 969.99 = ka10051 응답. "
+                            "FDR ^KS11·키움 ka20006 일봉은 3,160.43(둘 다 틀림) — 11-10 확인"),
+}
 COLS = (["date", "kospi", "kospi_chg_pct"] + [f"kospi_{v}_eok" for v in INVESTORS.values()]
         + ["kosdaq", "kosdaq_chg_pct"] + [f"kosdaq_{v}_eok" for v in INVESTORS.values()]
         + ["prog_arb", "prog_nonarb", "prog_total", "kospi200", "basis", "check", "fetched_at"])
@@ -47,6 +51,28 @@ def check_index(ix_close: float | None, ks_close: float | None, tol: float = CHE
     return "ok" if abs(d) <= tol else f"bad:{d * 100:+.2f}%"
 
 
+def check_row(day: str, ix_close: float | None, ks_close: float | None, tol: float = CHECK_TOL) -> str:
+    """check_index + VERIFIED — 대조값이 틀린 날은 그 대조값을 쓰지 않고, 다른 출처로 확인한 종가와 **정확히** 같을 때만
+    'ok'(틀린 대조값 0.5% 안에 든다고 통과시키지 않는다)."""
+    v = VERIFIED.get(day)
+    if v is None:
+        return check_index(ix_close, ks_close, tol)
+    if ix_close is None:
+        return "unchecked"
+    return "ok" if abs(ix_close - v[0]) < 0.005 else f"bad:{(ix_close / v[0] - 1) * 100:+.2f}%"
+
+
+def recheck_verified(have: dict[str, dict]) -> list[dict]:
+    """VERIFIED 에 올린 날의 'bad' 줄을 다시 판정 — 확인한 종가와 같으면 'ok', 아니면 그대로."""
+    out = []
+    for d, r in have.items():
+        if d in VERIFIED and str(r.get("check", "")).startswith("bad") and r.get("kospi") not in (None, ""):
+            c = check_row(d, float(r["kospi"]), None)
+            if c == "ok":
+                out.append({**r, "check": c})
+    return out
+
+
 def row_from(day: str, kospi: dict | None, kosdaq: dict | None, program: dict | None, ks_close: float | None,
              fetched_at: str) -> dict:
     """market_journal.index_flows / program_flows 결과 → CSV 한 줄."""
@@ -59,7 +85,7 @@ def row_from(day: str, kospi: dict | None, kosdaq: dict | None, program: dict | 
     p = program or {}
     r.update(prog_arb=p.get("차익"), prog_nonarb=p.get("비차익"), prog_total=p.get("전체"), kospi200=p.get("KOSPI200"),
              basis=p.get("베이시스"))
-    r["check"] = check_index((kospi or {}).get("지수"), ks_close)
+    r["check"] = check_row(day, (kospi or {}).get("지수"), ks_close)
     return r
 
 
@@ -157,7 +183,7 @@ async def backfill(start: str = START, end: str | None = None, path: Path = FLOW
     end = end or datetime.now().strftime("%Y-%m-%d")
     ks = ks_closes(start, end)
     have = load_rows(path)
-    rechecked = recheck_unchecked(have, ks)
+    rechecked = recheck_unchecked(have, ks) + recheck_verified(have)
     if rechecked:
         upsert(rechecked, path)
         print(f"[market_flows] 대조 다시: {[(r['date'], r['check']) for r in rechecked]}", flush=True)

@@ -23,6 +23,47 @@ def _bars(closes: list[float], start_month: int = 1) -> dict:
     return out
 
 
+def _mb(t, o, h, l, c):
+    return {"t": t, "o": o, "h": h, "l": l, "c": c}
+
+
+def _first5_bars(o, c, hi, lo):
+    xs = [_mb("0900", o, max(o, c), min(o, c), o)]
+    xs += [_mb(t, o, o, o, o) for t in ("0901", "0902", "0903")]
+    xs.append(_mb("0904", c, hi, lo, c))
+    return xs
+
+
+def test_orb_b3_declared_forward_only():
+    assert B.VARIANTS["B3"] == "122630" and B.B3_START == "2026-11-11" > "2026-11-10"
+    assert B.B3_BETA == {"long": 2.0, "inv": 1.0} and B.start_of("B3") == B.B3_START and B.start_of("B1") == B.B_START
+
+
+def test_orb_b3_stops_on_kodex200_and_fills_on_next_product_bar():
+    """★ 레버리지 09:05 봉이 비어도 09:06 시가로 들어가고, 손절은 KODEX200 이 첫 5분 저가를 깬 분의 상품 종가."""
+    sig = _first5_bars(100.0, 101.0, 101.5, 99.5) + [_mb("0905", 101.0, 101.2, 100.8, 101.1),
+                                                     _mb("0930", 100.0, 100.2, 99.4, 99.6), _mb("1530", 99.0, 99, 99, 99.0)]
+    lev = _first5_bars(200.0, 202.0, 203.0, 199.0)[2:] + [_mb("0906", 202.0, 203, 201, 202.5),
+                                                          _mb("0930", 198.0, 198, 195, 196.0), _mb("1530", 195, 195, 195, 195.0)]
+    r = B.orb_day_k(sig, lev, [])
+    risk = (101.0 - 99.5) / 101.0
+    size = min(1.0, 0.01 / (2.0 * risk))
+    assert r["side"] == "long" and r["how"] == "손절" and r["entry"] == 202.0 and r["exit"] == 196.0
+    assert abs(r["size"] - size) < 1e-12 and abs(r["ret"] - (size * (196 / 202 - 1) - size * 2 * B.SIDE_COST)) < 1e-12
+
+
+def test_orb_b3_inverse_uses_kodex200_high_and_holds_to_close():
+    sig = _first5_bars(100.0, 99.0, 100.5, 98.8) + [_mb("0905", 99.0, 99.3, 98.7, 99.1),
+                                                    _mb("1200", 98.0, 100.4, 97.5, 98.2), _mb("1530", 97.0, 97, 97, 97.0)]
+    inv = [_mb("0905", 1190.0, 1191, 1180, 1185), _mb("1200", 1200, 1210, 1178, 1205), _mb("1530", 1220, 1220, 1220, 1220.0)]
+    r = B.orb_day_k(sig, [], inv)
+    size = min(1.0, 0.01 / (1.0 * (100.5 - 99.0) / 99.0))
+    assert r["side"] == "inv" and r["how"] == "종가" and r["exit"] == 1220.0         # 인버스 장중 1178 은 손절 아님
+    assert abs(r["size"] - size) < 1e-12
+    assert B.orb_day_k(sig[1:], [], inv)["why"] == "첫 5분 자료 없음"
+    assert B.orb_day_k(sig, [], [])["why"] == "상품 분봉 부족(쉼)"
+
+
 def test_declared_constants_match_operator_decisions():
     """운용자 결정(10-28): 정지선 −30% · 50만원 · 6개 후보 · 2배 인버스 제외 · 월 10% × 36 은 보고만."""
     assert A.AG_MAX_MDD_PCT == 30.0 and A.AG_EQUITY == 500_000.0 and B.B_MAX_MDD_PCT == 30.0

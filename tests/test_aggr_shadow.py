@@ -38,11 +38,51 @@ def test_declared_constants_reuse_downside_defaults():
     """새 숫자를 고르지 않는다 — lab_downside 선언 기본값(V1 30 · K2 25)을 그대로 쓴다."""
     assert F.SIGNALS["V"][0] == "V1" and D.CANDIDATES["V1"][2] == 30
     assert F.SIGNALS["K"][0] == "K2" and D.CANDIDATES["K2"][2] == 25
-    assert F.MEMBERS == ("FEAR-V1", "FEAR-V2", "FEAR-K1", "FEAR-K2")
+    assert F.MEMBERS == ("FEAR-V1", "FEAR-V2", "FEAR-K1", "FEAR-K2", "FEAR-P1", "FEAR-P2")
     assert F.LONGS == {"1": "069500", "2": "122630"} and F.CASH == "488770"
     assert (F.ANCHOR, F.F_EQUITY, F.F_JUDGE_DAYS, F.F_MIN_HELD, F.F_MAX_MDD_PCT) == \
         ("2026-10-28", 500_000.0, 60, 20, 30.0)
-    assert S.MEMBERS == ("ORB-B1", "ORB-B2") + F.MEMBERS + ("HH1",) and S.STOP_PCT == 30.0
+    assert S.MEMBERS == ("ORB-B1", "ORB-B2", "ORB-B3") + F.MEMBERS + ("HH1",) and S.STOP_PCT == 30.0
+
+
+def test_fear_p_declaration():
+    """11-10 선언: P 는 K 와 같은 변동성·같은 25%, 정점 대비 20% 꺾임 · 11-10 판단부터(그 전 성적 없음)."""
+    assert F.SIGNALS["P"][0] == F.SIGNALS["K"][0] == "K2" and F.PEAK_DROP == 0.20
+    assert F.ANCHORS == {"V": "2026-10-28", "K": "2026-10-28", "P": "2026-11-10"}
+
+
+def test_peak_after_waits_for_fear_to_roll_over():
+    """켜짐(25% 초과) → 정점 따라감 → 정점의 80% 이하면 보유 → 새 정점이면 내려놓음 → 25% 밑이면 끝. 사이는 유지."""
+    vols = [10, 30, 40, 50, 45, 39, 41, 55, 44, 20, None, 30]
+    assert F.peak_after(vols, 25) == [False, False, False, False, False, True, True, False, True, False, False, False]
+
+
+def test_peak_after_forgets_old_peaks():
+    """★ 11-10 실데이터 사고 재현: 국면이 몇 달 이어지면 옛 정점(103%)을 기억해 지금 확대 중인 공포를 '꺾임'으로 봤다.
+    정점은 최근 20거래일 최고 — 옛 정점이 창을 벗어난 뒤 오늘이 20일 최고면 '확대 중'(현금)이다."""
+    vols = [30, 100] + [60] * 20 + [61, 48]
+    assert F.PEAK_WINDOW == 20
+    assert F.peak_after(vols, 25) == [False, False] + [True] * 20 + [False, True]
+    # 옛 규칙(국면 전체 정점)이었다면 61 도 100 × 0.8 아래라 보유 — 그 차이를 이 테스트가 잡는다
+    assert F.peak_after([30, 100] + [70] * 25 + [75], 25)[-1] is False
+
+
+def test_fear_p_runs_from_its_own_anchor():
+    """P 는 11-10 종가 판단부터 — 그 전 날짜는 곡선에 없다. 공포가 꺾인 상태면 첫날 시가에 산다."""
+    days = _days("2026-09-01", 80)
+    k, ks = 1000.0, {}
+    for j, d in enumerate(days):                       # 앞쪽은 크게 출렁이다가(공포) 뒤쪽은 잠잠 → 꺾임
+        k *= 1 + ((0.04 if j % 2 else -0.04) if j < 50 else (0.012 if j % 2 else -0.012))
+        ks[d] = {"open": k, "close": k}
+    flat = {d: {"open": 100.0, "close": 100.0} for d in days}
+    rise = {d: {"open": 100.0 + i, "close": 100.0 + i} for i, d in enumerate(days)}
+    px = {F.BASE: rise, F.LONGS["2"]: rise, F.CASH: flat, "^KS11": ks, "^VIX": flat}
+    r = F.run(px, "P", "1", days[-1], F.ANCHORS["P"])
+    assert r["curve"][0][0] == "2026-11-10" and all(d >= "2026-11-10" for d, _ in r["curve"])
+
+
+def test_decide_task_order_unchanged_by_new_members():
+    assert "ORB-B3" in S.MEMBERS and {"FEAR-P1", "FEAR-P2"} <= set(S.MEMBERS)
 
 
 def test_fear_buys_next_open_and_exits_when_fear_ends():
@@ -87,6 +127,16 @@ def test_orb_run_marks_missing_minute_days():
     assert r["missing"] == ["2026-10-30"] and r["days"] == 2
     assert r["curve"][0] == (F.ANCHOR, 500_000) and abs(r["curve"][-1][1] - 505_000) < 1e-6
     assert S.orb_verdict(r["curve"])["judged"] is False
+
+
+def test_orb_b3_curve_starts_the_day_before_its_start():
+    """B3 는 11-10 에 50만원으로 출발 — 10-28 부터 평평한 곡선이 아니다. 11-11 전 날짜는 '분봉 없음'으로 세지 않는다."""
+    rows = [("2026-11-11", {"side": "long", "ret": 0.02, "size": 0.5, "how": "종가"})]
+    fake = lambda v, s, e: [x for x in rows if max(s, "2026-11-11") <= x[0] <= e]   # noqa: E731
+    dates = ["2026-10-28", "2026-11-06", "2026-11-10", "2026-11-11", "2026-11-12"]
+    r = S.orb_run("B3", dates, "2026-11-12", 500_000, fake)
+    assert r["curve"][0] == ("2026-11-10", 500_000) and r["missing"] == ["2026-11-12"] and r["days"] == 1
+    assert S.orb_run("B3", dates[:3], "2026-11-10", 500_000, fake)["curve"] == [("2026-11-10", 500_000)]
 
 
 def test_stop_alert_only_once():

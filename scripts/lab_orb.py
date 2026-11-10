@@ -25,6 +25,19 @@
         **구현 확인용**(판정에 안 씀). 과거 분봉 이력이 없어 백테스트는 없다(키움 1분봉 ~900봉만).
   판정  2주(10영업일)는 '체결·비용이 모델과 같은가'만 본다 — 10번 매매로는 운과 실력을 못 가른다.
         실전 후보 자격은 B_JUDGE_DAYS(60영업일) 기록 뒤: 누적 순수익 > 0 · 최대 낙폭 ≤ 30%(공격형 정지선).
+
+B3 — 손절·익절을 KODEX200 가격으로 (2026-11-10 선언, 운용자 "ORB-B3 · FEAR-K 정점 뒤" — **앞으로만**, B3_START 부터)
+-------------------------------------------------------------------------------------------------------------
+  진단(첫 2주 기록, 판정 아님): ① 인버스(114800)는 1,190원 안팎·호가 1원(≈8bp)이라 '인버스 자신의 첫 5분 저가' 손절이
+  몇 호가뿐 — 방향을 맞힌 11-03 에도 장중 흔들림에 손절됐다. ② 레버리지(122630)는 장 시작 1~2분 분봉이 빠지는 날이 있어
+  (11-06·11-10) B2 가 '상품 분봉 부족'으로 쉬었다 — 크게 출렁이는 날일수록 빠진다.
+  B3 = B2 와 같은 상품(상승 = 레버리지 · 하락 = 인버스), 바뀌는 것만:
+    손절·익절·진입 판단 = **KODEX200 가격** — 상승이면 KODEX200 이 첫 5분 저가 이하로 내려간 분에 손절, 하락(인버스 보유)이면
+      첫 5분 고가 이상으로 올라간 분에 손절. 익절은 KODEX200 이 10R 만큼 유리하게 간 분. 같은 분에 둘 다면 손절 먼저.
+    크기 = min(1, 1% ÷ (상품 배수 × KODEX200 위험폭)) — 레버리지 2 · 인버스 1(B3_BETA). 손절 때 자본 1% 를 잃게.
+    체결 = 상품 분봉: 진입은 09:05 봉 시가, 없으면 09:10 까지의 첫 봉 시가(없으면 쉼). 손절·익절은 그 분 상품 봉 종가
+      (없으면 다음 봉 시가), 아니면 15:30 종가(없으면 마지막 봉 종가). 비용·판정은 B1·B2 와 같다.
+  숫자를 새로 고르지 않았다(10R·1%·5분은 원 출처 그대로). 2주 기록을 보고 만든 변형이라 과거 분봉으로 판정하지 않는다.
 """
 from __future__ import annotations
 
@@ -41,7 +54,10 @@ from src.mcp_servers.trend_mcp import costs as C  # noqa: E402
 
 # ── 선언 ─────────────────────────────────────────────────────────────────────
 SIGNAL, INV = "069500", "114800"
-VARIANTS = {"B1": "069500", "B2": "122630"}
+VARIANTS = {"B1": "069500", "B2": "122630", "B3": "122630"}
+B3_START = "2026-11-11"               # 11-10 선언 — 다음 거래일부터만 성적
+B3_BETA = {"long": 2.0, "inv": 1.0}   # 상품이 KODEX200 1% 에 움직이는 배수(레버리지 2 · 인버스 1)
+ENTRY_LIMIT_T = "0910"                # B3: 상품 09:05 봉이 없으면 여기까지의 첫 봉 시가
 OR_BARS = ("0900", "0901", "0902", "0903", "0904")
 ENTRY_T = "0905"
 LAST_CONT_T = "1519"                  # 연속매매 마지막 1분봉
@@ -99,15 +115,75 @@ def orb_day(signal: list[dict], long_bars: list[dict], inv_bars: list[dict]) -> 
             "exit": exit_px, "how": how}
 
 
+def _price_at(by: dict, sorted_ts: list[str], t: str, field: str) -> float | None:
+    """그 분 봉의 field, 없으면 그 뒤 첫 봉의 시가."""
+    if t in by:
+        return by[t][field]
+    nxt = next((x for x in sorted_ts if x > t), None)
+    return by[nxt]["o"] if nxt else None
+
+
+def orb_day_k(signal: list[dict], long_bars: list[dict], inv_bars: list[dict], beta=B3_BETA) -> dict:
+    """B3 하루 결과 — 판단·손절·익절은 KODEX200(signal) 가격, 체결은 상품 분봉. 순수 함수."""
+    s5 = _first5(signal)
+    if s5 is None:
+        return {"side": None, "ret": 0.0, "why": "첫 5분 자료 없음"}
+    if s5[3] == s5[0]:
+        return {"side": None, "ret": 0.0, "why": "첫 5분 시가=종가(쉼)"}
+    side = "long" if s5[3] > s5[0] else "inv"
+    sb = {b["t"]: b for b in signal}
+    if ENTRY_T not in sb:
+        return {"side": side, "ret": 0.0, "why": "신호 09:05 봉 없음(쉼)"}
+    entry_k = sb[ENTRY_T]["o"]
+    stop_k = s5[2] if side == "long" else s5[1]
+    risk_k = (entry_k - stop_k) / entry_k if side == "long" else (stop_k - entry_k) / entry_k
+    if risk_k <= 0:
+        return {"side": side, "ret": 0.0, "why": "진입가가 손절선 밖(쉼)"}
+    target_k = entry_k + TARGET_R * (entry_k - stop_k) if side == "long" else entry_k - TARGET_R * (stop_k - entry_k)
+    size = min(MAX_SIZE, (RISK_PCT / 100.0) / (beta[side] * risk_k))
+    prod = long_bars if side == "long" else inv_bars
+    pb = {b["t"]: b for b in prod}
+    pts = sorted(pb)
+    t_in = next((t for t in pts if ENTRY_T <= t <= ENTRY_LIMIT_T), None)
+    if t_in is None:
+        return {"side": side, "ret": 0.0, "why": "상품 분봉 부족(쉼)"}
+    entry = pb[t_in]["o"]
+    how, t_out = "종가", None
+    for b in sorted(signal, key=lambda x: x["t"]):
+        if not (t_in <= b["t"] <= LAST_CONT_T):
+            continue
+        hit_stop = b["l"] <= stop_k if side == "long" else b["h"] >= stop_k
+        hit_tgt = b["h"] >= target_k if side == "long" else b["l"] <= target_k
+        if hit_stop or hit_tgt:
+            how, t_out = ("손절" if hit_stop else "익절"), b["t"]
+            break
+    if t_out is not None:
+        exit_px = _price_at(pb, pts, t_out, "c")
+    else:
+        exit_px = pb[CLOSE_T]["c"] if CLOSE_T in pb else (pb[pts[-1]]["c"] if pts else None)
+    if exit_px is None:
+        return {"side": side, "ret": 0.0, "why": "상품 청산 봉 없음(쉼)"}
+    ret = size * (exit_px / entry - 1) - size * 2 * SIDE_COST
+    return {"side": side, "ret": ret, "size": size, "entry": entry, "stop": stop_k, "target": target_k,
+            "exit": exit_px, "how": how, "basis": "KODEX200"}
+
+
+def start_of(variant: str) -> str:
+    """변형별 성적 시작일 — B3 는 11-10 선언이라 11-11 부터."""
+    return B3_START if variant == "B3" else B_START
+
+
 def _load_day(code: str, day: str) -> list[dict]:
     p = MINUTE_DIR / code / f"{day}.json"
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
 
 
 def replay(variant: str, start: str = B_START, end: str = "9999-12-31") -> list[tuple[str, dict]]:
-    """저장된 분봉으로 날마다 orb_day — 신호 종목 파일이 있는 날만."""
+    """저장된 분봉으로 날마다 orb_day(B3 는 orb_day_k) — 신호 종목 파일이 있는 날만, 변형의 시작일부터."""
+    start = max(start, start_of(variant))
     days = sorted(p.stem for p in (MINUTE_DIR / SIGNAL).glob("*.json") if start <= p.stem <= end)
-    return [(d, orb_day(_load_day(SIGNAL, d), _load_day(VARIANTS[variant], d), _load_day(INV, d))) for d in days]
+    fn = orb_day_k if variant == "B3" else orb_day
+    return [(d, fn(_load_day(SIGNAL, d), _load_day(VARIANTS[variant], d), _load_day(INV, d))) for d in days]
 
 
 def main() -> int:

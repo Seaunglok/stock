@@ -25,6 +25,23 @@
           보유한 날의 KODEX200 수익(시가→다음 시가) 평균 > 기록 기간 전체 평균 — '공포일을 고른 실력'.
           (마지막 조건이 없으면 그냥 상승장에 오래 들고 있어서 번 돈이 실력처럼 보인다.)
         신호가 드물어 보유일이 모자라면 판정하지 않고 계속 기록한다(기준을 낮추지 않는다).
+
+FEAR-P — 공포가 정점을 지난 뒤 매수 (2026-11-10 선언, 운용자 "ORB-B3 · FEAR-K 정점 뒤" — **앞으로만**)
+------------------------------------------------------------------------------------------------
+  진단(첫 2주, 판정 아님): FEAR-K 는 변동성이 25% 를 넘자마자 산다 — 10-29 시가(반등 다음 날)에 사서 하락이 이어지자
+  FEAR-K2 가 6영업일 만에 그림자 MDD 31.5%(정지선). '떨어지는 칼'을 잡았다. → 공포가 **꺾인 뒤**에 산다.
+  규칙(KOSPI 20일 실현 변동성, FEAR-K 와 같은 정의 · 같은 25%):
+    국면   변동성 > 25% 가 이어진 날들 = 한 공포 국면. 25% 이하(또는 자료 없음)면 국면 끝 → 현금.
+    정점   그 국면 안에서 **최근 PEAK_WINDOW(20)거래일** 최고치(20 = 변동성 창 D.VOL_WINDOW 그대로, 새 숫자 아님).
+    매수   변동성 ≤ 정점 × (1 − PEAK_DROP 20%) — 정점에서 20% 꺾이면 다음 날 시가에 산다.
+    내려놓음 변동성이 앞선 날들의 정점을 넘으면(새 정점 = 공포 재확대) 현금으로 돌아가 다시 기다린다.
+    그 사이(꺾임 20% 와 새 정점 사이)는 직전 상태를 유지.
+  상품·조건·판정은 FEAR-K 와 같다(1 = KODEX200 · 2 = 레버리지, 50만원). 시작: 11-10 종가 판단 → 11-11 시가부터(ANCHORS).
+  20% 는 이번에 처음 정한 숫자다 — 2주 기록을 보고 만든 규칙이라 과거로 판정하지 않고, 선언 뒤에 바꾸지 않는다.
+  ※ 커밋 전 고침(11-10, 성적 0일): 초안은 '켜진 뒤 전체 정점'이었는데 실데이터 시험에서 변동성이 2026-02-03 부터
+    25% 아래로 한 번도 안 내려와 07-31 의 103.6% 를 정점으로 기억 → 지금 59%(오늘이 20일 최고 = 공포 확대 중)를
+    '꺾임'으로 보고 11-11 에 바로 사는 것을 확인. '떨어지는 칼을 피한다'는 이 후보의 목적과 반대라 최근 20거래일로 고쳤다.
+    (성적이 아니라 상태 기계가 의도와 다르게 도는 것을 보고 고친 것 — 고친 뒤 과거 성적은 재지 않는다.)
 """
 from __future__ import annotations
 
@@ -44,18 +61,64 @@ import lab_downside as D  # noqa: E402
 # ── 선언 ─────────────────────────────────────────────────────────────────────
 BASE, CASH = "069500", "488770"
 LONGS = {"1": "069500", "2": "122630"}
-SIGNALS = {"V": ("V1", "VIX 종가 > 30(미국발 공포)"), "K": ("K2", "KOSPI 20일 변동성 > 25%(한국발 공포)")}
-MEMBERS = tuple(f"FEAR-{s}{lv}" for s in SIGNALS for lv in LONGS)      # FEAR-V1 V2 K1 K2
+SIGNALS = {"V": ("V1", "VIX 종가 > 30(미국발 공포)"), "K": ("K2", "KOSPI 20일 변동성 > 25%(한국발 공포)"),
+           "P": ("K2", "KOSPI 20일 변동성이 25% 위에서 정점 대비 20% 꺾인 뒤(공포가 잦아들 때)")}
+MEMBERS = tuple(f"FEAR-{s}{lv}" for s in SIGNALS for lv in LONGS)      # FEAR-V1 V2 K1 K2 P1 P2
 ANCHOR = "2026-10-28"
+ANCHORS = {"V": ANCHOR, "K": ANCHOR, "P": "2026-11-10"}              # 신호별 첫 종가 판단일(그다음 거래일 시가 첫 체결)
+PEAK_DROP = 0.20
+PEAK_WINDOW = D.VOL_WINDOW                                            # 정점 = 이번 국면의 최근 20거래일 최고
 F_EQUITY = A.AG_EQUITY
 F_JUDGE_DAYS = 60
 F_MIN_HELD = 20
 F_MAX_MDD_PCT = A.AG_MAX_MDD_PCT
 
 
+def peak_after(vols: list[float | None], th: float, drop: float = PEAK_DROP,
+               window: int = PEAK_WINDOW) -> list[bool]:
+    """FEAR-P 상태 기계 — 변동성 열 → 날마다 보유 여부. 그날까지의 값만 쓴다.
+    정점 = 이번 공포 국면(변동성 > th 연속) 안의 최근 window 거래일 최고 — 몇 달 전 정점을 기억하지 않는다."""
+    out, on, s = [], False, None                     # s = 이번 국면 첫날 index
+    for k, v in enumerate(vols):
+        if v is None or v <= th:
+            on, s = False, None                      # 국면 끝(또는 자료 없음) → 현금
+        else:
+            if s is None:
+                s = k
+            prev = [vols[j] for j in range(max(s, k - window + 1), k)]
+            if not prev or v > max(prev):
+                on = False                           # 국면 첫날 · 새 정점 = 공포 확대 중
+            elif v <= max(prev) * (1 - drop):
+                on = True                            # 정점에서 20% 꺾임
+        out.append(on)
+    return out
+
+
+def kospi_vols(ks: dict) -> tuple[list[str], list[float | None]]:
+    """KOSPI 20일 실현 변동성(연율 %) — lab_downside._vol_above 와 같은 정의(최근 20개 일간 수익률의 표본 표준편차)."""
+    import math
+    ds, c = D._ser(ks)
+    out: list[float | None] = []
+    for k in range(len(c)):
+        if k < D.VOL_WINDOW:
+            out.append(None)
+            continue
+        r = [c[j] / c[j - 1] - 1 for j in range(k - D.VOL_WINDOW + 1, k + 1)]
+        out.append(statistics.stdev(r) * math.sqrt(252) * 100)
+    return ds, out
+
+
 def fear_on(sig: str, px: dict):
-    """d → True(공포)·False·None(자료 부족). lab_downside 의 선언 기본값 그대로."""
+    """d → True(공포)·False·None(자료 부족). V·K 는 lab_downside 의 선언 기본값 그대로, P 는 그 K 에 정점 뒤 규칙."""
     code = SIGNALS[sig][0]
+    if sig == "P":
+        ds, vols = kospi_vols(px["^KS11"])
+        st = dict(zip(ds, peak_after(vols, D.CANDIDATES[code][2])))
+
+        def f(d):
+            k = D._at(ds, d)
+            return None if k < 0 else st[ds[k]]
+        return f
     return D.down_fn(code, D.CANDIDATES[code][2], px)
 
 

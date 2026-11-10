@@ -7,6 +7,8 @@ I3 리그(i3_shadow)와 따로 둔다 — I3 리그는 입장 조건(E1~E3)·정
   멤버  ORB-B1 · ORB-B2 (lab_orb 5분 시가 범위 돌파, 10-29 부터 저장 분봉으로)
         FEAR-V1 · FEAR-V2 · FEAR-K1 · FEAR-K2 (lab_fear 공포 매수, 10-28 종가 판단 → 10-29 시가 첫 체결)
         HH1 (lab_aggr_gen3 한미 반반 × 한국 2배 — **운용자 예외**(10-29 "넣어줘"), 10-29 종가 판단 → 10-30 시가 첫 체결)
+        ORB-B3 (손절·익절을 KODEX200 가격으로, 11-11~) · FEAR-P1 · FEAR-P2 (공포 정점 뒤 매수, 11-10 판단 → 11-11 시가~)
+        — 2주 기록의 약점에서 만든 변형(운용자 11-10 선택), 앞으로만
   조건  모두 50만원 출발. 판정은 각 lab 의 선언(ORB: 60영업일 누적>0·MDD≤30% / FEAR: lab_fear.verdict /
         HH1: ORB 와 같은 60영업일·누적>0·MDD≤30% — 입장 조건 P2·P3·P5 미달을 알고 넣었으니 앞으로의 기록만이 근거).
 
@@ -54,14 +56,16 @@ MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS + ("HH1",)
 
 # ── 멤버 실행 ────────────────────────────────────────────────────────────────
 def orb_run(variant: str, dates: list[str], upto: str, equity: float = EQUITY, replay=B.replay) -> dict:
-    """B_START~upto 저장 분봉으로 날마다 lab_orb.orb_day. curve 첫 점 = ANCHOR(출발 자금)."""
+    """변형의 시작일~upto 저장 분봉으로 날마다 lab_orb. curve 첫 점 = 시작 전 마지막 거래일(출발 자금) —
+    B1·B2 는 ANCHOR(10-28), B3 는 11-10."""
     rows = replay(variant, B.B_START, upto)
-    nav, curve = equity, [(F.ANCHOR, equity)]
+    before = [d for d in dates if d < B.start_of(variant)]
+    nav, curve = equity, [(before[-1] if before else F.ANCHOR, equity)]
     for d, r in rows:
         nav *= 1 + r["ret"]
         curve.append((d, nav))
     seen = {d for d, _ in rows}
-    missing = [d for d in dates if B.B_START <= d <= upto and d not in seen]
+    missing = [d for d in dates if B.start_of(variant) <= d <= upto and d not in seen]
     return {"curve": curve, "last": rows[-1] if rows else None, "missing": missing, "days": len(rows)}
 
 
@@ -125,7 +129,7 @@ def run_members(px: dict, upto: str, equity: float = EQUITY, replay=B.replay) ->
     for name in F.MEMBERS:
         sig, lv = name[-2], name[-1]
         try:
-            r = F.run(px, sig, lv, upto, F.ANCHOR, equity)
+            r = F.run(px, sig, lv, upto, F.ANCHORS[sig], equity)
             out[name] = {**_record(r["curve"], equity), "entries": r["entries"], "held": len(r["held"]),
                          "on_today": r["on_today"],
                          "verdict": F.verdict(r["curve"], r["held"], px[F.BASE], r["dates"])}

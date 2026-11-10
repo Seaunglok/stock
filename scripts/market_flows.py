@@ -107,6 +107,12 @@ def recheck_unchecked(have: dict[str, dict], ks: dict[str, float]) -> list[dict]
     return out
 
 
+def days_to_fetch(trading_days, have: dict, today: str) -> list[str]:
+    """받을 날 — 없는 거래일 중 **오늘 전**만. 오늘 수급은 장 뒤에도 잠정치라(KRX 확정치는 다음 날 아침) 16:30 채우기가
+    받으면 잠정치가 확정치 자리에 앉는다 — 다음 날 아침 시장 일지가 덮지만, 그 아침이 실패하면 남는다."""
+    return [d for d in sorted(trading_days) if d not in have and d < today]
+
+
 def load_rows(path: Path = FLOWS_FILE) -> dict[str, dict]:
     if not path.exists():
         return {}
@@ -187,7 +193,7 @@ async def backfill(start: str = START, end: str | None = None, path: Path = FLOW
     if rechecked:
         upsert(rechecked, path)
         print(f"[market_flows] 대조 다시: {[(r['date'], r['check']) for r in rechecked]}", flush=True)
-    todo = [d for d in sorted(ks) if d not in have]
+    todo = days_to_fetch(ks, have, datetime.now().strftime("%Y-%m-%d"))
     print(f"[market_flows] {start}~{end} 거래일 {len(ks)} · 이미 있음 {len(have)} · 받을 날 {len(todo)}", flush=True)
     if not todo:
         return {"added": 0}

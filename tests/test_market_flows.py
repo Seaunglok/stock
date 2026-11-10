@@ -68,6 +68,13 @@ def test_verified_day_is_ok_only_for_the_confirmed_close():
     assert F.recheck_verified(have) == []
 
 
+def test_backfill_never_fetches_today():
+    """★ 오늘 수급은 잠정치 — 채우기는 어제까지만 받는다(확정치는 다음 날 아침 시장 일지가 넣는다)."""
+    days = ["2026-11-06", "2026-11-09", "2026-11-10"]
+    assert F.days_to_fetch(days, {}, "2026-11-10") == ["2026-11-06", "2026-11-09"]
+    assert F.days_to_fetch(days, {"2026-11-06": {}}, "2026-11-11") == ["2026-11-09", "2026-11-10"]
+
+
 def test_upsert_replaces_same_date_and_sorts(tmp_path):
     p = tmp_path / "d.csv"
     F.upsert([F.row_from("2026-11-06", KOSPI, KOSDAQ, PROG, 5059.69, "t1")], p)

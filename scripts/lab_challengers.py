@@ -80,6 +80,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         m_up: float | None = None, m_down: float | None = None,
         vol_short: int | None = None, vol_long: int = 252, m_min: float = 0.0,
         brake_off_high: int | None = None, brake_off_ma: int | None = None,
+        reentry_flow: str | None = None, flows: dict | None = None, flow_n: int = 20, flow_lag: int = 1,
         x_pct: float = 10, n: int = 20, regime_ma: int = I.I1_REGIME_MA,
         floor_dd: float = H.I3_FLOOR_DD, band: float = H.I3_BAND):
     """I3 일반형 — reset: none(I3) · always(R1) · once(직전 리셋 후 lookback 일 지나야 리셋).
@@ -91,7 +92,13 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
     배수를 줄인다(배수 × min(1, σ_long/σ_short), 하한 m_min). 조용한 장에선 배수를 늘리지 않는다.
     brake_off_high / brake_off_ma(8세대): 회복이 확인된 날엔 브레이크를 걸지 않는다 — KOSPI 종가가 직전 n일 최고 종가보다
     높을 때(엔진 재진입의 n일 고점과 같은 정의) / n일 이동평균보다 높을 때.
+    reentry_flow(9세대): 재진입의 시장 확인(KOSPI > 120일선)에 외국인 수급을 붙인다 — flows = {날짜: KOSPI 외국인 순매수
+    억원}(check=='ok' 줄만). 수급 확인 = d 의 flow_lag 거래일 전까지 flow_n 거래일 합 > 0(확정치는 다음 날 아침에 나오므로
+    15:50 판단엔 전날까지만). 'and' = 120일선 **그리고** 수급, 'or' = 120일선 **또는** 수급. 창 안에 자료가 하나라도 없으면
+    (2010 전·빠진 날) 그날은 I3 확인(120일선) 그대로.
     엔진 나머지는 lab_dd_control.reentry_confirmed 와 같다."""
+    if reentry_flow not in (None, "and", "or"):
+        raise ValueError(f"reentry_flow 는 None·'and'·'or' — {reentry_flow!r}")
     days = sorted(bars)
     pos = {d: k for k, d in enumerate(days)}
     closes = [bars[d]["close"] for d in days]
@@ -108,6 +115,25 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
         if k is None or k + 1 < regime_ma:
             return False
         return kcl[k] > sum(kcl[k + 1 - regime_ma:k + 1]) / regime_ma
+
+    def flow_up(d: str) -> bool | None:
+        """외국인 KOSPI 순매수 합(d 의 flow_lag 거래일 전까지 flow_n 거래일) > 0 — 창에 빈 날이 있으면 None."""
+        k = kpos.get(d)
+        if flows is None or k is None or k - flow_lag + 1 < flow_n:
+            return None
+        vals = [flows.get(x) for x in kdays[k - flow_lag - flow_n + 1:k - flow_lag + 1]]
+        if any(v is None for v in vals):
+            return None
+        return sum(vals) > 0
+
+    def reentry_ok(d: str) -> bool:
+        r = regime_up(d)
+        if reentry_flow is None:
+            return r
+        f = flow_up(d)
+        if f is None:
+            return r
+        return (r and f) if reentry_flow == "and" else (r or f)
 
     def trend_up(d: str, ma: int, lag: int) -> bool:
         """KOSPI ma 일선이 lag 영업일 전보다 높은가(그날까지의 값만)."""
@@ -171,7 +197,7 @@ def i3x(bars: dict, kospi: dict, asset: str, cash: str | None, m: float, lookbac
                 eng["in"] = False
                 return out_w
             return None
-        if k >= n and c > max(closes[k - n:k]) and regime_up(d):
+        if k >= n and c > max(closes[k - n:k]) and reentry_ok(d):
             eng["in"], eng["peak"], eng["entry_i"] = True, c, i
             return {asset: 1.0}
         return None

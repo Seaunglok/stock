@@ -271,6 +271,105 @@ def test_gen8_specs_are_the_declared_numbers():
         assert spec.pop(key) == 20 and spec == G7.SPECS7["V7a"], name
 
 
+def _flow_world(kospi_up: bool):
+    """0~39 상승 → 40 에 −15%(이탈) → 20일 횡보 → 60 부터 20일 고점 갱신. KOSPI 는 늘 오르거나(5일선 위) 늘 내린다."""
+    days = [f"2020-{1 + i // 28:02d}-{1 + i % 28:02d}" for i in range(110)]
+    px = [100 + i for i in range(40)] + [139 * 0.85] * 20 + [140 + i for i in range(50)]
+    bars = {d: {"open": p, "close": p} for d, p in zip(days, px)}
+    kospi = {d: {"open": 1000 + (i if kospi_up else -i), "close": 1000 + (i if kospi_up else -i)}
+             for i, d in enumerate(days)}
+    return days, bars, kospi
+
+
+def _first_reentry(days, bars, kospi, **opt):
+    t = C.i3x(bars, kospi, "A", "C", 6, 252, regime_ma=5, **opt)
+    was_out = False
+    for i, d in enumerate(days):
+        r = t(i, d, 100.0)
+        if r is None:
+            continue
+        w = r.get("A", 0.0)
+        if w == 0.0:
+            was_out = True
+        elif was_out:
+            return i
+    return None
+
+
+def test_flow_reentry_and_blocks_or_allows():
+    """9세대 장치 — 'and' 는 외국인 순매도면 재진입을 막고, 'or' 는 120일선(여기선 5일선) 아래여도 순매수면 들어간다."""
+    up_days, up_bars, up_k = _flow_world(True)
+    dn_days, dn_bars, dn_k = _flow_world(False)
+    neg = {d: -100.0 for d in up_days}
+    pos = {d: +100.0 for d in up_days}
+    assert _first_reentry(up_days, up_bars, up_k) == 60                                   # I3 그대로
+    assert _first_reentry(up_days, up_bars, up_k, reentry_flow="and", flows=pos) == 60
+    assert _first_reentry(up_days, up_bars, up_k, reentry_flow="and", flows=neg) is None
+    assert _first_reentry(dn_days, dn_bars, dn_k) is None                                 # I3 는 하락장 재진입 없음
+    assert _first_reentry(dn_days, dn_bars, dn_k, reentry_flow="or", flows=neg) is None
+    assert _first_reentry(dn_days, dn_bars, dn_k, reentry_flow="or", flows=pos) == 60
+    with pytest.raises(ValueError):
+        C.i3x(up_bars, up_k, "A", "C", 6, 252, reentry_flow="maybe")
+
+
+def test_flow_uses_only_confirmed_days_before_the_decision():
+    """★ 확정치는 다음 날 아침 — 판단일 당일 수급은 쓰지 않는다. 60 일의 큰 순매수는 61 일 판단부터 보인다."""
+    days, bars, kospi = _flow_world(True)
+    flows = {d: -100.0 for d in days}
+    flows[days[60]] = 1e9
+    assert _first_reentry(days, bars, kospi, reentry_flow="and", flows=flows) == 61
+    # 창(20일)에 빈 날이 하나라도 있으면 I3 확인 그대로 — 2010 전 · 빠진 날
+    gap = {d: -100.0 for d in days}
+    del gap[days[50]]
+    assert _first_reentry(days, bars, kospi, reentry_flow="and", flows=gap) == 60
+    assert _first_reentry(days, bars, kospi, reentry_flow="and", flows={}) == 60
+
+
+def test_gen9_specs_and_guard():
+    """9세대 선언(lab_gen9) — 20 = 엔진 n, 전날까지(1), 60 = 2세대 TIGHT_DAYS. 빈 날이 있으면 측정하지 않는다."""
+    import lab_gen9 as G9
+    assert (G9.FLOW_N, G9.FLOW_LAG, G9.FAIL_DAYS, G9.FLOW_GAP_MAX) == (20, 1, C.TIGHT_DAYS, 0)
+    for name, how in (("F9a", "and"), ("F9b", "or")):
+        spec = dict(G9.SPECS9[name])
+        assert spec.pop("reentry_flow") == how and spec == {"reset": "none", "flow_n": 20, "flow_lag": 1}
+    assert G9.REGISTER_ON == "2026-11-16" and G9.E9B_BULL_GAIN_PP == C.E2_BULL_GAIN_PP
+    ks = {f"2020-01-{d:02d}": {"close": 1.0} for d in range(1, 29)}
+    full = {d: 1.0 for d in ks}
+    assert G9.flow_gaps(full, ks, "2020-01-10", "2020-01-28", warmup=5) == []
+    broken = dict(full)
+    del broken["2020-01-06"]                                     # 워밍업 안의 빈 날도 잡는다
+    assert G9.flow_gaps(broken, ks, "2020-01-10", "2020-01-28", warmup=5) == ["2020-01-06"]
+    del broken["2020-01-02"]                                     # 워밍업보다 앞은 상관없다
+    assert G9.flow_gaps(broken, ks, "2020-01-10", "2020-01-28", warmup=5) == ["2020-01-06"]
+
+
+def test_gen9_loads_only_confirmed_rows(tmp_path):
+    import csv
+    import lab_gen9 as G9
+    import market_flows as MF
+    p = tmp_path / "daily.csv"
+    rows = [{"date": "2020-01-02", "kospi_foreign_eok": "120.0", "check": "ok"},
+            {"date": "2020-01-03", "kospi_foreign_eok": "-50.0", "check": "bad:+1.00%"},
+            {"date": "2020-01-06", "kospi_foreign_eok": "-50.0", "check": "dup"},
+            {"date": "2020-01-07", "kospi_foreign_eok": "", "check": "ok"},
+            {"date": "2020-01-08", "kospi_foreign_eok": "-7.0", "check": "ok"}]
+    with p.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=MF.COLS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    assert G9.load_flows(p) == {"2020-01-02": 120.0, "2020-01-08": -7.0}
+
+
+def test_gen9_failure_count():
+    import lab_gen9 as G9
+    dates = [f"2020-01-{d:02d}" for d in range(1, 29)]
+    kodex = {d: {"close": 100.0 + k} for k, d in enumerate(dates)}
+    kodex["2020-01-05"] = {"close": 90.0}
+    st = [("2020-01-02", "2020-01-05"), ("2020-01-10", "2020-01-20"), ("2020-01-21", None)]
+    assert G9.failures(st, kodex, dates) == 1                    # 손실 이탈 1 · 이익 이탈 · 아직 보유
+    assert G9.failures(st, kodex, dates, days=2) == 0            # 60일(여기선 2일) 넘어서 이탈하면 실패 아님
+
+
 def test_gen7_specs_are_the_declared_numbers():
     """7세대 선언(lab_gen7) — 20 = 엔진 n, 252 = L, 하한 2 = I2 격자 최솟값. V7a 는 T6c 그대로 + 브레이크."""
     import lab_dd_control as I

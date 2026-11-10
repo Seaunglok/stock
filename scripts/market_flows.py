@@ -71,6 +71,16 @@ def mark_duplicate(row: dict, prev: dict | None) -> dict:
     return row
 
 
+def recheck_unchecked(have: dict[str, dict], ks: dict[str, float]) -> list[dict]:
+    """대조할 종가가 없어 'unchecked' 로 남은 줄을, 이제 종가가 있으면 다시 대조한다(11-10: 아침 08:30 엔 FDR 에
+    전날 ^KS11 종가가 아직 없어 11-09 줄이 unchecked 였다)."""
+    out = []
+    for d, r in have.items():
+        if r.get("check") == "unchecked" and ks.get(d) and r.get("kospi") not in (None, ""):
+            out.append({**r, "check": check_index(float(r["kospi"]), ks[d])})
+    return out
+
+
 def load_rows(path: Path = FLOWS_FILE) -> dict[str, dict]:
     if not path.exists():
         return {}
@@ -147,6 +157,10 @@ async def backfill(start: str = START, end: str | None = None, path: Path = FLOW
     end = end or datetime.now().strftime("%Y-%m-%d")
     ks = ks_closes(start, end)
     have = load_rows(path)
+    rechecked = recheck_unchecked(have, ks)
+    if rechecked:
+        upsert(rechecked, path)
+        print(f"[market_flows] 대조 다시: {[(r['date'], r['check']) for r in rechecked]}", flush=True)
     todo = [d for d in sorted(ks) if d not in have]
     print(f"[market_flows] {start}~{end} 거래일 {len(ks)} · 이미 있음 {len(have)} · 받을 날 {len(todo)}", flush=True)
     if not todo:

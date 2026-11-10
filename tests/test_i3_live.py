@@ -244,6 +244,45 @@ def test_decide_skips_when_today_bar_missing(paths):
     assert len(notes.msgs) == 1 and notes.msgs[0][0] is False and "판단 건너뜀" in notes.msgs[0][1]
 
 
+class DeadKiwoom(FakeMarket):
+    """11-09 사고 모양 — 키움 호출이 오류를 삼키고 빈 결과를 준다."""
+    async def recent(self, code):
+        return {}
+
+
+class LaggingKiwoom(FakeMarket):
+    """FDR 에는 오늘 일봉이 있는데 키움엔 없다(키움 미갱신)."""
+    async def base_bars(self):
+        return dict(self.base)
+
+    async def recent(self, code):
+        out = await super().recent(code)
+        return {d: v for d, v in out.items() if d < self.today}
+
+
+def test_missing_bar_reason_separates_holiday_from_failure():
+    old = {"2026-11-06": {"close": 1.0}}
+    now = {**old, "2026-11-09": {"close": 1.0}}
+    assert LV.missing_bar_reason("2026-11-09", old, old, {}, old)[1] is True                 # 응답이 비었다
+    assert LV.missing_bar_reason("2026-11-09", now, old, old, old)[1] is True                # FDR 에만 오늘
+    why, crit = LV.missing_bar_reason("2026-11-09", old, old, old, old)                      # 둘 다 없다 = 휴장
+    assert crit is False and why.startswith("오늘 일봉 없음")
+
+
+@pytest.mark.parametrize("market_cls,word", [(DeadKiwoom, "조회 실패"), (LaggingKiwoom, "키움 미갱신")])
+def test_decide_aborts_critically_when_kiwoom_fails(paths, market_cls, word):
+    """★ 일부러 깨뜨린다 — 키움이 막혀도 '휴장'으로 넘기지 않고 판단 중단 + critical(11-09 8050 사고)."""
+    days = _days()
+    m = market_cls(days, days[-1])
+    now = datetime.fromisoformat(days[-1] + "T15:50:00")
+    notes = Notes()
+    r = run(LV.phase_decide(m, FakeBroker(), notes, now, *paths))
+    assert "abort" in r and word in r["abort"] and not paths[0].exists()
+    assert len(notes.msgs) == 1 and notes.msgs[0][0] is True and "판단 중단" in notes.msgs[0][1]
+    ev = [json.loads(x) for x in paths[1].read_text(encoding="utf-8").splitlines()]
+    assert ev[-1]["event"] == "decide_abort"
+
+
 def test_decide_aborts_on_source_mismatch(paths):
     """★ 키움 최근 일봉이 장기 이력과 0.5% 넘게 다르면 판단 중단 + critical."""
     days = _days()

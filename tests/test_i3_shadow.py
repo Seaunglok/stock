@@ -205,6 +205,10 @@ def test_audit_catches_source_mismatch():
     gap = S.audit_sources(hist, off, "2026-10-30")
     assert gap == pytest.approx(0.01) and gap > S.AUDIT_TOL
     assert S.audit_sources(hist, {k: hist[k] for k in list(hist)[:3]}, "2026-10-30") is None
+    assert S.audit_sources(hist, {}, "2026-10-30") is None                       # 11-09: 키움 응답이 비었다
+    # ★ 대조를 못 한 것은 통과가 아니다 — None 인 출처는 따로 모아 critical 로 알린다
+    assert S.audit_gaps({"069500": None, "^KS11": 0.0, "488770": None}) == ["069500", "488770"]
+    assert S.audit_gaps({"069500": 0.001}) == []
 
 
 def test_every_member_starts_from_the_same_line(league_data):

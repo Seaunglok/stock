@@ -139,6 +139,22 @@ def check_consistency(long_hist: dict[str, dict], recent: dict[str, dict], today
     return f"종가 최대 차이 {worst:.2%} > {tol:.1%}" if worst > tol else None
 
 
+def missing_bar_reason(today: str, long_base: dict, long_kospi: dict, rb: dict, rk: dict) -> tuple[str, bool]:
+    """키움에 오늘 일봉이 없을 때 — (사유, 긴급 여부). 휴장과 조회 실패를 가른다.
+
+    11-09 사고: 키움 인증이 '8050 IP 미등록'으로 막혔는데, 키움 호출이 오류를 삼키고 빈 결과를 돌려줘 판단이 '휴장'으로
+    보고 일반 알림만 냈다. 보유 중 이탈 신호가 나는 날이었다면 매도가 조용히 하루 늦었다.
+      · 키움 응답이 통째로 비었다 → 조회 실패(휴장일에도 지난 일봉은 온다)          → 긴급
+      · FDR 에는 오늘 일봉이 있는데 키움엔 없다 → 키움 미갱신                       → 긴급
+      · 둘 다 없다 → 휴장(또는 두 출처 모두 지연)                                   → 일반 알림
+    """
+    if not rb or not rk:
+        return "키움 조회 실패 — 최근 일봉 응답이 비었다(인증·IP·서버 확인 · 11-09 8050 사고와 같은 모양)", True
+    if today in long_base or today in long_kospi:
+        return "키움에 오늘 일봉이 없다 — FDR 에는 있다(키움 미갱신)", True
+    return "오늘 일봉 없음(휴장·미갱신)", False
+
+
 async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: datetime,
                        state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
                        dry_run: bool = True) -> dict:
@@ -148,7 +164,13 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     long_base, long_kospi = await market.base_bars(), await market.kospi_bars()
     rb, rk = await market.recent(K.BASE), await market.recent("KOSPI")
     if today not in rb or today not in rk:
-        log_event("decide_skip", {"reason": "오늘 일봉 없음(휴장·미갱신)"}, events_path)
+        why, critical = missing_bar_reason(today, long_base, long_kospi, rb, rk)
+        if critical:
+            log_event("decide_abort", {"reason": why}, events_path)
+            await notify(f"⛔ [I3] {today} 판단 중단 — {why}. 고친 뒤 scripts\\i3_decide.cmd 를 다시 돌리면 오늘 판단이 "
+                         f"된다(내일 08:50 매매는 그 판단을 따른다)", critical=True)
+            return {"abort": why}
+        log_event("decide_skip", {"reason": why}, events_path)
         # 운용자(10-26): 조용히 건너뛰면 평일 데이터 지연을 모르고 지나간다 — 휴장일엔 정상이라 일반 알림
         await notify(f"ℹ️ [I3] {today} 판단 건너뜀 — 오늘 일봉이 없다. 휴장일이면 정상, 평일이면 데이터 미갱신 확인 "
                      f"필요(이 경우 내일 아침 매매도 없다)")

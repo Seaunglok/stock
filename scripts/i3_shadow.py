@@ -436,6 +436,12 @@ def audit_sources(hist: dict, recent: dict, upto: str) -> float | None:
                if hist[d].get(f) and recent[d].get(f))
 
 
+def audit_gaps(audit: dict[str, float | None]) -> list[str]:
+    """대조하지 못한 출처(키움 최근 일봉이 없거나 겹치는 날 5일 미만). 11-09 사고: 키움 인증 실패로 전부 None 이었는데
+    '대조 통과'로 기록됐다 — 대조를 못 한 것은 통과가 아니다."""
+    return sorted(c for c, x in audit.items() if x is None)
+
+
 def run_league(data: dict, start: str, equity: float, upto: str,
                members: tuple[Member, ...] = MEMBERS) -> dict[str, dict]:
     """멤버별 결과. 실패한 멤버는 {'error': ...} 로 남기고 나머지는 계속한다."""
@@ -699,9 +705,13 @@ async def main_async(now: datetime) -> int:
     today = now.strftime("%Y-%m-%d")
     data, audit = await _load_data(today)
     bad = {c: x for c, x in audit.items() if x is not None and x > AUDIT_TOL}
+    gaps = audit_gaps(audit)
     if bad:
         await LV._notify("⛔ [I3 리그] 데이터 출처 불일치 — 오늘 리그 기록은 믿을 수 없다: "
                          + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
+    if gaps:
+        await LV._notify("⛔ [I3 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
+                         + " (인증·IP·서버 확인 — 11-09 8050 사고). 오늘 기록은 대조 없이 FDR 만으로 했다", critical=True)
     base, kospi = data[K.BASE], data[KOSPI]
     # 장중엔 오늘 일봉이 미완성 — 15:35 전이면 어제까지만 본다
     upto = (today if now.time() >= AFTER_CLOSE and today in base and today in kospi
@@ -732,7 +742,8 @@ async def main_async(now: datetime) -> int:
     rec = {"asof": upto, "start": start, "equity": round(equity),
            "live": {"nav": round(live_nav), "ret": round((live_nav / equity - 1) * 100, 3), "date": navs[-1][0]},
            "models": models, "promotion": promo,
-           "audit": {c: (None if x is None else round(x, 6)) for c, x in audit.items()}, "audit_ok": not bad}
+           "audit": {c: (None if x is None else round(x, 6)) for c, x in audit.items()},
+           "audit_ok": not bad and not gaps, "audit_gaps": gaps}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SHADOW_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -43,6 +43,14 @@ def test_duplicate_of_previous_day_is_marked():
     assert F.mark_duplicate(c, a)["check"] == "ok"
 
 
+def test_unchecked_rows_are_rechecked_when_close_appears():
+    have = {"2026-11-09": {**F.row_from("2026-11-09", KOSPI, KOSDAQ, PROG, None, "t"), "kospi": "5059.69"},
+            "2026-11-06": {**F.row_from("2026-11-06", KOSPI, KOSDAQ, PROG, 5059.69, "t"), "kospi": "5059.69"}}
+    assert [r["check"] for r in F.recheck_unchecked(have, {"2026-11-09": 5059.69})] == ["ok"]
+    assert [r["check"] for r in F.recheck_unchecked(have, {"2026-11-09": 4000.0})] == ["bad:+26.49%"]
+    assert F.recheck_unchecked(have, {}) == []                        # 아직 종가가 없으면 그대로
+
+
 def test_upsert_replaces_same_date_and_sorts(tmp_path):
     p = tmp_path / "d.csv"
     F.upsert([F.row_from("2026-11-06", KOSPI, KOSDAQ, PROG, 5059.69, "t1")], p)

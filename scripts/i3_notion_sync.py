@@ -6,7 +6,7 @@
   설계 근거는 docs/notion-guide.md.
 
     prep   최근 LOOKBACK_DAYS 일의 I3 기록을 Notion 행 모양으로 계산해 OUT_FILE 에 쓴다.
-             daily   — 일일 기록DB: 판단·자산·성과·매매·입출금·리그 (하루 1행)
+             daily   — 일일 기록DB: 판단·자산·성과·매매·입출금·리그·공격형 리그(11-11~, data/aggr/history.csv) (하루 1행)
              trades  — 주식 매매일지DB: 체결 1건 = 1행(매매이유 MARK "🛡️ 방어형 ETF 자동매매(I3) …"), 매도는 평균단가 기준
              months  — 월별 결산DB: "🛡️ 방어형 ETF 자동매매(I3) YYYY년 M월" 1행(매수·매도·실현손익·비용·월 수익률)
              Notion 에 보이는 이름은 줄임말 단독 금지 — TRACK·DISPLAY(풀네임(줄임말), 운용자 10-22)
@@ -60,6 +60,19 @@ DISPLAY = {                 # 리그 멤버 이름이 영문 줄임말이면 여
     "D5a": "방어 자산 추세 현금 자리(D5a)",
     "T6c": "장기 추세 연동 예산 배수 8/4(T6c)",
     "V7a": "추세 연동 배수 + 변동성 브레이크(V7a)",
+}
+AGGR_DIR = _ROOT / "data" / "aggr"
+AGGR_DISPLAY = {            # 공격형 리그(aggr_shadow.MEMBERS) 표시 이름 — 11-11 운용자 "그렇게 진행해줘"(멤버DB + 매일 한 줄)
+    "ORB-B1": "시가 범위 돌파 KODEX200(ORB-B1)",
+    "ORB-B2": "시가 범위 돌파 레버리지(ORB-B2)",
+    "ORB-B3": "시가 범위 돌파 KODEX200 기준 손절(ORB-B3)",
+    "FEAR-V1": "공포 매수 VIX·KODEX200(FEAR-V1)",
+    "FEAR-V2": "공포 매수 VIX·레버리지(FEAR-V2)",
+    "FEAR-K1": "공포 매수 KOSPI 변동성·KODEX200(FEAR-K1)",
+    "FEAR-K2": "공포 매수 KOSPI 변동성·레버리지(FEAR-K2)",
+    "FEAR-P1": "공포 정점 뒤 매수 KODEX200(FEAR-P1)",
+    "FEAR-P2": "공포 정점 뒤 매수 레버리지(FEAR-P2)",
+    "HH1": "한미 반반 × 한국 2배(HH1)",
 }
 
 
@@ -117,6 +130,27 @@ def league_text(rows: list[dict], day: str, slug_names: dict[str, str], champion
     if lv not in ("", None) and first.get("live_nav"):
         txt += f" · 실계좌 {(float(lv) / first['live_nav'] - 1) * 100:+.2f}%"
     return txt
+
+
+def aggr_text(rows: list[dict], day: str, stopped: dict[str, str], equity: float,
+              names: dict[str, str] = AGGR_DISPLAY) -> str | None:
+    """data/aggr/history.csv 의 그날 행 → 'X +a% · Y +b% · … — 멤버 n개 · 50만원 그림자 · 주문 없음'(누적 높은 순).
+    멤버는 모두 같은 출발 자금(equity)이라 그 기준으로 센다. 그날 값이 빈 멤버(아직 시작 전)는 뺀다.
+    stopped(aggr_shadow 의 정지선 도달일)가 그날 이전이면 '⛔ 정지선' 을 붙인다."""
+    today = next((r for r in rows if r.get("date") == day), None)
+    if not today:
+        return None
+    rets = {}
+    for k, v in today.items():
+        if k.endswith("_nav") and v not in ("", None):
+            rets[k[:-4].upper()] = round((float(v) / equity - 1) * 100, 2)
+    if not rets:
+        return None
+    parts = []
+    for n in sorted(rets, key=lambda x: (-rets[x], x)):
+        mark = " ⛔ 정지선" if stopped.get(n) and stopped[n] <= day else ""
+        parts.append(f"{names.get(n, n)} {rets[n]:+.2f}%{mark}")
+    return " · ".join(parts) + f" — 멤버 {len(rets)}개 · {equity / 10_000:,.0f}만원 그림자 · 주문 없음"
 
 
 # ── 매매 ────────────────────────────────────────────────────────────────────
@@ -231,7 +265,8 @@ FLOW_LABEL = {"declared": "신고", "auto-withdrawal": "출금(자동)", "auto-d
               "distribution": "분배금", "skip-trade": "매매일 — 판정 보류"}
 
 
-def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], since: str) -> list[dict]:
+def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], since: str,
+               aggr: dict[str, str] | None = None) -> list[dict]:
     """events.jsonl + 성과 지수 → 일일 기록DB 행. 하루에 판단이 여러 번이면 마지막 것."""
     by_day: dict[str, dict] = {}
     for e in events:
@@ -279,6 +314,8 @@ def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], sin
                     notes.append("주문 " + ", ".join(bad))
             if league.get(day):
                 row["리그"] = league[day]
+            if aggr and aggr.get(day):
+                row["공격형 리그"] = aggr[day]
             if notes:
                 row["특이사항"] = " · ".join(n for n in notes if n)
             if "판단" in row or "매매" in row:
@@ -301,7 +338,9 @@ def plans_by_trade_day(events: list[dict]) -> dict[str, dict]:
 
 
 def build_payload(events: list[dict], navs: list[list], fills: list[dict], league_rows: list[dict],
-                  slug_names: dict[str, str], today: datetime, lookback: int = LOOKBACK_DAYS) -> dict:
+                  slug_names: dict[str, str], today: datetime, lookback: int = LOOKBACK_DAYS,
+                  aggr_rows: list[dict] | None = None, aggr_stopped: dict[str, str] | None = None,
+                  aggr_equity: float = 500_000.0) -> dict:
     since = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
     league = {}
     for r in league_rows:
@@ -310,7 +349,14 @@ def build_payload(events: list[dict], navs: list[list], fills: list[dict], leagu
             t = league_text(league_rows, d, slug_names)
             if t:
                 league[d] = t
-    daily = daily_rows(events, navs, league, since)
+    aggr = {}
+    for r in aggr_rows or []:
+        d = r.get("date", "")
+        if d >= since:
+            t = aggr_text(aggr_rows, d, aggr_stopped or {}, aggr_equity)
+            if t:
+                aggr[d] = t
+    daily = daily_rows(events, navs, league, since, aggr)
     plans = plans_by_trade_day(events)
     trades_all, _ = trade_rows(fills, "0000-00-00", plans)
     trades, warns = trade_rows(fills, since, plans)
@@ -329,12 +375,17 @@ def _league_rows(path: Path) -> list[dict]:
 
 
 def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = OUT_FILE,
-         journal_dir: Path | None = None) -> dict:
+         journal_dir: Path | None = None, aggr_dir: Path = AGGR_DIR) -> dict:
+    import aggr_shadow as AS
     import i3_shadow as S
     st = json.loads((data_dir / "state.json").read_text(encoding="utf-8")) if (data_dir / "state.json").exists() else {}
+    ag = aggr_dir / AS.SHADOW_FILE.name
+    stopped = (json.loads(ag.read_text(encoding="utf-8")).get("stopped") or {}) if ag.exists() else {}
     payload = build_payload(_read_jsonl(data_dir / "events.jsonl"), st.get("navs") or [],
                             _read_jsonl(data_dir / "fills.jsonl"), _league_rows(data_dir / "shadow_history.csv"),
-                            {S._slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now())
+                            {S._slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now(),
+                            aggr_rows=_league_rows(aggr_dir / AS.HISTORY_FILE.name), aggr_stopped=stopped,
+                            aggr_equity=AS.EQUITY)
     import market_journal as MJ                       # 시장 일지DB(11-06) — 같은 대조 창으로 없는 행만
     payload["journal"] = MJ.notion_rows(payload["since"], journal_dir or MJ.JOURNAL_DIR)
     out.parent.mkdir(parents=True, exist_ok=True)

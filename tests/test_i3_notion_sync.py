@@ -130,6 +130,29 @@ def test_notion_names_have_no_bare_abbreviation():
     assert N.DISPLAY[S.CHAMPION] == N.TRACK and N.MARK.endswith(N.TRACK)
 
 
+def test_aggr_names_have_no_bare_abbreviation():
+    """공격형 리그 멤버도 Notion 에선 「풀네임(줄임말)」 — 새 변형을 등록하면서 빠뜨리면 여기서 걸린다."""
+    import aggr_shadow as AS
+    for n in AS.MEMBERS:
+        assert n in N.AGGR_DISPLAY, f"{n}: 공격형 표시 풀네임 없음 — AGGR_DISPLAY 에 추가"
+        assert N.AGGR_DISPLAY[n].endswith(f"({n})"), N.AGGR_DISPLAY[n]
+    assert set(N.AGGR_DISPLAY) == set(AS.MEMBERS)
+
+
+def test_aggr_text_orders_marks_stop_and_skips_unstarted():
+    rows = [{"date": "2026-11-10", "orb-b1_nav": "488179", "orb-b3_nav": "", "fear-k2_nav": "366484", "hh1_nav": "499952"},
+            {"date": "2026-11-11", "orb-b1_nav": "485152", "orb-b3_nav": "495084", "fear-k2_nav": "387844",
+             "hh1_nav": "499992"}]
+    stopped = {"FEAR-K2": "2026-11-06"}
+    t = N.aggr_text(rows, "2026-11-10", stopped, 500_000.0)
+    assert t == ("한미 반반 × 한국 2배(HH1) -0.01% · 시가 범위 돌파 KODEX200(ORB-B1) -2.36% · "
+                 "공포 매수 KOSPI 변동성·레버리지(FEAR-K2) -26.70% ⛔ 정지선 — 멤버 3개 · 50만원 그림자 · 주문 없음")
+    t2 = N.aggr_text(rows, "2026-11-11", stopped, 500_000.0)
+    assert "시가 범위 돌파 KODEX200 기준 손절(ORB-B3) -0.98%" in t2 and "멤버 4개" in t2       # 11-11 시작 멤버
+    assert "⛔" not in N.aggr_text(rows, "2026-11-10", {"FEAR-K2": "2026-11-20"}, 500_000.0)   # 정지 전 날짜엔 표시 없음
+    assert N.aggr_text(rows, "2026-11-12", stopped, 500_000.0) is None
+
+
 def test_task_file_queries_the_same_mark_as_the_code():
     """★ 작업지시서의 조회 키 == 코드가 쓰는 앞머리. 어긋나면 에이전트가 기존 행을 못 찾아 **매일 중복 행**을 넣는다."""
     txt = (_ROOT / "scripts" / "i3_notion_task.md").read_text(encoding="utf-8")
@@ -171,10 +194,16 @@ def test_prep_reads_real_writers(tmp_path):
     MJ.save_section("2026-10-22", "close", {"kospi": {"지수": 3500.0, "등락(%)": -1.0, "외국인": -100.0, "기관": 50.0,
                                                     "개인": 50.0}}, jd)
     MJ.save_section("2026-10-23", "morning", {"overseas": {}}, jd)          # 아침만 있는 날은 행 없음
+    import aggr_shadow as AS                         # 공격형 리그도 실제 writer(append_history) → prep
+    ad = tmp_path / "aggr"
+    AS.append_history({"date": "2026-10-22", "orb-b1_nav": 510000, "fear-k2_nav": 300000}, ad / AS.HISTORY_FILE.name)
+    (ad / AS.SHADOW_FILE.name).write_text(json.dumps({"stopped": {"FEAR-K2": "2026-10-22"}}), encoding="utf-8")
     out = tmp_path / "out.json"
-    p = N.prep(datetime(2026, 10, 23, 16, 30), data_dir=tmp_path, out=out, journal_dir=jd)
+    p = N.prep(datetime(2026, 10, 23, 16, 30), data_dir=tmp_path, out=out, journal_dir=jd, aggr_dir=ad)
     assert json.loads(out.read_text(encoding="utf-8")) == p
     assert p["daily"][0]["일자"] == "2026-10-22" and p["daily"][0]["리그"].endswith("· 실계좌 +0.00%")
+    assert p["daily"][0]["공격형 리그"].startswith("시가 범위 돌파 KODEX200(ORB-B1) +2.00% · ")
+    assert "(FEAR-K2) -40.00% ⛔ 정지선" in p["daily"][0]["공격형 리그"]
     assert p["trades"][0]["체결수량"] == 34 and p["months"][0]["key"] == "2026-10"
     assert [r["일자"] for r in p["journal"]] == ["2026-10-22"] and p["journal"][0]["외국인 순매수(억원)"] == -100.0
     assert "결과:" not in N.prep_summary(p) and "시장 일지 1행" in N.prep_summary(p)

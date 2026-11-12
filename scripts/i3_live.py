@@ -139,6 +139,12 @@ def check_consistency(long_hist: dict[str, dict], recent: dict[str, dict], today
     return f"종가 최대 차이 {worst:.2%} > {tol:.1%}" if worst > tol else None
 
 
+def _cause(src: Any, *codes: str) -> str:
+    """조회 실패 원인(KiwoomMarket·KiwoomBroker 의 errors) 한 줄 — 가짜 객체엔 없을 수 있다."""
+    errs = getattr(src, "errors", None) or {}
+    return " · ".join(f"{c} {errs[c]}" for c in codes if errs.get(c))[:300]
+
+
 def missing_bar_reason(today: str, long_base: dict, long_kospi: dict, rb: dict, rk: dict) -> tuple[str, bool]:
     """키움에 오늘 일봉이 없을 때 — (사유, 긴급 여부). 휴장과 조회 실패를 가른다.
 
@@ -165,6 +171,9 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     rb, rk = await market.recent(K.BASE), await market.recent("KOSPI")
     if today not in rb or today not in rk:
         why, critical = missing_bar_reason(today, long_base, long_kospi, rb, rk)
+        cause = _cause(market, K.BASE, "KOSPI")
+        if cause:
+            why = f"{why} · 키움: {cause}"
         if critical:
             log_event("decide_abort", {"reason": why}, events_path)
             await notify(f"⛔ [I3] {today} 판단 중단 — {why}. 고친 뒤 scripts\\i3_decide.cmd 를 다시 돌리면 오늘 판단이 "
@@ -328,13 +337,17 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
         for side, code, planned in buys:
             px = await broker.price(code)
             if not px or px <= 0:
-                await notify(f"⛔ [I3] {code} 현재가 조회 실패 — 매수 안 함(추측 주문 금지)", critical=True)
+                cause = _cause(broker, code)
+                await notify(f"⛔ [I3] {code} 현재가 조회 실패 — 매수 안 함(추측 주문 금지)"
+                             + (f" · 키움: {cause}" if cause else ""), critical=True)
                 rec["buys"][code] = {"planned": planned, "skip": "현재가 없음"}
                 continue
             lim = limit_price(px)
             cash = await broker.orderable(code, lim)
             if cash is None:
-                await notify(f"⛔ [I3] {code} 주문가능금액 조회 실패 — 매수 안 함", critical=True)
+                cause = _cause(broker, code)
+                await notify(f"⛔ [I3] {code} 주문가능금액 조회 실패 — 매수 안 함" + (f" · 키움: {cause}" if cause else ""),
+                             critical=True)
                 rec["buys"][code] = {"planned": planned, "cur": px, "limit": lim, "skip": "주문가능금액 없음"}
                 continue
             qty = min(planned, affordable(cash, lim))
@@ -419,7 +432,12 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
 
 # ── 실제 연결 ────────────────────────────────────────────────────────────────
 class KiwoomMarket:
-    """장기 이력은 FDR(검증과 같은 출처), 최근·오늘 일봉은 키움(날짜 포함·당일 반영)."""
+    """장기 이력은 FDR(검증과 같은 출처), 최근·오늘 일봉은 키움(날짜 포함·당일 반영).
+    키움 조회는 `kiwoom_read`(직접·오류를 담는다) — 실패하면 빈 dict 를 돌려주고 원인은 `errors[code]` 에 남긴다
+    (11-12 리팩터링: 옛 MCP 길은 8050 을 삼켜 '빈 응답'만 남겼다)."""
+
+    def __init__(self):
+        self.errors: dict[str, str] = {}
 
     async def base_bars(self):
         import strategy_lab as L
@@ -430,30 +448,20 @@ class KiwoomMarket:
         return L.load_bars("^KS11", "1996-01-01", (datetime.now()).strftime("%Y-%m-%d"))
 
     async def recent(self, code: str):
-        from trend_config import MARKET_URL
-        from trend_kiwoom_io import _kiwoom_call, _num
-        if code == "KOSPI":
-            d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "sector_daily_chart",
-                                   {"sector_code": "001", "limit": 150})
-            rows, scale = d.get("inds_dt_pole_qry") or [], 100.0
-        else:
-            d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "get_daily_chart",
-                                   {"stock_code": code, "limit": 150})
-            rows, scale = d.get("stk_dt_pole_chart_qry") or [], 1.0
-        out = {}
-        for r in rows:
-            dt = str(r.get("dt", ""))
-            c = _num(r, "cur_prc", abs_val=True) / scale
-            o = _num(r, "open_pric", abs_val=True) / scale or c
-            if len(dt) == 8 and c > 0:      # 고가·저가도 담는다(리그 변동성돌파가 같은 함수를 쓴다 — 판단은 시가·종가만 본다)
-                out[f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"] = {
-                    "open": o, "close": c,
-                    "high": (_num(r, "high_pric", abs_val=True) / scale) or max(o, c),
-                    "low": (_num(r, "low_pric", abs_val=True) / scale) or min(o, c)}
-        return out
+        """키움 최근 150 일봉 — 고가·저가도 담는다(리그 변동성돌파가 같은 함수를 쓴다 — 판단은 시가·종가만 본다)."""
+        import kiwoom_read as KR
+        bars, r = await KR.daily_bars(code, datetime.now().strftime("%Y%m%d"))
+        if not r.ok:
+            self.errors[code] = r.why()
+        return bars
 
 
 class KiwoomBroker:
+    """계좌 평가·주문은 MCP(검증된 길), 현재가·주문가능금액은 `kiwoom_read` — 실패 원인은 `errors[code]`."""
+
+    def __init__(self):
+        self.errors: dict[str, str] = {}
+
     async def holdings(self):
         from trend_kiwoom_io import _broker_holdings_checked
         return await _broker_holdings_checked()
@@ -463,20 +471,19 @@ class KiwoomBroker:
         return await _account_equity()
 
     async def price(self, code):
-        from trend_config import MARKET_URL
-        from trend_kiwoom_io import _kiwoom_call, _num
-        d = await _kiwoom_call("kiwoom-market-mcp", MARKET_URL, "basic_info", {"stock_code": code})
-        return _num(d, "cur_prc", abs_val=True) or None
+        import kiwoom_read as KR
+        px, r = await KR.current_price(code)
+        if px is None:
+            self.errors[code] = r.why() if not r.ok else "현재가 0"
+        return px
 
     async def orderable(self, code, price):
         """kt00010 주문가능금액(ord_alowa). 응답이 이상하면 None — 0 으로 믿지 않는다."""
-        from trend_config import TRADING_URL
-        from trend_kiwoom_io import _kiwoom_call, _num
-        d = await _kiwoom_call("trading-domain", TRADING_URL, "orderable_amount",
-                               {"stock_code": code, "trade_type": "buy", "price": price})
-        if str(d.get("return_code")) != "0" or "ord_alowa" not in d:
-            return None
-        return _num(d, "ord_alowa")
+        import kiwoom_read as KR
+        cash, r = await KR.orderable_amount(code, price)
+        if cash is None:
+            self.errors[code] = r.why()
+        return cash
 
     async def place(self, side, code, qty, price=None):
         """주문 1회 — price 가 있으면 지정가(01), 없으면 시장가(03). **재전송하지 않는다**: 예외·타임아웃은
@@ -515,6 +522,9 @@ def _setup_logging() -> None:
     h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(h)
     log.setLevel(logging.INFO)
+    kr = logging.getLogger("kiwoom_read")              # 키움 조회 실패 원인도 같은 로그에(11-12 리팩터링)
+    kr.addHandler(h)
+    kr.setLevel(logging.INFO)
 
 
 async def wait_broker_ready(broker: Broker, deadline: datetime, sleep=asyncio.sleep, clock=datetime.now,

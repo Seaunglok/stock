@@ -70,15 +70,15 @@ def merge_save(code: str, day: str, bars: list[dict], out_dir: Path = OUT_DIR) -
 
 
 async def collect(now: datetime) -> dict:
-    from src.mcp_servers.kiwoom_mcp.common.constants.api_types import KiwoomAPIID
-    from src.mcp_servers.kiwoom_mcp.domains.market_domain import create_market_domain_server
-    srv = create_market_domain_server()                # MCP 응답 30KB 잘림을 피해 서버 코드를 프로세스 안에서 쓴다
+    import kiwoom_read as KR          # 키움 직접(11-12 리팩터링 — 전엔 market 서버 객체를 프로세스 안에서 만들어 썼다)
     today = now.strftime("%Y-%m-%d")
     report = {}
     for code in CODES:
-        r = await srv.call_api_with_response(api_id=KiwoomAPIID.STOCK_MINUTE_CHART, query=f"{code} 1분",
-                                             params={"stk_cd": code, "tic_scope": "1", "upd_stkpc_tp": "1"})
-        days = parse_rows((r.get("data") or {}).get("stk_min_pole_chart_qry") or [])
+        rows, r = await KR.minute_rows(code)
+        if not r.ok:
+            report[code] = {"days": {}, "short_days": [], "error": r.why()}
+            continue
+        days = parse_rows(rows)
         saved = {}
         for day, bars in days.items():
             if day == today and now.time() < SESSION_END:

@@ -50,18 +50,7 @@ REGISTER_HINT = "키움 REST API 홈페이지 > API 사용신청 화면에서 IP
 
 
 # ── 순수 함수 ────────────────────────────────────────────────────────────────
-def classify(result: dict | None, error: str | None) -> tuple[str, str]:
-    """키움 응답 → ('ok' | 'ip' | 'fail', 설명). 8050 은 토큰 단계(예외 문구)·조회 단계(return_msg) 어디서든 올 수 있다."""
-    if error is not None:
-        return ("ip" if "8050" in error else "fail"), error
-    if not isinstance(result, dict):
-        return "fail", "응답 없음"
-    rc, msg = result.get("return_code"), str(result.get("return_msg") or "")
-    if "8050" in msg:
-        return "ip", msg
-    if rc in (0, "0"):
-        return "ok", msg or "정상"
-    return "fail", f"rc={rc} {msg}".strip()
+from kiwoom_read import classify  # noqa: E402,F401 — 판정은 키움 조회 모듈 하나에서(11-12 리팩터링)
 
 
 def decide(prev: dict, status: str, detail: str, ip: str | None, now: datetime,
@@ -127,20 +116,10 @@ async def public_ip() -> str | None:
 
 
 async def probe_kiwoom(now: datetime) -> tuple[dict | None, str | None]:
-    """키움 REST 직접 1번 — (응답, 예외 문구)."""
-    from src.mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client import KiwoomRESTAPIClient
-    c = KiwoomRESTAPIClient()
-    try:
-        r = await c.call_api("ka10081", {"stk_cd": PROBE_CODE, "base_dt": now.strftime("%Y%m%d"), "upd_stkpc_tp": "1"})
-        return r, None
-    except Exception as e:  # noqa: BLE001
-        return None, f"{type(e).__name__}: {e}"
-    finally:
-        if hasattr(c, "close"):
-            try:
-                await c.close()
-            except Exception:  # noqa: BLE001
-                pass
+    """키움 REST 직접 1번 — (응답, 예외 문구). 재시도는 check() 가 한다(네트워크가 자리 잡을 시간까지 넉넉히)."""
+    import kiwoom_read as KR
+    return await KR.raw_call(KR.API["daily"], {"stk_cd": PROBE_CODE, "base_dt": now.strftime("%Y%m%d"),
+                                               "upd_stkpc_tp": "1"})
 
 
 async def check(delay: float = 0.0, dry_run: bool = False, state_file: Path = STATE_FILE,

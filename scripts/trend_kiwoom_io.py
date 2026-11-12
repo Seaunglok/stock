@@ -47,9 +47,13 @@ async def _kiwoom_call(server_key: str, url: str, tool_kw, args: dict) -> dict:
             if not isinstance(p, dict):
                 return {}
             d = p.get("data", p)
+            if isinstance(d, dict) and d.get("return_code") not in (None, 0, "0"):
+                # 11-12 리팩터링: 키움 거부(예: 8050 IP 미등록)를 조용히 넘기지 않는다 — 반환값은 그대로(호출자 호환)
+                logger.warning("[KIWOOM] %s %s 키움 거부 rc=%s: %s", server_key, kws, d.get("return_code"),
+                               str(d.get("return_msg", ""))[:160])
             return d if isinstance(d, dict) else {}
     except Exception as e:
-        logger.debug("[KIWOOM] %s %s 실패: %s", server_key, kws, e)
+        logger.warning("[KIWOOM] %s %s 실패: %s", server_key, kws, e)
         return {}
 
 

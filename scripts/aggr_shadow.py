@@ -233,7 +233,7 @@ async def _load(today: str) -> tuple[dict, dict]:
 
 
 async def main_async(now: datetime) -> int:
-    from trend_runtime import notify
+    from ops_base import notify
     from i3_shadow import AUDIT_TOL
     today = now.strftime("%Y-%m-%d")
     if today < F.ANCHOR:

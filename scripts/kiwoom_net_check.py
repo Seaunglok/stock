@@ -141,7 +141,7 @@ async def check(delay: float = 0.0, dry_run: bool = False, state_file: Path = ST
     if not dry_run:
         save_state(state, state_file)
         if msgs:
-            from trend_runtime import notify
+            from ops_base import notify
             for text, critical in msgs:
                 await notify(text, critical=critical)
     return {"status": status, "ip": ip, "msgs": msgs, "state": state}

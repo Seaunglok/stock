@@ -504,7 +504,7 @@ async def run_morning(now: datetime, notify: bool = True) -> dict:
     text = morning_summary(day, rec, prev, (load_day(prev).get("close") if prev else None))
     print(text)
     if notify:
-        from trend_runtime import notify as tg
+        from ops_base import notify as tg
         await tg(text)
     return rec
 
@@ -536,7 +536,7 @@ async def run_close(now: datetime, notify: bool = True) -> dict:
     print(f"[market_journal close] {day} 잠정 {flows_text(rec.get('flows_prelim'))} · 뉴스 {len(rec.get('news', []))}건 · "
           f"공시 {len(rec.get('dart', []))}건 · 실패 {errors or '없음'} → {p}")
     if errors and notify:
-        from trend_runtime import notify as tg
+        from ops_base import notify as tg
         await tg(f"⚠️ [시장 일지] {day} 장 마감 조회 실패: {', '.join(errors)}")
     return rec
 

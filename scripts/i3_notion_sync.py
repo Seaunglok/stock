@@ -420,7 +420,7 @@ def check(log: Path, offset: int, dry_run: bool = False) -> int:
     if dry_run:
         print("[dry-run] 알림 생략:", msg.replace("\n", " | "))
     else:
-        from trend_runtime import notify
+        from ops_base import notify
         asyncio.run(notify(msg, critical=True))
     return 1
 

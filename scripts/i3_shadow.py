@@ -699,7 +699,7 @@ def summary_line(rec: dict) -> str:
 
 async def main_async(now: datetime) -> int:
     import i3_live as LV
-    from trend_runtime import notify
+    from ops_base import notify
     st = LV.load_state()
     navs = st.get("navs") or []
     if not navs:

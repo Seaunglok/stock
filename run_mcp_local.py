@@ -1,8 +1,13 @@
 """MCP 서버 로컬 기동 런처 (Docker 없이)
 사용법:
-  python run_mcp_local.py start   # 모든 MCP 서버 기동
-  python run_mcp_local.py stop    # 모든 MCP 서버 종료
-  python run_mcp_local.py status  # 상태 확인
+  python run_mcp_local.py start        # 모든 MCP 서버 기동
+  python run_mcp_local.py start live   # 운용에 필요한 키움 서버 5개만(8030~8034) — 워치독이 쓴다(11-12)
+  python run_mcp_local.py stop         # 모든 MCP 서버 종료
+  python run_mcp_local.py status       # 상태 확인
+
+11-12 리팩터링: 운용 코드(I3 주문·계좌 평가 · 외인 수집)가 쓰는 것은 키움 도메인 서버뿐이다. 나머지 7개(tavily·naver_news·
+stock·financial·macro·closing_bet·trend)는 종료한 트랙·옛 에이전트용이라 매일 띄우지 않는다(손으로 `start` 하면 다 뜬다).
+시세 조회는 이미 `scripts/kiwoom_read.py` 가 키움 REST 를 직접 부른다.
 """
 import os
 import sys
@@ -28,6 +33,17 @@ SERVERS = [
     ("closing_bet",  "src.mcp_servers.closing_bet_mcp.server"),
     ("trend",        "src.mcp_servers.trend_mcp.server"),
 ]
+# 운용 프로필 — trend_watchdog.ESSENTIAL_PORTS(8030~8034)와 같은 다섯(테스트가 맞춰 본다)
+LIVE = ("kiwoom_mkt", "kiwoom_info", "kiwoom_trade", "kiwoom_inv", "kiwoom_port")
+
+
+def select_servers(profile: str = "all") -> list[tuple[str, str]]:
+    """기동할 서버 — 'all'(기본) 또는 'live'(키움 5개). 모르는 이름이면 실수로 다 끄지 않게 오류."""
+    if profile == "all":
+        return list(SERVERS)
+    if profile == "live":
+        return [s for s in SERVERS if s[0] in LIVE]
+    raise ValueError(f"모르는 프로필: {profile!r} (all|live)")
 
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,11 +107,12 @@ def is_running(pid: int, module: str = "") -> bool:
     return module in cmd if cmd else True   # 커맨드라인 조회 불가 시 생존만으로 인정
 
 
-def start_servers():
+def start_servers(profile: str = "all"):
+    targets = select_servers(profile)
     env = load_env()
     pids = load_pids()
 
-    for name, module in SERVERS:
+    for name, module in targets:
         pid = pids.get(name)
         if pid and is_running(pid, module):
             print(f"[SKIP] {name} 이미 실행 중 (PID={pid})")
@@ -179,7 +196,7 @@ def check_status():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "start"
     if cmd == "start":
-        start_servers()
+        start_servers(sys.argv[2] if len(sys.argv) > 2 else "all")
     elif cmd == "stop":
         stop_servers()
     elif cmd == "status":

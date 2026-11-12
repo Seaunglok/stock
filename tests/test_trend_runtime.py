@@ -18,6 +18,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import trend_runtime as rt  # noqa: E402
 
 
+def test_ops_base_reexports_the_same_objects():
+    """11-12 리팩터링: I3 쪽은 ops_base 로 부른다 — 다시 내보내기일 뿐 같은 함수·같은 값이어야 한다(알림·주문 경로 불변)."""
+    import ops_base as O
+    import trend_config as TC
+    assert O.notify is rt.notify
+    assert (O.ACCOUNT_NO, O.TRADING_URL, O.MARKET_URL, O.PORTFOLIO_URL, O.INVESTOR_URL, O.INFO_URL, O.PRODUCTION_MODE) == \
+        (TC.ACCOUNT_NO, TC.TRADING_URL, TC.MARKET_URL, TC.PORTFOLIO_URL, TC.INVESTOR_URL, TC.INFO_URL, TC.PRODUCTION_MODE)
+
+
 @pytest.fixture
 def state(tmp_path, monkeypatch):
     """STATE_FILE/.bak/.tmp 를 tmp_path 로 격리 — 실제 data/trend_follow 무접촉."""

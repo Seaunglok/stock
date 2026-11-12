@@ -115,6 +115,22 @@ def test_no_module_arg_checks_liveness_only(rml):
     assert rml.is_running(os.getpid()) is True
 
 
+# ─── 운용 프로필(11-12) ────────────────────────────────────────────────────
+def test_live_profile_is_exactly_the_watchdog_ports(rml):
+    """★ 워치독은 'start live' 로 키움 서버만 띄운다 — 그 다섯이 워치독이 지키는 포트(8030~8034)와 어긋나면
+    워치독이 '다운'으로 보고 매 5분 재시작을 되풀이한다."""
+    import re
+    live = rml.select_servers("live")
+    assert {n for n, _ in live} == set(rml.LIVE) and all("kiwoom_mcp.domains" in m for _, m in live)
+    assert rml.select_servers("all") == rml.SERVERS and len(rml.SERVERS) == 12
+    wd = (_ROOT / "scripts" / "trend_watchdog.py").read_text(encoding="utf-8")
+    ports = [int(p) for p in re.search(r"ESSENTIAL_PORTS = \[([\d, ]+)\]", wd).group(1).split(",")]
+    assert sorted(ports) == [8030, 8031, 8032, 8033, 8034] and len(live) == len(ports)
+    assert '"run_mcp_local.py", "start", "live"' in wd
+    with pytest.raises(ValueError):
+        rml.select_servers("liv")                      # 오타로 엉뚱한 세트를 띄우지 않는다
+
+
 # ─── 프로세스 정보 조회 ────────────────────────────────────────────────────
 def test_proc_info_returns_create_time_and_cmdline(rml, dummy):
     created, cmd = rml._proc_info(dummy.pid)

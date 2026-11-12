@@ -180,7 +180,8 @@ def start_servers() -> list:
         # 먼저 추적 중인(죽었을 수 있는) PID 정리 → 중복 서버 세트 누적 방지
         subprocess.run([sys.executable, "run_mcp_local.py", "stop"],
                        cwd=str(ROOT), timeout=60)
-        subprocess.run([sys.executable, "run_mcp_local.py", "start"],
+        # 11-12: 운용에 필요한 키움 서버 5개만(ESSENTIAL_PORTS) — 나머지 7개는 운용 코드가 쓰지 않는다
+        subprocess.run([sys.executable, "run_mcp_local.py", "start", "live"],
                        cwd=str(ROOT), timeout=120)
     except Exception as e:
         log(f"[MCP] start 예외: {e}")

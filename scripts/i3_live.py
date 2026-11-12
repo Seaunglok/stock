@@ -489,7 +489,7 @@ class KiwoomBroker:
         """주문 1회 — price 가 있으면 지정가(01), 없으면 시장가(03). **재전송하지 않는다**: 예외·타임아웃은
         접수 여부 불명({"unknown": True})으로 돌려 잔고 대조에 맡긴다(trend_kiwoom_io._place 와 같은 원칙)."""
         from src.claude_agents.base.mcp_client import MCPManager
-        from trend_config import ACCOUNT_NO, TRADING_URL
+        from ops_base import ACCOUNT_NO, TRADING_URL
         tool = "place_buy_order" if side == "buy" else "place_sell_order"
         args = {"stock_code": code, "quantity": qty, "price": price,
                 "order_type": "01" if price else "03", "account_no": ACCOUNT_NO}
@@ -504,7 +504,7 @@ class KiwoomBroker:
     async def executions(self, day):
         """그날 체결내역 원응답(ka10076) — 체결가 기록용. 실패는 호출자가 '파싱 실패'로 남긴다."""
         from src.claude_agents.base.mcp_client import MCPManager
-        from trend_config import ACCOUNT_NO, TRADING_URL
+        from ops_base import ACCOUNT_NO, TRADING_URL
         async with MCPManager({"trading-domain": TRADING_URL}) as mcp:
             return await asyncio.wait_for(mcp.call_tool("get_order_executions",
                                                         {"account_no": ACCOUNT_NO, "start_date": day,
@@ -512,7 +512,7 @@ class KiwoomBroker:
 
 
 async def _notify(msg: str, critical: bool = False) -> None:
-    from trend_runtime import notify
+    from ops_base import notify
     await notify(msg, critical=critical)
 
 

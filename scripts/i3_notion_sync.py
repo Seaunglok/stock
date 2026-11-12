@@ -269,10 +269,12 @@ def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], sin
                aggr: dict[str, str] | None = None) -> list[dict]:
     """events.jsonl + 성과 지수 → 일일 기록DB 행. 하루에 판단이 여러 번이면 마지막 것."""
     by_day: dict[str, dict] = {}
+    at: dict[str, dict] = {}                  # 날짜 → 사건 → 'HH:MM'(재판단 표시용)
     for e in events:
         p = e.get("payload") or {}
         day = p.get("date") or str(e.get("ts", ""))[:10]
         by_day.setdefault(day, {})[e["event"]] = p
+        at.setdefault(day, {})[e["event"]] = str(e.get("ts", ""))[11:16]
     idx = {d: float(v) for d, v in navs}
     days_i = sorted(idx)
     prev_close = None
@@ -296,6 +298,10 @@ def daily_rows(events: list[dict], navs: list[list], league: dict[str, str], sin
                 fl = dec.get("flow") or {}
                 if fl.get("how") and fl["how"] != "none":
                     row["입출금"] = f"{FLOW_LABEL.get(fl['how'], fl['how'])} {fl.get('amount', 0):+,}원"
+                for k, label in (("decide_abort", "판단 중단"), ("decide_skip", "판단 건너뜀")):
+                    if k in ev:   # 11-12: 재판단으로 행을 고쳐도 특이사항에 옛 중단 사유만 남아 '오늘 판단 실패'처럼 보였다
+                        notes.append(f"{at[day].get(k, '')} {label}({ev[k].get('reason', '')}) → "
+                                     f"{at[day].get('decide', '')} 재판단")
             elif "decide_abort" in ev:
                 row["판단"] = "판단 중단"
                 notes.append(ev["decide_abort"].get("reason", ""))

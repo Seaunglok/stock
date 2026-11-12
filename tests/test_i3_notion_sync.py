@@ -130,6 +130,20 @@ def test_notion_names_have_no_bare_abbreviation():
     assert N.DISPLAY[S.CHAMPION] == N.TRACK and N.MARK.endswith(N.TRACK)
 
 
+def test_redecided_day_keeps_the_abort_story_in_notes():
+    """★ 11-12: 15:50 판단 중단 → 21:43 재판단. 행은 재판단 값으로 고쳐지는데 특이사항이 비면 옛 중단 사유가 남아
+    '판단 실패'처럼 보였다 → 파일이 '중단 → 재판단' 을 직접 적는다. 중단만 있는 날은 그대로 '판단 중단'."""
+    ev = [{"ts": "2026-11-12T15:50:30", "event": "decide_abort", "payload": {"reason": "키움 조회 실패"}},
+          {"ts": "2026-11-12T21:43:43", "event": "decide",
+           "payload": {"date": "2026-11-12", "nav": 100, "engine_holding": False, "exposure": 1.0, "w": 0.0,
+                       "trade": False, "reason": "유지", "close": {"069500": 84240.0}}},
+          {"ts": "2026-11-13T15:50:30", "event": "decide_abort", "payload": {"reason": "키움 조회 실패"}}]
+    rows = {r["일자"]: r for r in N.daily_rows(ev, [], {}, "2026-11-01")}
+    assert rows["2026-11-12"]["판단"] == "매매 없음"
+    assert rows["2026-11-12"]["특이사항"] == "15:50 판단 중단(키움 조회 실패) → 21:43 재판단"
+    assert rows["2026-11-13"]["판단"] == "판단 중단" and rows["2026-11-13"]["특이사항"] == "키움 조회 실패"
+
+
 def test_aggr_names_have_no_bare_abbreviation():
     """공격형 리그 멤버도 Notion 에선 「풀네임(줄임말)」 — 새 변형을 등록하면서 빠뜨리면 여기서 걸린다."""
     import aggr_shadow as AS

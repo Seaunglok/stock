@@ -167,32 +167,16 @@ def _b_i3(mode: str):
     return build
 
 
-def _b_i3x(spec: str):
-    """lab_challengers 일반형(세대별 설계) — 같은 i3x 를 그대로 쓴다(다시 구현하지 않는다)."""
+def _b_spec(module: str, table: str, spec: str):
+    """세대별 선언 SPECS 표(`module.table[spec]`)의 한 줄을 lab_challengers 일반형 i3x 에 그대로 얹는다 — 다시 구현하지 않는다.
+    R6 = lab_challengers.SPECS · T6c = lab_gen6.SPECS6(선언 1406001) · V7a = lab_gen7.SPECS7(선언 ef2d207).
+    (11-12 리팩터링: 세대마다 SPECS 출처만 다른 빌더를 하나씩 만들던 것을 합쳤다. import 는 실행 때 — 리그 모듈을 가볍게.)"""
     def build(data, dates):
+        import importlib
         import lab_challengers as CH
+        specs = getattr(importlib.import_module(module), table)
         return ((K.BASE, K.CASH),
-                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **CH.SPECS[spec]), True)
-    return build
-
-
-def _b_gen6(spec: str):
-    """6세대(lab_gen6 선언 1406001) — 같은 i3x 에 선언한 배수 옵션만 얹는다(다시 구현하지 않는다)."""
-    def build(data, dates):
-        import lab_challengers as CH
-        import lab_gen6 as G6
-        return ((K.BASE, K.CASH),
-                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **G6.SPECS6[spec]), True)
-    return build
-
-
-def _b_gen7(spec: str):
-    """7세대(lab_gen7 선언 ef2d207) — 같은 i3x 에 선언한 배수·브레이크 옵션만 얹는다."""
-    def build(data, dates):
-        import lab_challengers as CH
-        import lab_gen7 as G7
-        return ((K.BASE, K.CASH),
-                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **G7.SPECS7[spec]), True)
+                CH.i3x(data[K.BASE], data[KOSPI], K.BASE, K.CASH, K.M, K.LOOKBACK, **specs[spec]), True)
     return build
 
 
@@ -361,7 +345,7 @@ MEMBERS: tuple[Member, ...] = (
     Member("R6", "I3 계보", _D,
            "운용자 예외(10-22): 입장 조건 E2(강세장 +1%p)를 0.2%p 차로 못 넘음 — 규칙 밖 결정으로 입장",
            "3세대: 1년 1회 리셋 + KOSPI 250일선 상승 때만 — 학습에서 위험은 I3 와 같고 연 +0.5%p",
-           (K.BASE, K.CASH, KOSPI), std_run(_b_i3x("R6"))),
+           (K.BASE, K.CASH, KOSPI), std_run(_b_spec("lab_challengers", "SPECS", "R6"))),
     Member("I1a", "I3 계보", _D, _OP, "5차: I3 의 엔진만(낙폭 예산 없음)", (K.BASE, K.CASH, KOSPI), std_run(_b_i1a)),
     Member("MA60", "지수 추세", _D, _OP, "1차 A: KODEX200 ⇔ KOSPI>MA60", (K.BASE, K.CASH, KOSPI), std_run(_b_ma60)),
     Member("듀얼모멘텀", "모멘텀", _D, _OP, "1차 C: 월말 KODEX200·나스닥100·국고채3년 12개월 수익 비교",
@@ -412,14 +396,14 @@ MEMBERS = MEMBERS + (
            "운용자 예외(10-23)로 10-26 — 10월 신규 상한 밖(INTAKE_EXCEPTIONS)",
            "6세대: 낙폭 예산 배수를 KOSPI 250일선 방향으로 — 상승 8 · 그 외 4. 학습 연 13.8%·MDD 18.6%(I3 12.6%·19.8%), "
            "단 6월 갭 급락 −11.5%(I3 −10.5%)",
-           (K.BASE, K.CASH, KOSPI), std_run(_b_gen6("T6c"))),
+           (K.BASE, K.CASH, KOSPI), std_run(_b_spec("lab_gen6", "SPECS6", "T6c"))),
 )
 MEMBERS = MEMBERS + (
     Member("V7a", "I3 계보", "2026-11-02",
            "7세대 입장 조건 E1·G2·G3·G6·E7 전부 통과(lab_gen7 선언 ef2d207 → 측정). 단 G3(미공개) 여유 0.1%p",
            "7세대: T6c + 변동성 브레이크(배수 × min(1, σ252/σ20), 하한 2). 학습 연 13.2%·MDD 16.5%·6월 갭 −10.3% "
            "(T6c 13.8%·18.6%·−11.5%), 대신 미공개 −3.6%·박스권 4.2%",
-           (K.BASE, K.CASH, KOSPI), std_run(_b_gen7("V7a"))),
+           (K.BASE, K.CASH, KOSPI), std_run(_b_spec("lab_gen7", "SPECS7", "V7a"))),
 )
 
 

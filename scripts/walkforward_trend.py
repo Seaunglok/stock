@@ -382,13 +382,13 @@ def main() -> int:
     SNAPSHOT = args.snapshot
 
     costs = Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS)
-    secmap = P._sector_map()
+    secmap = P.sector_map()
     if args.compare_snapshots:
         snaps = [s.strip() for s in args.compare_snapshots.split(",") if s.strip()]
         if len(snaps) != 2 or not PIT_POOL:
             raise SystemExit("--compare-snapshots 는 A,B 두 개 + 시점별 모드에서만")
         return _compare_snapshots(snaps, costs, secmap, args.train_years, args.test_years, args.metric)
-    dates, bars, _closes, _ordered = P._load(*_load_key())
+    dates, bars, _closes, _ordered = P.load_ohlcv(*_load_key())
     if args.select_now:
         return _select_now(dates, costs, secmap, args.train_years, args.metric)
     if args.entry_ab:
@@ -481,7 +481,7 @@ def _compare_snapshots(snaps: list[str], costs: Costs, secmap: dict,
     out = {}
     for snap in snaps:
         SNAPSHOT = snap
-        dates, bars, _c, _o = P._load(*_load_key())
+        dates, bars, _c, _o = P.load_ohlcv(*_load_key())
         folds = _folds(dates, train_years, test_years)
         _assert_folds(folds)
         ns = argparse.Namespace(train_years=train_years, test_years=test_years, metric=metric)

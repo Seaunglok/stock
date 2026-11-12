@@ -120,7 +120,7 @@ def i3_sim(ohlc: dict, kospi: dict, dates: list[str], equity: float, cash_bars: 
                     goal = math.floor(goal)
                 if hold[c] > goal:
                     q = hold[c] - goal
-                    cash_amt += q * px[c] * (1 - L._side_cost(assets[c].taxed, True))
+                    cash_amt += q * px[c] * (1 - L.side_cost(assets[c].taxed, True))
                     traded += q * px[c]
                     res.trades += 1
                     hold[c] = goal
@@ -134,7 +134,7 @@ def i3_sim(ohlc: dict, kospi: dict, dates: list[str], equity: float, cash_bars: 
                     goal = math.floor(goal)
                 have = hold.get(c, 0.0)
                 if goal > have:
-                    unit = px[c] * (1 + L._side_cost(assets[c].taxed, False))
+                    unit = px[c] * (1 + L.side_cost(assets[c].taxed, False))
                     q = min(goal - have, cash_amt / unit)
                     if integer:
                         q = math.floor(q)
@@ -152,7 +152,7 @@ def i3_sim(ohlc: dict, kospi: dict, dates: list[str], equity: float, cash_bars: 
                 fill = min(b["open"], level)
                 if trading and hold.get(asset, 0) > 0:
                     q = hold.pop(asset)
-                    cash_amt += q * fill * (1 - L._side_cost(False, True))
+                    cash_amt += q * fill * (1 - L.side_cost(False, True))
                     traded += q * fill
                     res.trades += 1
                 eng["in"] = False

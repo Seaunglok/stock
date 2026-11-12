@@ -236,8 +236,8 @@ def _run_trend(data: dict, start: str, equity: float, upto: str) -> dict:
     import trend_paper as TP
     from backtest_walkforward import Costs
     from src.mcp_servers.trend_mcp import costs as C
-    cfg, k = TP._live_cfg()
-    dates, _b, _c, _o = P._load(TP.DATA_START, upto, 100)
+    cfg, k = TP.live_cfg()
+    dates, _b, _c, _o = P.load_ohlcv(TP.DATA_START, upto, 100)
     win = [d for d in dates if d >= start]
     if not win:
         return {"curve": [(start, round(equity))], "w_hist": {}, "trade_days": [], "nav_hist": {start: equity}, "w": None}
@@ -245,7 +245,7 @@ def _run_trend(data: dict, start: str, equity: float, upto: str) -> dict:
     # end 는 위 _load 와 같은 값(upto)으로 — 다르면 캐시 키가 달라 100종목을 다시 받는다(10-22 리팩터에서 발견)
     res = P.simulate(TP.DATA_START, upto, 100, cfg, Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS),
                      P.Sizing(mode="notional", position_pct=k["position_pct"]), k["max_pos"], 0,
-                     "partial" in k["exits"], P._sector_map(), hard_stop_pct=k["hard_stop"],
+                     "partial" in k["exits"], P.sector_map(), hard_stop_pct=k["hard_stop"],
                      rank_mode=k["rank_mode"], regime_ma=k["regime_ma"], breadth_min=k["breadth_min"],
                      exits=k["exits"], sim_from=start, sim_to=dates[-1])
     scale = equity / P.START_EQUITY                   # 다른 예탁으로 이미 로드됐으면 비율로 맞춘다
@@ -305,7 +305,7 @@ def _run_factor(kind: str):
         import lab_factors as F
         import trend_paper as TP
         with contextlib.redirect_stdout(io.StringIO()):
-            _d, bars, _c, _o = P._load(TP.DATA_START, upto, 100)
+            _d, bars, _c, _o = P.load_ohlcv(TP.DATA_START, upto, 100)
         ends = month_ends_live(sorted(data[K.BASE]))
         inner = (F.bab_target(bars, data[KOSPI], ends) if kind == "BAB"
                  else F.qmj_target(bars, F.load_fund(), ends))
@@ -405,6 +405,21 @@ MEMBERS = MEMBERS + (
            "(T6c 13.8%·18.6%·−11.5%), 대신 미공개 −3.6%·박스권 4.2%",
            (K.BASE, K.CASH, KOSPI), std_run(_b_spec("lab_gen7", "SPECS7", "V7a"))),
 )
+# Notion 표시 이름 — 운용자(10-22): "노션에서는 줄임말을 풀네임(줄임말)로". 영문이 들어간 멤버는 여기에 있어야 한다
+# (테스트가 빠짐을 잡는다). 멤버를 등록할 때 MEMBERS 와 같은 자리에서 함께 고친다(11-12 리팩터링 — 전엔 i3_notion_sync 에 있었다).
+DISPLAY = {
+    "I3": "방어형 ETF 자동매매(I3)",
+    "R1": "재진입 리셋(R1)",
+    "R6": "1년 1회 리셋·250일선 상승 때만(R6)",
+    "I1a": "재진입 확인 엔진만(I1a)",
+    "MA60": "KOSPI 60일 이동평균(MA60)",
+    "Faber10": "파버 10개월 이동평균(Faber10)",
+    "TSMOM": "시계열 모멘텀(TSMOM)",
+    "RSI2": "2일 상대강도지수(RSI2)",
+    "D5a": "방어 자산 추세 현금 자리(D5a)",
+    "T6c": "장기 추세 연동 예산 배수 8/4(T6c)",
+    "V7a": "추세 연동 배수 + 변동성 브레이크(V7a)",
+}
 
 
 # ── 데이터 점검 (운용자 10-22: "이번엔 백테스트 제대로 하는 거지?") ───────────────────────
@@ -611,8 +626,12 @@ def govern(status: dict, res: dict, members, upto: str, live_navs: list[list]) -
     return st, msgs
 
 
-def _slug(name: str) -> str:
+def slug(name: str) -> str:
+    """멤버 이름 → history 열 이름 앞머리(공개 — Notion 동기화가 쓴다)."""
     return name.lower()
+
+
+_slug = slug   # 옛 이름(11-12 리팩터링 전 호출 호환)
 
 
 def history_cols() -> list[str]:
@@ -680,6 +699,7 @@ def summary_line(rec: dict) -> str:
 
 async def main_async(now: datetime) -> int:
     import i3_live as LV
+    from trend_runtime import notify
     st = LV.load_state()
     navs = st.get("navs") or []
     if not navs:
@@ -691,10 +711,10 @@ async def main_async(now: datetime) -> int:
     bad = {c: x for c, x in audit.items() if x is not None and x > AUDIT_TOL}
     gaps = audit_gaps(audit)
     if bad:
-        await LV._notify("⛔ [I3 리그] 데이터 출처 불일치 — 오늘 리그 기록은 믿을 수 없다: "
+        await notify("⛔ [I3 리그] 데이터 출처 불일치 — 오늘 리그 기록은 믿을 수 없다: "
                          + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
     if gaps:
-        await LV._notify("⛔ [I3 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
+        await notify("⛔ [I3 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
                          + " (인증·IP·서버 확인 — 11-09 8050 사고). 오늘 기록은 대조 없이 FDR 만으로 했다", critical=True)
     base, kospi = data[K.BASE], data[KOSPI]
     # 장중엔 오늘 일봉이 미완성 — 15:35 전이면 어제까지만 본다
@@ -742,9 +762,9 @@ async def main_async(now: datetime) -> int:
     tmp.write_text(json.dumps(new_status, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATUS_FILE)
     print(json.dumps(rec, ensure_ascii=False, indent=2))
-    await LV._notify(weekly_table(rec) if now.weekday() == 4 else summary_line(rec))
+    await notify(weekly_table(rec) if now.weekday() == 4 else summary_line(rec))
     for text, critical in msgs:
-        await LV._notify(text, critical=critical)
+        await notify(text, critical=critical)
     return 0
 
 

@@ -109,7 +109,7 @@ def test_signal_fills_at_next_open_not_same_close():
     bars = _bars([(100, 100), (110, 120), (120, 130)])
     dates = sorted(bars)
     res = L.simulate({"X": L.Asset("X", bars)}, dates, lambda i, d: {"X": 1.0} if i == 0 else None)
-    unit = 110 * (1 + L._side_cost(False, False))            # 둘째 날 시가 + 비용
+    unit = 110 * (1 + L.side_cost(False, False))            # 둘째 날 시가 + 비용
     assert res.curve[0] == pytest.approx(1.0)                  # 신호일엔 아직 현금
     assert res.curve[1] == pytest.approx(120 / unit)
     assert res.curve[2] == pytest.approx(130 / unit)
@@ -123,7 +123,7 @@ def test_stock_sell_pays_tax_etf_does_not():
     etf = L.simulate({"X": L.Asset("X", bars, taxed=False)}, dates, tgt)
     assert stock.curve[-1] < etf.curve[-1], "주식 매도세가 빠졌다"
     gap = etf.curve[-1] - stock.curve[-1]
-    assert gap == pytest.approx(L.C.TAX_BPS / 10_000 * etf.curve[-1] / (1 - L._side_cost(False, True)), rel=0.05)
+    assert gap == pytest.approx(L.C.TAX_BPS / 10_000 * etf.curve[-1] / (1 - L.side_cost(False, True)), rel=0.05)
 
 
 def test_integer_shares_leave_cash_when_price_exceeds_budget():
@@ -147,7 +147,7 @@ def test_buy_and_hold_tracks_price_minus_entry_cost():
     bars = _bars([(100, 100), (100, 105), (110, 150)])
     dates = sorted(bars)
     res = L.buy_and_hold("X", dates, bars)
-    assert res.curve[-1] == pytest.approx(150 / (100 * (1 + L._side_cost(False, False))))
+    assert res.curve[-1] == pytest.approx(150 / (100 * (1 + L.side_cost(False, False))))
 
 
 # ─── 지표 ────────────────────────────────────────────────────────────────────

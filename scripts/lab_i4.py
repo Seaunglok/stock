@@ -147,7 +147,7 @@ def main() -> int:
                                    "ALTX": L.Asset("ALTX", ndx_krw)}
         else:
             long_assets = lambda: {"IDX": L.Asset("IDX", ks), "LEVX": L.Asset("LEVX", ks2)}  # noqa: E731
-        verdicts[name] = I._run_family(
+        verdicts[name] = I.run_family(
             name, grid, default, lambda p: f"m{p[0]}·L{p[1]}",
             lambda p, kw=kw: i4(bars[BASE], ks, p[0], p[1], alt_bars=bars[ALT], **kw),
             lambda p, kw=kw: i4(ks, ks, p[0], p[1], alt_bars=ndx_krw, base="IDX", lev_code="LEVX",

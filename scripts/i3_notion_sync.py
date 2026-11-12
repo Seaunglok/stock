@@ -46,35 +46,15 @@ NAMES = {"069500": "KODEX 200", "488770": "KODEX 머니마켓액티브", "153130
 WEEKDAY = "월화수목금토일"
 
 # Notion 에 보이는 이름 — 운용자(10-22): "노션에서는 줄임말을 풀네임(줄임말)로". 코드 식별자(I3·R1…)는 그대로 둔다.
-TRACK = "방어형 ETF 자동매매(I3)"
-MARK = f"🛡️ {TRACK}"       # 매매일지 매매이유·월별 결산 제목의 앞머리 = i3_notion_task.md 의 조회 키(바꾸면 같이 바꾼다)
-DISPLAY = {                 # 리그 멤버 이름이 영문 줄임말이면 여기 풀네임이 있어야 한다(테스트가 확인)
-    "I3": TRACK,
-    "R1": "재진입 리셋(R1)",
-    "R6": "1년 1회 리셋·250일선 상승 때만(R6)",
-    "I1a": "재진입 확인 엔진만(I1a)",
-    "MA60": "KOSPI 60일 이동평균(MA60)",
-    "Faber10": "파버 10개월 이동평균(Faber10)",
-    "TSMOM": "시계열 모멘텀(TSMOM)",
-    "RSI2": "2일 상대강도지수(RSI2)",
-    "D5a": "방어 자산 추세 현금 자리(D5a)",
-    "T6c": "장기 추세 연동 예산 배수 8/4(T6c)",
-    "V7a": "추세 연동 배수 + 변동성 브레이크(V7a)",
-}
-AGGR_DIR = _ROOT / "data" / "aggr"
-AGGR_DISPLAY = {            # 공격형 리그(aggr_shadow.MEMBERS) 표시 이름 — 11-11 운용자 "그렇게 진행해줘"(멤버DB + 매일 한 줄)
-    "ORB-B1": "시가 범위 돌파 KODEX200(ORB-B1)",
-    "ORB-B2": "시가 범위 돌파 레버리지(ORB-B2)",
-    "ORB-B3": "시가 범위 돌파 KODEX200 기준 손절(ORB-B3)",
-    "FEAR-V1": "공포 매수 VIX·KODEX200(FEAR-V1)",
-    "FEAR-V2": "공포 매수 VIX·레버리지(FEAR-V2)",
-    "FEAR-K1": "공포 매수 KOSPI 변동성·KODEX200(FEAR-K1)",
-    "FEAR-K2": "공포 매수 KOSPI 변동성·레버리지(FEAR-K2)",
-    "FEAR-P1": "공포 정점 뒤 매수 KODEX200(FEAR-P1)",
-    "FEAR-P2": "공포 정점 뒤 매수 레버리지(FEAR-P2)",
-    "HH1": "한미 반반 × 한국 2배(HH1)",
-}
+# 표시 이름의 정본은 멤버 정의 옆(i3_shadow.DISPLAY · aggr_shadow.DISPLAY) — 11-12 리팩터링. 여기 이름은 그것을 가리킨다.
+import aggr_shadow as _AS  # noqa: E402
+import i3_shadow as _S  # noqa: E402
 
+DISPLAY = _S.DISPLAY
+TRACK = DISPLAY[_S.CHAMPION]   # "방어형 ETF 자동매매(I3)"
+MARK = f"🛡️ {TRACK}"       # 매매일지 매매이유·월별 결산 제목의 앞머리 = i3_notion_task.md 의 조회 키(바꾸면 같이 바꾼다)
+AGGR_DIR = _ROOT / "data" / "aggr"
+AGGR_DISPLAY = _AS.DISPLAY
 
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
@@ -389,7 +369,7 @@ def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = O
     stopped = (json.loads(ag.read_text(encoding="utf-8")).get("stopped") or {}) if ag.exists() else {}
     payload = build_payload(_read_jsonl(data_dir / "events.jsonl"), st.get("navs") or [],
                             _read_jsonl(data_dir / "fills.jsonl"), _league_rows(data_dir / "shadow_history.csv"),
-                            {S._slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now(),
+                            {S.slug(m.name): DISPLAY.get(m.name, m.name) for m in S.MEMBERS}, today or datetime.now(),
                             aggr_rows=_league_rows(aggr_dir / AS.HISTORY_FILE.name), aggr_stopped=stopped,
                             aggr_equity=AS.EQUITY)
     import market_journal as MJ                       # 시장 일지DB(11-06) — 같은 대조 창으로 없는 행만

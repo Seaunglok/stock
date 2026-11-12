@@ -244,7 +244,7 @@ def strat_f(px: Prices, fund, shares, sectors, dates: list[str], n: int, sigma: 
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
-def _family(name: str, runs: list[tuple[str, L.SimResult]], default_label: str, bench: L.SimResult) -> bool:
+def report_family(name: str, runs: list[tuple[str, L.SimResult]], default_label: str, bench: L.SimResult) -> bool:
     print("=" * 100)
     print(f"[{name}]")
     print(L.HEADER + "   판정  (매매횟수)")
@@ -288,12 +288,12 @@ def main() -> int:
     for lb, sg in D_GRID:
         assets = {c: L.Asset(c, etf_bars[c]) for c in etf_codes}
         runs.append((f"L{lb}·σ{sg}%", L.simulate(assets, dates, strat_d(epx, dates, lb, sg), EQUITY)))
-    verdicts["D 위험관리 단독"] = _family("D 위험관리 단독", runs, f"L{D_DEFAULT[0]}·σ{D_DEFAULT[1]}%", bench)
+    verdicts["D 위험관리 단독"] = report_family("D 위험관리 단독", runs, f"L{D_DEFAULT[0]}·σ{D_DEFAULT[1]}%", bench)
 
     key = ("2015-01-01", "2026-08-25", 100, 350, "")
-    _d, sbars, _c, _o = P._load(*key)
+    _d, sbars, _c, _o = P.load_ohlcv(*key)
     shares = P._SHARES[key]
-    sectors = P._sector_map()
+    sectors = P.sector_map()
     fund = json.loads(FUND_PATH.read_text(encoding="utf-8"))
     # 데이터 무결성 가드(2026-10-22): 중지했다고 생각한 수집 프로세스가 살아남아 파일을 84종목짜리로
     # 덮어쓴 채 측정이 돌았다. 재무가 풀의 일부만 덮으면 '버핏식이 나쁘다'가 아니라 '데이터가 없다'다.
@@ -308,7 +308,7 @@ def main() -> int:
     for n, k in E_GRID:
         assets = {c: L.Asset(c, b, taxed=True) for c, b in stock_bars.items()}
         runs.append((f"N{n}·K{k}", L.simulate(assets, dates, strat_e(spx, fund, shares, sectors, dates, n, k), EQUITY)))
-    verdicts["E 버핏식 핵심"] = _family("E 버핏식 핵심", runs, f"N{E_DEFAULT[0]}·K{E_DEFAULT[1]}", bench)
+    verdicts["E 버핏식 핵심"] = report_family("E 버핏식 핵심", runs, f"N{E_DEFAULT[0]}·K{E_DEFAULT[1]}", bench)
 
     allpx = Prices({**stock_bars, **{c: etf_bars[c] for c in DEF_ASSETS}})
     runs = []
@@ -316,11 +316,15 @@ def main() -> int:
         assets = {**{c: L.Asset(c, b, taxed=True) for c, b in stock_bars.items()},
                   **{c: L.Asset(c, etf_bars[c]) for c in DEF_ASSETS}}
         runs.append((f"N{n}·σ{sg}%", L.simulate(assets, dates, strat_f(allpx, fund, shares, sectors, dates, n, sg), EQUITY)))
-    verdicts["F 버핏식+위험관리"] = _family("F 버핏식+위험관리", runs, f"N{F_DEFAULT[0]}·σ{F_DEFAULT[1]}%", bench)
+    verdicts["F 버핏식+위험관리"] = report_family("F 버핏식+위험관리", runs, f"N{F_DEFAULT[0]}·σ{F_DEFAULT[1]}%", bench)
 
     print("=" * 100)
     print("최종: " + " · ".join(f"{k} {'채택 가능' if v else '기각'}" for k, v in verdicts.items()))
     return 0
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_family = report_family
 
 
 if __name__ == "__main__":

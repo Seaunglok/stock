@@ -151,6 +151,9 @@ def test_aggr_names_have_no_bare_abbreviation():
         assert n in N.AGGR_DISPLAY, f"{n}: 공격형 표시 풀네임 없음 — AGGR_DISPLAY 에 추가"
         assert N.AGGR_DISPLAY[n].endswith(f"({n})"), N.AGGR_DISPLAY[n]
     assert set(N.AGGR_DISPLAY) == set(AS.MEMBERS)
+    import i3_shadow as S
+    assert N.AGGR_DISPLAY is AS.DISPLAY and N.DISPLAY is S.DISPLAY      # 정본은 멤버 정의 옆 한 곳(11-12 리팩터링)
+    assert N.TRACK == "방어형 ETF 자동매매(I3)" and N.MARK == "🛡️ 방어형 ETF 자동매매(I3)"   # 조회 키는 그대로
 
 
 def test_aggr_text_orders_marks_stop_and_skips_unstarted():
@@ -199,7 +202,7 @@ def test_prep_reads_real_writers(tmp_path):
                             "w": 0.0, "trade": True, "reason": "첫 판단", "close": {"069500": 86525.0}}, ev)
     LV.save_state({"navs": [["2026-10-22", 3647503.0]]}, st)
     row = {"date": "2026-10-22", "live_nav": 3647503}
-    row.update({f"{S._slug(m.name)}_nav": 3647503 for m in S.MEMBERS})
+    row.update({f"{S.slug(m.name)}_nav": 3647503 for m in S.MEMBERS})
     S.append_history(row, tmp_path / "shadow_history.csv")
     (tmp_path / "fills.jsonl").write_text(json.dumps(_fill("2026-10-23", "buy", "488770", 34, 105950.0)) + "\n",
                                           encoding="utf-8")

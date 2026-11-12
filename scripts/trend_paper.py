@@ -54,7 +54,7 @@ DATA_START = "2015-01-01"           # 워밍업 포함 로드 구간
 LOG_FILE = _ROOT / "data" / "trend_follow" / "paper_log.jsonl"
 
 
-def _live_cfg() -> tuple[TrendConfig, dict]:
+def live_cfg() -> tuple[TrendConfig, dict]:
     """**라이브 설정을 그대로 읽는다.** 모의운용이 다른 값으로 돌면 검증이 아니다."""
     from trend_config import (BREADTH_MIN_PCT, CFG as LIVE, EXIT_MA, EXITS, HARD_STOP_PCT,
                               MAX_HOLD_DAYS, MAX_POS, POSITION_PCT, RANK_MODE, REGIME_MA,
@@ -86,9 +86,9 @@ def main() -> int:
     ap.add_argument("--no-log", action="store_true", help="paper_log.jsonl 기록 생략")
     args = ap.parse_args()
 
-    cfg, k = _live_cfg()
+    cfg, k = live_cfg()
     costs = Costs(C.TAX_BPS, C.FEE_BPS, C.SLIPPAGE_BPS)
-    dates, bars, _cl, _od = P._load(DATA_START, datetime.now().strftime("%Y-%m-%d"), 100)
+    dates, bars, _cl, _od = P.load_ohlcv(DATA_START, datetime.now().strftime("%Y-%m-%d"), 100)
     win = [d for d in dates if d >= args.start]
     if not win:
         print(f"구간에 영업일이 없다({args.start} 이후). 개시 전이거나 데이터 미갱신.")
@@ -97,7 +97,7 @@ def main() -> int:
     P._SIG_MEMO.clear()
     res = P.simulate(DATA_START, dates[-1], 100, cfg, costs,
                      P.Sizing(mode="notional", position_pct=k["position_pct"]),
-                     k["max_pos"], 0, "partial" in k["exits"], P._sector_map(),
+                     k["max_pos"], 0, "partial" in k["exits"], P.sector_map(),
                      hard_stop_pct=k["hard_stop"], rank_mode=k["rank_mode"],
                      regime_ma=k["regime_ma"], breadth_min=k["breadth_min"],
                      exits=k["exits"], sim_from=args.start, sim_to=dates[-1])
@@ -154,6 +154,10 @@ def main() -> int:
     _log({**base, "total_pct": round(m["total"], 4), "mdd_pct": round(m["mdd"], 4),
           "entries": m["entries"], "closed": len(res.closed)})
     return 0
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_live_cfg = live_cfg
 
 
 if __name__ == "__main__":

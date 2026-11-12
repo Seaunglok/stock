@@ -97,7 +97,7 @@ def peak_after(vols: list[float | None], th: float, drop: float = PEAK_DROP,
 def kospi_vols(ks: dict) -> tuple[list[str], list[float | None]]:
     """KOSPI 20일 실현 변동성(연율 %) — lab_downside._vol_above 와 같은 정의(최근 20개 일간 수익률의 표본 표준편차)."""
     import math
-    ds, c = D._ser(ks)
+    ds, c = D.series(ks)
     out: list[float | None] = []
     for k in range(len(c)):
         if k < D.VOL_WINDOW:
@@ -116,7 +116,7 @@ def fear_on(sig: str, px: dict):
         st = dict(zip(ds, peak_after(vols, D.CANDIDATES[code][2])))
 
         def f(d):
-            k = D._at(ds, d)
+            k = D.at_or_before(ds, d)
             return None if k < 0 else st[ds[k]]
         return f
     return D.down_fn(code, D.CANDIDATES[code][2], px)
@@ -164,15 +164,12 @@ def verdict(curve: list[tuple[str, float]], held: list[str], base: dict, dates: 
 
 
 def gauges(px: dict, d: str) -> dict:
-    """그날 공포 계기판(보고용) — VIX 는 날짜 ≤ d 인 마지막 값, KOSPI 변동성은 20일 연율."""
-    import math
-    vd, vc = D._ser(px["^VIX"])
-    kd, kc = D._ser(px["^KS11"])
-    kv = D._at(vd, d)
-    kk = D._at(kd, d)
-    vol = None
-    if kk >= D.VOL_WINDOW:
-        rets = [kc[j] / kc[j - 1] - 1 for j in range(kk - D.VOL_WINDOW + 1, kk + 1)]
-        vol = statistics.stdev(rets) * math.sqrt(252) * 100
+    """그날 공포 계기판(보고용) — VIX 는 날짜 ≤ d 인 마지막 값, KOSPI 변동성은 신호와 **같은 함수**(`kospi_vols`)의 그날 값.
+    (11-12 리팩터링: 전엔 같은 식을 여기서 한 번 더 계산했다 — 어긋나면 '보여 준 값 ≠ 판단한 값'이 된다.)"""
+    vd, vc = D.series(px["^VIX"])
+    kd, vols = kospi_vols(px["^KS11"])
+    kv = D.at_or_before(vd, d)
+    kk = D.at_or_before(kd, d)
+    vol = vols[kk] if kk >= 0 else None
     return {"vix": None if kv < 0 else round(vc[kv], 2), "vix_date": None if kv < 0 else vd[kv],
             "kospi_vol": None if vol is None else round(vol, 1)}

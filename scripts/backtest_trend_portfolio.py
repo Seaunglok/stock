@@ -77,7 +77,7 @@ def warn_if_default_equity() -> str:
 
 
 # ─── 섹터 맵 (유니버스 캐시) ─────────────────────────────────────────────────
-def _sector_map() -> dict[str, str]:
+def sector_map() -> dict[str, str]:
     """code→sector (docs_cache/universe_kiwoom_*.json). 없으면 '기타'."""
     files = sorted(glob.glob(str(_ROOT / "docs_cache" / "universe_kiwoom_*.json")), reverse=True)
     if not files:
@@ -142,7 +142,7 @@ class Result:
 _CACHE: dict = {}
 
 
-def _load(start: str, end: str, top_n: int, pit_pool: int = 0, snapshot: str = ""):
+def load_ohlcv(start: str, end: str, top_n: int, pit_pool: int = 0, snapshot: str = ""):
     """OHLCV 로드(캐시). pit_pool>0 이면 **시점별 유니버스**용 넓은 풀을 받는다.
 
     pit_pool=0 : 현재 스냅샷 시총 상위 top_n 을 과거에 소급(구 동작 — 생존편향).
@@ -274,7 +274,7 @@ def simulate(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs, s
     pit_pool: >0 이면 시점별 유니버스 — 신호 후보와 breadth 를 **그날의** 시총 상위 top_n 으로
               제한한다(`day_top`). 보유 포지션 관리는 유니버스와 무관(라이브와 같다).
     """
-    dates, bars, closes, ordered = _load(start, end, top_n, pit_pool, snapshot)
+    dates, bars, closes, ordered = load_ohlcv(start, end, top_n, pit_pool, snapshot)
     load_key = (start, end, top_n, pit_pool, snapshot)
     # ⚠️ 이름을 `shares` 로 하면 아래 진입부의 `shares = _target_shares(...)`(매수 주식수)가
     #    이 dict 를 덮어써, 첫 매수 다음 날부터 순위 계산이 int.get 으로 터진다(테스트로 발견).
@@ -518,9 +518,9 @@ def report_rank(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs
     거래당 하니스(backtest_trend.py)로는 측정 불가 — 거기선 게이트 통과분을 전부 세기 때문에
     랭킹이 결과에 영향을 주지 않는다. 슬롯 제약이 있는 이 하니스에서만 의미가 있다.
     """
-    secmap = _sector_map()
+    secmap = sector_map()
     _SIG_MEMO.clear()
-    dates, *_ = _load(start, end, top_n)
+    dates, *_ = load_ohlcv(start, end, top_n)
     dl = len(dates)
     sizing = Sizing(mode="risk", risk_pct=risk_pct)
     print()
@@ -556,9 +556,9 @@ def report_regime_ma(start: str, end: str, top_n: int, cfg: TrendConfig, costs: 
     거래당 기대값이 아니라 **자산곡선의 MDD/MAR** 로 봐야 한다 — 레짐 필터의 목적이
     거래 품질이 아니라 파산 회피이기 때문이다.
     """
-    secmap = _sector_map()
+    secmap = sector_map()
     _SIG_MEMO.clear()
-    dates, *_ = _load(start, end, top_n)
+    dates, *_ = load_ohlcv(start, end, top_n)
     dl = len(dates)
     sizing = Sizing(mode="risk", risk_pct=risk_pct)
     variants = [("off (차단 없음)", 0), ("MA20", 20), ("MA60 (현행)", 60),
@@ -601,9 +601,9 @@ def report(start: str, end: str, top_n: int, cfg: TrendConfig, costs: Costs,
            max_pos: int, base_pct: float, risk_pct: float, sector_cap: int,
            hard_stop: float = 0.0, rank_mode: str = "composite",
            regime_ma: int = 0, breadth_min: float = 0.0) -> None:
-    secmap = _sector_map()
+    secmap = sector_map()
     _SIG_MEMO.clear()
-    dates, *_ = _load(start, end, top_n)
+    dates, *_ = load_ohlcv(start, end, top_n)
     dl = len(dates)
     notional = Sizing(mode="notional", position_pct=base_pct)
     risk = Sizing(mode="risk", risk_pct=risk_pct)
@@ -695,6 +695,11 @@ def main():
     report(args.start, args.end, args.top_n, cfg, costs, args.max_pos,
            args.position_pct, args.risk_pct, args.sector_cap, hard_stop=hard_stop,
            regime_ma=regime_ma, breadth_min=breadth_min)
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_sector_map = sector_map
+_load = load_ohlcv
 
 
 if __name__ == "__main__":

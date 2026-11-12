@@ -122,7 +122,7 @@ def qmj_target(bars: dict[str, dict], fund: dict, ends: set[str], n_pick: int = 
 def load_universe(end: str) -> dict[str, dict]:
     import backtest_trend_portfolio as P
     with contextlib.redirect_stdout(io.StringIO()):
-        _dates, bars, _c, _o = P._load("2015-01-01", end, 100)
+        _dates, bars, _c, _o = P.load_ohlcv("2015-01-01", end, 100)
     return bars
 
 

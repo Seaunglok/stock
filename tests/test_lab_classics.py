@@ -34,7 +34,7 @@ def test_vbreak_buys_at_level_and_sells_next_open():
          d[1]: {"open": 100, "high": 112, "low": 99, "close": 111},      # 기준가 100+0.5×20=110 돌파
          d[2]: {"open": 115, "high": 116, "low": 114, "close": 115}}
     dd, vv, n, _ = C.vbreak_curve(o, None, d, 1000.0)
-    bc, sc = L._side_cost(False, False), L._side_cost(False, True)
+    bc, sc = L.side_cost(False, False), L.side_cost(False, True)
     assert n == 1
     assert vv[2] == pytest.approx(1000.0 * 115 * (1 - sc) / (110 * (1 + bc)))
 

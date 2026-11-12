@@ -128,7 +128,7 @@ def faber_ls(bars, months: int, ends: set[str]):
 
 def tsmom_ls(bars, months: int, ends: set[str]):
     """A2 — 월말에 지난 months×21 영업일 수익 > 0 이면 'up', 아니면 'down'."""
-    days, pos, cl = C._closes(bars)
+    days, pos, cl = C.closes_index(bars)
     look = months * 21
 
     def state(i, d):

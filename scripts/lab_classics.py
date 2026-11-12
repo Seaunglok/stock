@@ -87,7 +87,7 @@ def load_ohlc(code: str, start: str = "1990-01-01", end: str = END) -> dict[str,
     return {d: v for d, v in rows.items() if start <= d <= end}
 
 
-def _closes(bars):
+def closes_index(bars):
     days = sorted(bars)
     return days, {d: k for k, d in enumerate(days)}, [bars[d]["close"] for d in days]
 
@@ -98,7 +98,7 @@ def month_ends(days: list[str]) -> set[str]:
 
 # ── 알고리즘 (target(i, d) → {code: 비중} | None, 비중 합 < 1 이면 나머지 현금) ─────────────────
 def faber10(bars, asset, ends: set[str]):
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
     me = [d for d in days if d in ends]
     mpos = {d: k for k, d in enumerate(me)}
 
@@ -114,7 +114,7 @@ def faber10(bars, asset, ends: set[str]):
 
 
 def tsmom(bars_by: dict, ends: set[str], look: int = 252):
-    series = {c: _closes(b) for c, b in bars_by.items()}
+    series = {c: closes_index(b) for c, b in bars_by.items()}
 
     def t(i, d):
         if d not in ends:
@@ -130,7 +130,7 @@ def tsmom(bars_by: dict, ends: set[str], look: int = 252):
 
 
 def volmgd(bars, asset, ends: set[str]):
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
     hist: list[float] = []
 
     def t(i, d):
@@ -155,7 +155,7 @@ def all_weather(qends: set[str], weights: dict[str, float] = AW_WEIGHTS):
 
 def turtle(bars, asset, entry: int = 55, exit_: int = 20):
     """종가 기준 돈치안(원전은 장중 고가·저가 — 리그 데이터가 시가·종가뿐이라 연구·리그를 같은 계산으로)."""
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
     st = {"in": False}
 
     def t(i, d):
@@ -191,7 +191,7 @@ def rsi_wilder(cl: list[float], n: int = 2) -> list[float | None]:
 
 
 def rsi2(bars, asset):
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
     r = rsi_wilder(cl, 2)
     st = {"in": False}
 
@@ -212,7 +212,7 @@ def rsi2(bars, asset):
 
 
 def bollinger_mr(bars, asset, n: int = 20, z: float = 2.0):
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
     st = {"in": False}
 
     def t(i, d):
@@ -232,7 +232,7 @@ def bollinger_mr(bars, asset, n: int = 20, z: float = 2.0):
 
 
 def golden_cross(bars, asset, fast: int = 50, slow: int = 200):
-    days, pos, cl = _closes(bars)
+    days, pos, cl = closes_index(bars)
 
     def t(i, d):
         k = pos.get(d)
@@ -249,7 +249,7 @@ def vbreak_curve(ohlc: dict, cash: dict | None, dates: list[str], equity: float,
     비용: 매수·매도 각각 수수료+슬리피지(ETF 매도세 없음, strategy_lab._side_cost 와 같은 값).
     no_trade_on_start: 리그용 — 출발일(판단 종가)엔 사지 않는다(그날 장중 매수는 출발선보다 앞선다).
     반환: (날짜, 자산, 매매 수, 돌파 매수한 날)."""
-    buy_c, sell_c = (L._side_cost(False, False), L._side_cost(False, True)) if costs else (0.0, 0.0)
+    buy_c, sell_c = (L.side_cost(False, False), L.side_cost(False, True)) if costs else (0.0, 0.0)
     nav, out_d, out_v, trades, buys = equity, [], [], 0, []
     held = None                                         # 전날 돌파 매수가
     prev = None
@@ -356,6 +356,10 @@ def main() -> int:
               + (f"{lm['mdd']:>8.1f}%{lm['worst_year']:>+8.1f}%" if lm else f"{'—':>9}{'—':>9}")
               + f"{r['trades']:>6}  {'O' if p12 else 'x'}")
     return 0
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_closes = closes_index
 
 
 if __name__ == "__main__":

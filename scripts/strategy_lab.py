@@ -175,7 +175,7 @@ class SimResult:
     turnover: float = 0.0        # 누적 매매대금 / 평균 자산
 
 
-def _side_cost(taxed: bool, sell: bool) -> float:
+def side_cost(taxed: bool, sell: bool) -> float:
     bps = C.FEE_BPS + C.SLIPPAGE_BPS + (C.TAX_BPS if (taxed and sell) else 0.0)
     return bps / 10_000.0
 
@@ -219,7 +219,7 @@ def simulate(assets: dict[str, Asset], dates: list[str],
                     goal = math.floor(goal)
                 if pos[c] > goal:
                     q = pos[c] - goal
-                    cash += q * px[c] * (1 - _side_cost(assets[c].taxed, True))
+                    cash += q * px[c] * (1 - side_cost(assets[c].taxed, True))
                     traded += q * px[c]
                     res.trades += 1
                     pos[c] = goal
@@ -234,7 +234,7 @@ def simulate(assets: dict[str, Asset], dates: list[str],
                     goal = math.floor(goal)
                 have = pos.get(c, 0.0)
                 if goal > have:
-                    unit = px[c] * (1 + _side_cost(assets[c].taxed, False))
+                    unit = px[c] * (1 + side_cost(assets[c].taxed, False))
                     q = min(goal - have, cash / unit)
                     if integer:
                         q = math.floor(q)
@@ -403,6 +403,10 @@ HEADER = f"{'전략':30}{'CAGR':>8}{'MDD':>8}{'MAR':>6}{'최악연도':>9}{'박�
 def bench_result(equity: float = 0.0) -> SimResult:
     bars = load_bars(BENCH_CODE, "2014-01-01", FULL[1])
     return buy_and_hold(BENCH_CODE, calendar(bars, *FULL), bars, equity)
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_side_cost = side_cost
 
 
 if __name__ == "__main__":

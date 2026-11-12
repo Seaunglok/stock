@@ -99,7 +99,7 @@ def main() -> int:
             ("G1 C+D", G1_GRID, G1_DEFAULT, lambda a: blend([(a, comp_c()), (1 - a, comp_d())])),
             ("G2 B+D", G2_GRID, G2_DEFAULT, lambda a: blend([(a, comp_b()), (1 - a, comp_d())]))):
         runs = [(f"α{a:.1f}", L.simulate(assets(), dates, make(a), EQUITY)) for a in grid]
-        verdicts[fam] = LB._family(fam, runs, f"α{default:.1f}", bench)
+        verdicts[fam] = LB.report_family(fam, runs, f"α{default:.1f}", bench)
     print("=" * 100)
     print("최종: " + " · ".join(f"{k} {'채택 가능' if v else '기각'}" for k, v in verdicts.items()))
     return 0

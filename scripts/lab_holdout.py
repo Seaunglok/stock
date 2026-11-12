@@ -90,7 +90,7 @@ def main() -> int:
 
     def long_assets():
         return {"IDX": L.Asset("IDX", ks)}
-    train_ok = I._run_family(
+    train_ok = I.run_family(
         "I3 재진입 확인 + 낙폭 예산(최근 L일)", I3_GRID, I3_DEFAULT, lambda p: f"m{p[0]}·L{p[1]}",
         lambda p: i3(kodex, ks, "069500", CASH_ETF, p[0], p[1]),
         lambda p: i3(ks, ks, "IDX", None, p[0], p[1]),

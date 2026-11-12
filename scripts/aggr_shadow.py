@@ -52,6 +52,20 @@ EXCEPTIONS = {   # 입장 조건 밖으로 들어온 멤버 — 운용자 결정
            "P4(롤링 3년 > 0) 첫 통과라 앞으로의 기록으로 본다. 1998~ 장기 MDD 26.4%·3년 최악 −24.6% 를 알고 넣음",
 }
 MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS + ("HH1",)
+# Notion 표시 이름(「풀네임(줄임말)」) — 멤버를 늘리면 여기 함께(테스트가 빠짐을 잡는다) + Notion 공격형 리그 멤버DB 1행.
+# 11-12 리팩터링: 전엔 i3_notion_sync.AGGR_DISPLAY 에 따로 있었다(지금은 그 이름이 이것을 가리킨다).
+DISPLAY = {
+    "ORB-B1": "시가 범위 돌파 KODEX200(ORB-B1)",
+    "ORB-B2": "시가 범위 돌파 레버리지(ORB-B2)",
+    "ORB-B3": "시가 범위 돌파 KODEX200 기준 손절(ORB-B3)",
+    "FEAR-V1": "공포 매수 VIX·KODEX200(FEAR-V1)",
+    "FEAR-V2": "공포 매수 VIX·레버리지(FEAR-V2)",
+    "FEAR-K1": "공포 매수 KOSPI 변동성·KODEX200(FEAR-K1)",
+    "FEAR-K2": "공포 매수 KOSPI 변동성·레버리지(FEAR-K2)",
+    "FEAR-P1": "공포 정점 뒤 매수 KODEX200(FEAR-P1)",
+    "FEAR-P2": "공포 정점 뒤 매수 레버리지(FEAR-P2)",
+    "HH1": "한미 반반 × 한국 2배(HH1)",
+}
 
 
 # ── 멤버 실행 ────────────────────────────────────────────────────────────────
@@ -219,7 +233,7 @@ async def _load(today: str) -> tuple[dict, dict]:
 
 
 async def main_async(now: datetime) -> int:
-    import i3_live as LV
+    from trend_runtime import notify
     from i3_shadow import AUDIT_TOL
     today = now.strftime("%Y-%m-%d")
     if today < F.ANCHOR:
@@ -253,14 +267,14 @@ async def main_async(now: datetime) -> int:
     append_history(row)
     print(json.dumps(rec, ensure_ascii=False, indent=2))
     if bad:
-        await LV._notify("⛔ [공격형 리그] 데이터 출처 불일치 — 오늘 기록은 믿을 수 없다: "
+        await notify("⛔ [공격형 리그] 데이터 출처 불일치 — 오늘 기록은 믿을 수 없다: "
                          + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
     if gaps:
-        await LV._notify("⛔ [공격형 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
+        await notify("⛔ [공격형 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
                          + " (인증·IP·서버 확인)", critical=True)
-    await LV._notify(summary_line(rec))
+    await notify(summary_line(rec))
     for text in msgs:
-        await LV._notify(text, critical=True)
+        await notify(text, critical=True)
     return 0
 
 

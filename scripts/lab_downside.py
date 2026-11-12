@@ -95,48 +95,48 @@ GRID_PASS = 2
 
 
 # ── 신호 — d 의 상태는 날짜 ≤ d 인 봉만 ────────────────────────────────────────
-def _ser(bars: dict[str, dict]) -> tuple[list[str], list[float]]:
+def series(bars: dict[str, dict]) -> tuple[list[str], list[float]]:
     ds = sorted(bars)
     return ds, [bars[x]["close"] for x in ds]
 
 
-def _at(ds: list[str], d: str) -> int:
+def at_or_before(ds: list[str], d: str) -> int:
     """날짜 ≤ d 인 마지막 봉의 위치(없으면 -1)."""
     return bisect.bisect_right(ds, d) - 1
 
 
 def _level_above(bars, thr: float):
-    ds, c = _ser(bars)
+    ds, c = series(bars)
 
     def f(d):
-        k = _at(ds, d)
+        k = at_or_before(ds, d)
         return None if k < 0 else c[k] > thr
     return f
 
 
 def _change_above(bars, lag: int, pct: float):
-    ds, c = _ser(bars)
+    ds, c = series(bars)
 
     def f(d):
-        k = _at(ds, d)
+        k = at_or_before(ds, d)
         return None if k < lag else c[k] / c[k - lag] - 1 > pct / 100.0
     return f
 
 
 def _below_ma(bars, n: int):
-    ds, c = _ser(bars)
+    ds, c = series(bars)
 
     def f(d):
-        k = _at(ds, d)
+        k = at_or_before(ds, d)
         return None if k < n - 1 else c[k] < statistics.fmean(c[k - n + 1:k + 1])
     return f
 
 
 def _vol_above(bars, n: int, pct: float):
-    ds, c = _ser(bars)
+    ds, c = series(bars)
 
     def f(d):
-        k = _at(ds, d)
+        k = at_or_before(ds, d)
         if k < n:
             return None
         r = [c[j] / c[j - 1] - 1 for j in range(k - n + 1, k + 1)]
@@ -286,6 +286,11 @@ def main() -> int:
     print("* 미공개(2026-08-25~10-21)는 이 축에선 오염 — 판정에 쓰지 않는다. 적중 = 다음 거래일 시가 → 그다음 시가 KODEX200 하락.")
     print(f"하락 예측 후보: {', '.join(passed) if passed else '없음'} · 반대 신호(보고만): {', '.join(contra) if contra else '없음'}")
     return 0
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_ser = series
+_at = at_or_before
 
 
 if __name__ == "__main__":

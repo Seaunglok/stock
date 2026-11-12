@@ -103,7 +103,7 @@ def drawdown_budget(asset: str, m: float, cash: str | None,
     return target
 
 
-def _run_family(name, grid, default, label_fn, make_main, make_long, pass_nav, dates, assets_fn,
+def run_family(name, grid, default, label_fn, make_main, make_long, pass_nav, dates, assets_fn,
                 long_dates, long_assets_fn, bench) -> bool:
     print("=" * 100)
     print(f"[{name}]")
@@ -162,12 +162,12 @@ def main() -> int:
 
         def long_assets(long_bars=long_bars):
             return {"IDX": L.Asset("IDX", long_bars)}
-        verdicts[f"I1{tag}"] = _run_family(
+        verdicts[f"I1{tag}"] = run_family(
             f"I1{tag} 재진입 확인 강화", I1_GRID, I1_DEFAULT, lambda p: f"X{p[0]}%·n{p[1]}",
             lambda p, code=code, bars=bars: reentry_confirmed(bars, ks, code, p[0], p[1], CASH_ETF),
             lambda p, long_bars=long_bars: reentry_confirmed(long_bars, ks, "IDX", p[0], p[1], None),
             False, dates, assets, long_dates, long_assets, bench)
-        verdicts[f"I2{tag}"] = _run_family(
+        verdicts[f"I2{tag}"] = run_family(
             f"I2{tag} 낙폭 예산", I2_GRID, I2_DEFAULT, lambda p: f"m{p}",
             lambda p, code=code: drawdown_budget(code, p, CASH_ETF),
             lambda p: drawdown_budget("IDX", p, None),
@@ -175,6 +175,10 @@ def main() -> int:
     print("=" * 100)
     print("최종: " + " · ".join(f"{k} {'채택 가능' if v else '기각'}" for k, v in verdicts.items()))
     return 0
+
+
+# 옛 이름(11-12 리팩터링 전 — 내부 호출·보관본 호환)
+_run_family = run_family
 
 
 if __name__ == "__main__":

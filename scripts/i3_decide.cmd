@@ -26,6 +26,10 @@ REM Does not change RC.
 echo ---- journal %TIME% >> logs\i3\i3_task.log
 "D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\market_journal.py --phase close >> logs\i3\i3_task.log 2>&1
 echo journal_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
+REM News/macro feature log (one row per day from the journal - forward-only research, judged at 120 days). Does not change RC.
+echo ---- features %TIME% >> logs\i3\i3_task.log
+"D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\market_features.py >> logs\i3\i3_task.log 2>&1
+echo features_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
 REM Notion daily records (DB rows only - see docs\notion-guide.md). Last, so it sees decide+league. Does not change RC;
 REM its own check step sends a Telegram alert when the sync did not finish.
 echo ---- notion %TIME% >> logs\i3\i3_task.log

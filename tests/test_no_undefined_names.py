@@ -42,6 +42,8 @@ TARGETS = [
     "scripts/lab_challengers.py",
     "scripts/lab_gen6.py",
     "scripts/lab_gen7.py",
+    "scripts/lab_flows.py",
+    "scripts/market_features.py",
     "scripts/strategy_lab.py",
     "scripts/trend_runtime.py",
     "scripts/trend_kiwoom_io.py",

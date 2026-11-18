@@ -54,6 +54,7 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-16", "뉴스·경제 지표 N1~N3(앞으로만, 판정 2027-04-30)", 3, "scripts/market_features.py"),
     ("2026-11-18", "구조적 수급 날짜 C1~C5(lab_calendar)", 5, "scripts/lab_calendar.py"),
     ("2026-11-18", "한국 팩터 기울기 F1~F5(lab_jkp, 사는 쪽만)", 5, "scripts/lab_jkp.py"),
+    ("2026-11-18", "가치 ETF × I3 엔진(리그 앞으로만, 11-20 등록)", 1, "scripts/lab_value_etf.py"),
 ]
 
 

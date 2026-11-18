@@ -33,6 +33,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
 import lab_fear as F  # noqa: E402
 import lab_orb as B  # noqa: E402
 import strategy_lab as L  # noqa: E402
@@ -201,13 +202,7 @@ def append_history(row: dict, path: Path = HISTORY_FILE) -> None:
             rows = [r for r in rd if r.get("date") != row["date"]]
     rows.append({k: row.get(k, "") for k in cols})
     rows.sort(key=lambda r: r["date"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-    tmp.replace(path)
+    AIO.write_csv(path, cols, rows)
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
@@ -256,10 +251,7 @@ async def main_async(now: datetime) -> int:
            "models": models, "stopped": stopped,
            "audit": {c: (None if x is None else round(x, 6)) for c, x in audit.items()},
            "audit_ok": not bad and not gaps, "audit_gaps": gaps}
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SHADOW_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SHADOW_FILE)
+    AIO.write_text(SHADOW_FILE, json.dumps(rec, ensure_ascii=False, indent=2))
     row = {"date": upto}
     for n, v in models.items():
         if "nav" in v:

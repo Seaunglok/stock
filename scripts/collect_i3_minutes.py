@@ -22,6 +22,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
+
 CODES = ("069500", "488770", "229200",     # KODEX200 · KODEX 머니마켓액티브 · KODEX 코스닥150
          # 공격형 트랙(10-28 운용자 결정 — 양방향·단타): 레버리지 · 200선물인버스2X · 인버스 · 코스닥150 레버리지·선물인버스
          "122630", "252670", "114800", "233740", "251340")
@@ -62,10 +64,7 @@ def merge_save(code: str, day: str, bars: list[dict], out_dir: Path = OUT_DIR) -
         merged.setdefault(b["t"], b)
     rows = [merged[k] for k in sorted(merged)]
     if len(rows) > len(old):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        AIO.write_text(path, json.dumps(rows, ensure_ascii=False))
     return len(old), max(len(rows), len(old))
 
 

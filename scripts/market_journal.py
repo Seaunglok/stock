@@ -39,6 +39,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
+
 JOURNAL_DIR = _ROOT / "data" / "market_journal"
 CALENDAR_FILE = _ROOT / "scripts" / "market_calendar.json"
 KEYWORDS = ("코스피", "반도체", "삼성전자", "SK하이닉스", "외국인 순매도", "환율", "기준금리", "연준", "엔비디아", "관세")
@@ -289,9 +291,7 @@ def save_section(day: str, section: str, data: dict, journal_dir: Path = JOURNAL
     rec = load_day(day, journal_dir)
     rec[section] = data
     p = journal_dir / f"{day}.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(p)
+    AIO.write_text(p, json.dumps(rec, ensure_ascii=False, indent=1))
     return p
 
 

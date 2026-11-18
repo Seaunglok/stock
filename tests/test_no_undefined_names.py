@@ -44,6 +44,7 @@ TARGETS = [
     "scripts/lab_gen7.py",
     "scripts/lab_flows.py",
     "scripts/market_features.py",
+    "scripts/atomic_io.py",       # 11-18 원자적 쓰기 한 곳
     "scripts/strategy_lab.py",
     "scripts/trend_runtime.py",
     "scripts/trend_kiwoom_io.py",

@@ -150,3 +150,19 @@ def test_minute_collection_reports_kiwoom_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(M, "OUT_DIR", tmp_path)
     rep = run(M.collect(datetime(2026, 11, 12, 15, 50)))
     assert set(rep) == set(M.CODES) and all("8050" in v["error"] for v in rep.values())
+
+
+def test_raw_call_never_raises_even_when_client_cannot_be_built(monkeypatch):
+    """깨뜨리기(11-18): 클라이언트 생성이 실패해도(키 누락 등) raw_call 은 예외를 던지지 않고 원인 문구를 돌려준다 —
+    전에는 import·생성이 try 밖이라 예외가 판단까지 올라갔다(점검 스크립트에서 경로가 빠지자 ModuleNotFoundError 가 그대로)."""
+    import src.mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client as C
+
+    class Broken:
+        def __init__(self, *a, **k):
+            raise RuntimeError("KIWOOM_APP_KEY 없음")
+    monkeypatch.setattr(C, "KiwoomRESTAPIClient", Broken)
+    res, err = run(KR.raw_call("ka10001", {"stk_cd": "069500"}))
+    assert res is None and err == "RuntimeError: KIWOOM_APP_KEY 없음"
+    KR._last["t"] = 0.0
+    r = run(KR.call("ka10001", {"stk_cd": "069500"}, sleep=lambda s: asyncio.sleep(0)))
+    assert r.status == "fail" and "KIWOOM_APP_KEY 없음" in r.why()

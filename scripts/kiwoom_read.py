@@ -107,15 +107,17 @@ def parse_daily(rows: list[dict], scale: float = 1.0) -> dict[str, dict]:
 
 # ── 호출 ────────────────────────────────────────────────────────────────────
 async def raw_call(api_id: str, params: dict) -> tuple[dict | None, str | None]:
-    """키움 REST 1번 — (응답, 예외 문구). 예외를 던지지 않는다."""
-    from src.mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client import KiwoomRESTAPIClient
-    c = KiwoomRESTAPIClient()
+    """키움 REST 1번 — (응답, 예외 문구). 예외를 던지지 않는다 — 클라이언트 import·생성 실패(키 누락 등)도 문구로
+    (11-18: 전에는 이 둘이 try 밖이라 생성 실패가 판단까지 예외로 올라갔다)."""
+    c = None
     try:
+        from src.mcp_servers.kiwoom_mcp.common.client.kiwoom_restapi_client import KiwoomRESTAPIClient
+        c = KiwoomRESTAPIClient()
         return await c.call_api(api_id, params), None
     except Exception as e:  # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"
     finally:
-        if hasattr(c, "close"):
+        if c is not None and hasattr(c, "close"):
             try:
                 await c.close()
             except Exception:  # noqa: BLE001

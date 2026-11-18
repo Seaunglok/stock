@@ -34,6 +34,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
 import market_journal as MJ  # noqa: E402
 
 FEATURES_FILE = _ROOT / "data" / "market_features" / "daily.csv"
@@ -101,13 +102,7 @@ def features_for(day: str, journal_dir: Path = MJ.JOURNAL_DIR) -> dict | None:
 def update(journal_dir: Path = MJ.JOURNAL_DIR, out: Path = FEATURES_FILE) -> int:
     """일지가 있는 모든 날을 다시 계산해 통째로 쓴다(작다 — 정의가 같으니 결과도 같다). 행 수."""
     rows = [r for p in sorted(journal_dir.glob("*.json")) if (r := features_for(p.stem, journal_dir))]
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows({k: ("" if r.get(k) is None else r.get(k)) for k in COLS} for r in rows)
-    tmp.replace(out)
+    AIO.write_csv(out, COLS, ({k: ("" if r.get(k) is None else r.get(k)) for k in COLS} for r in rows))
     return len(rows)
 
 

@@ -41,6 +41,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
 import i3_core as K  # noqa: E402
 import i3_fills as FL  # noqa: E402
 import i3_flows as F  # noqa: E402
@@ -77,6 +78,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # ── 상태 (원자적 쓰기) ────────────────────────────────────────────────────────
 def load_state(path: Path = STATE_FILE) -> dict:
     if not path.exists():
+        bak = AIO.bak_of(path)
+        if bak.exists():           # 11-18: 상태가 사라진 것을 '처음 실행'으로 믿지 않는다(성과 지수·예산 최고치·대기 판단)
+            raise FileNotFoundError(f"{path.name} 없음 · {bak.name} 있음 — 빈 상태로 시작하지 않는다(.bak 확인 뒤 복구)")
         return {}
     txt = path.read_text(encoding="utf-8")
     d = json.loads(txt)        # 깨졌으면 예외 — 빈 상태로 덮어쓰지 않는다
@@ -86,13 +90,10 @@ def load_state(path: Path = STATE_FILE) -> dict:
 
 
 def save_state(st: dict, path: Path = STATE_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """원자적 쓰기 + 직전 본 .bak(복사) — 11-18 전엔 state.json 을 .bak 으로 '옮긴' 뒤 교체해, 교체가 막히면 state.json 이
+    없어지고 다음 load_state 가 {} 로 처음부터 시작했다(atomic_io 문서)."""
     st["updated"] = datetime.now().isoformat(timespec="seconds")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
-    if path.exists():
-        os.replace(path, path.with_suffix(".bak"))
-    os.replace(tmp, path)
+    AIO.write_text(path, json.dumps(st, ensure_ascii=False, indent=2), keep_bak=True)
 
 
 def log_event(event: str, payload: dict, path: Path = EVENTS_FILE) -> None:

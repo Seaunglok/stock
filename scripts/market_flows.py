@@ -25,6 +25,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
+
 FLOWS_FILE = _ROOT / "data" / "market_flows" / "daily.csv"
 START = "2010-01-04"
 CHECK_TOL = 0.005
@@ -125,13 +127,7 @@ def upsert(rows: list[dict], path: Path = FLOWS_FILE) -> int:
     cur = load_rows(path)
     for r in rows:
         cur[r["date"]] = {k: ("" if r.get(k) is None else r.get(k)) for k in COLS}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=COLS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(cur[d] for d in sorted(cur))
-    tmp.replace(path)
+    AIO.write_csv(path, COLS, (cur[d] for d in sorted(cur)))
     return len(cur)
 
 

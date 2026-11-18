@@ -45,6 +45,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
 from src.mcp_servers.trend_mcp import costs as C  # noqa: E402
 
 # ── 잣대 (운용자 선언 2026-10-22 — 결과를 보기 전) ────────────────────────────
@@ -95,9 +96,7 @@ def _fetch(code: str, start: str, end: str) -> dict[str, dict]:
 
 
 def _write_json(path: Path, obj) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj), encoding="utf-8")
-    tmp.replace(path)
+    AIO.write_text(path, json.dumps(obj))
 
 
 def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31") -> dict[str, dict]:

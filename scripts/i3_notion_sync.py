@@ -37,6 +37,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
+
 DATA_DIR = _ROOT / "data" / "i3"
 OUT_FILE = DATA_DIR / "notion_sync.json"
 LOOKBACK_DAYS = 10         # 대조 창 — 연휴(최대 5일)에 하루 실패가 겹쳐도 다음 실행이 메운다
@@ -374,10 +376,7 @@ def prep(today: datetime | None = None, data_dir: Path = DATA_DIR, out: Path = O
                             aggr_equity=AS.EQUITY)
     import market_journal as MJ                       # 시장 일지DB(11-06) — 같은 대조 창으로 없는 행만
     payload["journal"] = MJ.notion_rows(payload["since"], journal_dir or MJ.JOURNAL_DIR)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(out)
+    AIO.write_text(out, json.dumps(payload, ensure_ascii=False, indent=1))
     return payload
 
 

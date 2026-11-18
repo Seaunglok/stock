@@ -39,6 +39,8 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import atomic_io as AIO  # noqa: E402
+
 STATE_FILE = _ROOT / "data" / "kiwoom_net" / "state.json"
 IP_URLS = ("https://api.ipify.org", "https://checkip.amazonaws.com")
 PROBE_CODE = "069500"
@@ -94,10 +96,7 @@ def load_state(path: Path = STATE_FILE) -> dict:
 
 
 def save_state(state: dict, path: Path = STATE_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    AIO.write_text(path, json.dumps(state, ensure_ascii=False, indent=1))
 
 
 # ── 바깥 ────────────────────────────────────────────────────────────────────

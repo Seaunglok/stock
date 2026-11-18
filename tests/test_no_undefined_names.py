@@ -47,6 +47,7 @@ TARGETS = [
     "scripts/atomic_io.py",       # 11-18 원자적 쓰기 한 곳
     "scripts/lab_trials.py",      # 11-18 시험 횟수 장부
     "scripts/lab_calendar.py",    # 11-18 구조적 수급 날짜 판정대
+    "scripts/lab_jkp.py",         # 11-18 한국 팩터 기울기 판정대
     "scripts/strategy_lab.py",
     "scripts/trend_runtime.py",
     "scripts/trend_kiwoom_io.py",

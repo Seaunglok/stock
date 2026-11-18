@@ -53,12 +53,25 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-16", "수급 판정대 S1~S5(lab_flows)", 5, "scripts/lab_flows.py"),
     ("2026-11-16", "뉴스·경제 지표 N1~N3(앞으로만, 판정 2027-04-30)", 3, "scripts/market_features.py"),
     ("2026-11-18", "구조적 수급 날짜 C1~C5(lab_calendar)", 5, "scripts/lab_calendar.py"),
+    ("2026-11-18", "한국 팩터 기울기 F1~F5(lab_jkp, 사는 쪽만)", 5, "scripts/lab_jkp.py"),
 ]
 
 
 def total(upto: str | None = None) -> int:
     """upto(포함)까지 선언된 변형 수 합 — None 이면 전부."""
     return sum(n for d, _, n, _ in TRIALS if upto is None or d <= upto)
+
+
+def total_through(source: str) -> int:
+    """그 근거(source) 행까지(포함)의 누적 — 판정대의 통과선은 이것으로 쓴다(첫 번째로 일치하는 행).
+
+    같은 날 묶음을 둘 이상 선언해도 앞 묶음의 통과선이 바뀌지 않는다(11-18: lab_calendar 93 → 그대로, lab_jkp 98)."""
+    s = 0
+    for _, _, n, src in TRIALS:
+        s += n
+        if src == source:
+            return s
+    raise KeyError(source)
 
 
 def hurdle_t(n: int, alpha: float = ALPHA, floor: float = T_FLOOR) -> float:

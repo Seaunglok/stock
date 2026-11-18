@@ -111,7 +111,10 @@ def test_judge_no_effect_fails_p4():
 # ── 시험 횟수 장부 ───────────────────────────────────────────────────────────
 def test_trials_ledger_and_hurdle():
     assert T.total() == sum(r[2] for r in T.TRIALS)
-    assert T.total("2026-11-17") == 88 and T.total(C.DECLARED_ON) == 93
+    assert T.total("2026-11-17") == 88 and T.total_through("scripts/lab_calendar.py") == 93
+    assert C.trials() == 93                                         # 같은 날 2묶음(lab_jkp)을 더해도 이 묶음의 통과선은 그대로
+    with pytest.raises(KeyError):
+        T.total_through("scripts/없는_판정대.py")
     assert T.hurdle_t(5) == 3.0                                     # 적게 쟀어도 하한 3.0(Harvey·Liu·Zhu)
     assert T.hurdle_t(93) == pytest.approx(3.46, abs=0.01)
     hs = [T.hurdle_t(n) for n in (10, 50, 100, 200, 500, 1000)]
@@ -124,4 +127,4 @@ def test_this_batch_is_registered_before_measuring():
     """선언과 장부가 같다 — 후보 수 = 장부의 이 묶음 행 · 통과선은 그 행까지 합친 수로."""
     row = [r for r in T.TRIALS if r[0] == C.DECLARED_ON and "lab_calendar" in r[3]]
     assert len(row) == 1 and row[0][2] == len(C.CANDIDATES)
-    assert C.hurdle() == T.hurdle_t(T.total(C.DECLARED_ON))
+    assert C.hurdle() == T.hurdle_t(T.total_through("scripts/lab_calendar.py"))

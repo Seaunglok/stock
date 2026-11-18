@@ -37,6 +37,7 @@
     P3 매매  구간마다 사례 평균(가설 방향) − 왕복 비용(2 × 11.5bp) > 0  — 같은 후보의 사례끼리는 겹치지 않는다(겹치면 앞 것만)
     P4 유의  두 구간을 합친 t = (사례 평균 − 같은 모양 창 모든 날 평균) ÷ (사례 표준편차 ÷ √n) ≥ 시험 횟수 장부 통과선
              `lab_trials.hurdle_t(lab_trials.total('2026-11-18'))` — 이 묶음 5개까지 합친 93개, 본페로니 양측 5% → 약 3.46
+             (11-18 같은 날 2묶음 lab_jkp 선언 때 `total_through('scripts/lab_calendar.py')` 로 바꿈 — 값 93 그대로)
   보고만   구간별 t · 적중률(가설 방향 > 0 인 비율) · 반대 방향. **반대가 강해도 채택하지 않는다**(다음 선언 후보로 기록만).
   통과하면 공격형 리그에 앞으로만 기록하는 멤버 후보(50만원, 다음 거래일부터) — 실계좌는 11-10 운용자 결정대로 없다.
 
@@ -121,8 +122,13 @@ def side_cost() -> float:
     return L.side_cost(False, False)          # ETF 편도 수수료+슬리피지(거래세 없음) = 11.5bp
 
 
+def trials() -> int:
+    """이 묶음 행까지의 누적(93) — 11-18 같은 날 2묶음(lab_jkp)을 선언하며 날짜 합(total)에서 행 기준(total_through)으로 바꿨다, 값 그대로."""
+    return T.total_through("scripts/lab_calendar.py")
+
+
 def hurdle() -> float:
-    return T.hurdle_t(T.total(DECLARED_ON))
+    return T.hurdle_t(trials())
 
 
 # ── 날짜 (순수 함수 — 거래일 목록만 본다) ──────────────────────────────────────
@@ -253,7 +259,7 @@ def judge(bars: dict[str, dict], days: list[str], name: str, hurdle_t: float, co
 def measure(bars: dict[str, dict]) -> dict:
     days = sorted(d for d in bars if bars[d].get("close"))
     h, c = hurdle(), side_cost()
-    return {"hurdle": h, "trials": T.total(DECLARED_ON), "days": (days[0], days[-1], len(days)),
+    return {"hurdle": h, "trials": trials(), "days": (days[0], days[-1], len(days)),
             "res": {n: judge(bars, days, n, h, c) for n in CANDIDATES}}
 
 

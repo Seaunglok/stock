@@ -193,6 +193,11 @@ def league_data():
         pytest.skip("OHLC 캐시 없음")
     import lab_classics as C
     data["ohlc:069500"] = C.load_ohlc("069500", "2010-01-01", "2026-10-21")
+    # 고정 기준일(HOLDOUT 끝 이하) 캐시만 쓴다 — 날짜별 캐시(11-18 등)는 리그가 매일 받으며 prune_live_cache 가 지운다(11-19 발견).
+    # 시작일 = 캐시 첫날(상장일) — 더 이르면 meta 없는 옛 캐시라 네트워크로 앞쪽을 다시 받는다.
+    if not (cache / "223190_2026-10-21.json").exists():
+        pytest.skip("223190 고정 캐시 없음(「가치저변동」)")
+    data["223190"] = {d: b for d, b in L.load_bars("223190", "2015-06-26", "2026-10-21").items() if d <= "2026-08-24"}
     return data
 
 
@@ -293,6 +298,25 @@ def test_v7a_member_is_the_declared_gen7_design(league_data):
     i3, t6, x = res["I3"]["w_hist"], res["T6c"]["w_hist"], res["V7a"]["w_hist"]
     assert all((i3[d] == 0) == (x[d] == 0) for d in i3)
     assert any(abs(t6[d] - x[d]) > 0.05 for d in t6)
+
+
+def test_value_member_is_the_declared_design(league_data):
+    """「가치저변동」은 lab_value_etf 선언(525b308) 그대로 — I3 엔진을 223190 자기 가격으로, 등록일 11-20, 월 상한 안(예외 아님).
+    엔진이 ETF 가격을 보므로 챔피언과 실제로 다르게 행동한 날이 있어야 한다(그래야 승격 조건 '다르게 행동 20일'을 잴 수 있다)."""
+    import lab_value_etf as VE
+    m = next(x for x in S.MEMBERS if x.name == VE.NAME)
+    assert (m.family, m.registered) == (VE.FAMILY, VE.REGISTER_ON) and m.name not in S.INTAKE_EXCEPTIONS
+    assert set(m.codes) == {VE.ETF, K.CASH, S.KOSPI} and "525b308" in m.admitted and "fb77fa5" in m.admitted
+    dates = S._calendar(league_data, UPTO)
+    codes, t, needs_nav = S._b_value(league_data, dates)
+    _, ref, _ = VE.build(league_data, dates)
+    assert codes == (VE.ETF, K.CASH) and needs_nav
+    for i, d in enumerate(dates[:400]):
+        assert t(i, d, 3_640_000.0) == ref(i, d, 3_640_000.0), d          # 다시 구현하지 않았다
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], m))
+    i3, x = res["I3"]["w_hist"], res[VE.NAME]["w_hist"]
+    assert res[VE.NAME]["curve"][0] == (START, 3_640_000)
+    assert sum(1 for d in i3 if abs(i3[d] - x.get(d, 0.0)) >= S.DIVERGE_PP) >= S.PROMO_MIN_DIVERGE_DAYS
 
 
 def test_factor_members_start_from_the_same_line(league_data, monkeypatch):

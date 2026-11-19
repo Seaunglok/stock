@@ -406,6 +406,22 @@ MEMBERS = MEMBERS + (
            "(T6c 13.8%·18.6%·−11.5%), 대신 미공개 −3.6%·박스권 4.2%",
            (K.BASE, K.CASH, KOSPI), std_run(_b_spec("lab_gen7", "SPECS7", "V7a"))),
 )
+
+
+def _b_value(data, dates):
+    """「가치저변동」 — lab_value_etf 선언(525b308) 그대로: I3 엔진을 KODEX 200가치저변동(223190) 자기 가격으로."""
+    import lab_value_etf as VE
+    return VE.build(data, dates)
+
+
+_VE_ADMIT = ("lab_jkp 선언(fb77fa5) '통과하면 그 팩터 ETF 로 I3 엔진을 돌리는 도전자를 리그에 앞으로만' → 가치 통과(33e666d) · "
+             "등록 선언 lab_value_etf(525b308) — 운용자 '진행하자'(11-18)·'진행 해줘'(11-19)")
+MEMBERS = MEMBERS + (
+    Member("가치저변동", "외부 팩터(JKP 가치)", "2026-11-20", _VE_ADMIT,
+           "KODEX 200가치저변동(223190, 코스피200 가치+저변동) × I3 엔진을 그 ETF 가격으로(재진입 국면 KOSPI>MA120 그대로). "
+           "보고만 재생 2015-07~ 연 12.7%·MDD 21.6%(I3 12.0%·19.9%)",
+           ("223190", K.CASH, KOSPI), std_run(_b_value)),
+)
 # Notion 표시 이름 — 운용자(10-22): "노션에서는 줄임말을 풀네임(줄임말)로". 영문이 들어간 멤버는 여기에 있어야 한다
 # (테스트가 빠짐을 잡는다). 멤버를 등록할 때 MEMBERS 와 같은 자리에서 함께 고친다(11-12 리팩터링 — 전엔 i3_notion_sync 에 있었다).
 DISPLAY = {

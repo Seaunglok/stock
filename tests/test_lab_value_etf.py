@@ -103,18 +103,22 @@ def test_ledger_row_registered_before_report():
     assert T.total_through(V.SOURCE) == 99 and T.total_through("scripts/lab_jkp.py") == 98
 
 
-@pytest.mark.skipif(not (ROOT / "docs_cache" / "lab" / f"{V.ETF}_{V.REPORT_END}.json").exists(), reason="223190 캐시 없음")
+_CACHE = ROOT / "docs_cache" / "lab"
+_FIXED = ("223190_2026-10-21.json", "069500_2026-08-24.json", "IDX_KS11_2026-08-24.json", "488770_2026-10-21.json")
+
+
+@pytest.mark.skipif(not all((_CACHE / n).exists() for n in _FIXED), reason="고정 기준일 캐시 없음")
 def test_real_etf_history_covers_league_replay():
-    """실제 223190 이력이 리그 재생 시작(2015-07-28) 전부터 있고, 리그 실행기로 돌려도 비중이 0~1 안이다(성과는 보지 않는다)."""
+    """실제 223190 이력이 리그 재생 시작(2015-07-28) 전부터 있고, 리그 실행기(현금 488770)로 돌려도 비중이 0~1 안이다
+    (성과는 보지 않는다). 고정 기준일 캐시만 쓴다 — 날짜별 캐시는 리그가 매일 받으며 prune_live_cache 가 지운다(11-19 발견)."""
     import strategy_lab as L
-    v = L.load_bars(V.ETF, "2014-01-01", V.REPORT_END)
+    v = L.load_bars(V.ETF, "2015-06-26", "2026-10-21")
     assert min(v) <= "2015-06-30" < K.REPLAY_START
-    k = L.load_bars(K.BASE, "2014-01-01", V.REPORT_END)
-    ks = L.load_bars(V.KOSPI, "1996-01-01", V.REPORT_END)
-    c = L.load_bars(V.REPORT_CASH, "2014-01-01", V.REPORT_END)
+    k = L.load_bars(K.BASE, "2014-01-01", "2026-08-24")
+    ks = L.load_bars(V.KOSPI, "1996-01-01", "2026-08-24")
+    c = L.load_bars(K.CASH, "2014-01-01", "2026-10-21")
     missing = [d for d in k if d >= K.REPLAY_START and d not in v]
     assert len(missing) <= 5, missing[:10]
-    data = {K.BASE: k, V.ETF: v, V.KOSPI: ks, V.REPORT_CASH: c}
-    run = S.std_run(lambda d, dates: V.build(d, dates, cash=V.REPORT_CASH))
-    r = run(data, "2024-09-02", 3_640_000.0, max(k))
+    data = {K.BASE: k, V.ETF: v, V.KOSPI: ks, K.CASH: c}
+    r = S.std_run(V.build)(data, "2024-09-02", 3_640_000.0, "2026-08-24")
     assert r["curve"][0] == ("2024-09-02", 3_640_000) and all(0 <= w <= 1 + 1e-9 for w in r["w_hist"].values())

@@ -285,6 +285,27 @@ def order_status(resp: Any) -> str:
     return "ok" if rc in (0, "0", None) else "rejected"
 
 
+async def _alert_missed_window(notify: Notifier, state_path: Path, now: datetime, today: str) -> None:
+    """매매 시간대 **뒤**에 돈 매매 단계 — 대기 판단이 남아 있으면 놓친 것이다(11-19 평가).
+
+    PC 가 09:20 뒤에 켜지면 `I3Trade`(StartWhenAvailable)가 늦게 돌아 여기로 온다. 전엔 조용히 건너뛰어, 이탈(매도)
+    판단이 하루 늦어도 운용자가 몰랐다. 동작은 그대로(주문 안 함 · 판단 유지 → 다음 매매일 08:50, 오래되면 폐기) —
+    알림만 더한다. 오늘 판단한 것(내일 몫) · 오늘 이미 매매함 · 상태 읽기 실패(15:50 판단이 같은 이유로 critical
+    중단한다)는 알리지 않는다.
+    """
+    try:
+        st = load_state(state_path)
+    except Exception:
+        return
+    plan = st.get("pending")
+    if not plan or st.get("traded_on") == today or str(plan.get("decided_on", "")) >= today:
+        return
+    await notify(f"🚨 [I3] {today} 매매 놓침 — 대기 판단({plan['decided_on']} · KODEX200 목표 {float(plan['w']):.0%})이 "
+                 f"있는데 매매 단계가 {now:%H:%M} 에 돌았다(시간대 {TRADE_WINDOW[0]:%H:%M}~{TRADE_WINDOW[1]:%H:%M} 밖). "
+                 f"주문 안 함 · 다음 매매일 08:50 에 다시 시도(판단 {MAX_PLAN_AGE_DAYS}일 넘으면 폐기). "
+                 f"급하면 직접 매매해도 다음 실행이 잔고 기준으로 맞춘다", critical=True)
+
+
 async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: dict[str, float],
                       state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
                       dry_run: bool = True, halt: bool = False, wait_after_open=None,
@@ -297,6 +318,8 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
             await notify(f"⏸️ [I3] {today} 매매 정지 중(I3_HALT=true) — 주문 안 함. 다시 켜려면 .env 에서 false")
         return {"skip": "I3_HALT=true"}
     if not in_window:
+        if now.time() > TRADE_WINDOW[1]:
+            await _alert_missed_window(notify, state_path, now, today)
         return {"skip": f"매매 시간대({TRADE_WINDOW[0]:%H:%M}~{TRADE_WINDOW[1]:%H:%M}) 밖"}
     st = load_state(state_path)
     plan = st.get("pending")

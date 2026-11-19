@@ -607,6 +607,38 @@ def test_morning_notice_only_for_scheduled_quiet_days(paths, kw, seed, now, word
         assert len(notes.msgs) == 1 and notes.msgs[0][0] is False and word in notes.msgs[0][1]
 
 
+@pytest.mark.parametrize("decided, extra, now, alert", [
+    ("2026-10-21", {}, datetime(2026, 10, 22, 10, 30), True),                          # ★ 대기 판단 + 시간대 뒤 = 놓침
+    ("2026-10-21", {"traded_on": "2026-10-22"}, datetime(2026, 10, 22, 10, 30), False),  # 오늘 이미 매매함
+    ("2026-10-22", {}, datetime(2026, 10, 22, 16, 5), False),                          # 오늘 판단한 내일 몫 — 놓친 게 아님
+    ("2026-10-21", {}, datetime(2026, 10, 22, 8, 0), False),                           # 시간대 전 — 08:50 예약 실행이 남음
+])
+def test_missed_trade_window_alerts_critically(paths, decided, extra, now, alert):
+    """11-19 평가: PC 가 09:20 뒤에 켜지면 늦게 돈 매매 단계(StartWhenAvailable)가 시간대 밖으로 **조용히** 건너뛰었다 —
+    대기 판단이 이탈(매도)이면 폭락장 매도가 하루 늦어도 운용자는 몰랐다. 동작(주문 안 함 · 판단 유지)은 그대로, critical 만."""
+    _seed(paths[0], decided=decided, **extra)
+    b = FakeBroker(allow_orders=False)
+    notes = Notes()
+    r = run(LV.phase_trade(b, notes, now, PRICES, *paths, dry_run=False))
+    assert "시간대" in r["skip"]
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert st["pending"]["decided_on"] == decided            # 대기 판단은 다음 매매일 08:50 몫으로 남는다
+    if alert:
+        assert len(notes.msgs) == 1 and notes.msgs[0][0] is True
+        assert "매매 놓침" in notes.msgs[0][1] and decided in notes.msgs[0][1]
+    else:
+        assert notes.msgs == []
+
+
+def test_missed_window_alert_does_not_break_on_bad_state(paths):
+    """상태 파일이 깨졌으면 알림 쪽은 조용히 물러난다 — 예전처럼 건너뜀만(15:50 판단이 같은 이유로 critical 중단한다)."""
+    paths[0].write_text("{깨짐", encoding="utf-8")
+    notes = Notes()
+    r = run(LV.phase_trade(FakeBroker(allow_orders=False), notes, datetime(2026, 10, 22, 10, 30), PRICES, *paths,
+                           dry_run=False))
+    assert "시간대" in r["skip"] and notes.msgs == []
+
+
 def test_stale_plan_is_dropped(paths):
     _seed(paths[0], decided="2026-10-10")
     b = FakeBroker(allow_orders=False)

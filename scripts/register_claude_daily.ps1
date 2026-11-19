@@ -5,14 +5,16 @@
 # (IgnoreNew) - the PC is shut down nightly, so normally a fresh window every morning.
 # Windows Terminal (wt.exe) is not installed on this PC, so plain cmd.exe.
 # 09:00 is inside the order window (08:30-09:20): do not re-run batches or restart MCP from this session
-# before 09:20 (CLAUDE.md rule 4).
+# before 09:20 (CLAUDE.md rule 4) - enforced by the PreToolUse hook scripts\claude_guard.py (backlog 23, 11-19).
+# --permission-mode default (11-19, backlog 23): every command/edit asks for approval, even if a settings file
+# later sets another default mode. The remote device gets the approval prompts.
 $ErrorActionPreference = 'Stop'
 $root = 'D:\kiwoom_rest_study\multi_agent_kiwoom'
 $claude = "$env:USERPROFILE\.local\bin\claude.exe"
 if (-not (Test-Path $claude)) { throw "claude.exe not found: $claude" }
 
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' `
-    -Argument "/k `"`"$claude`" --remote-control multi_agent_kiwoom`"" -WorkingDirectory $root
+    -Argument "/k `"`"$claude`" --remote-control multi_agent_kiwoom --permission-mode default`"" -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -Daily -At 9:00
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
     -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)

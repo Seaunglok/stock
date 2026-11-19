@@ -42,6 +42,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
         sys.path.insert(0, _p)
 
 import atomic_io as AIO  # noqa: E402
+import heartbeat as HB  # noqa: E402
 import i3_core as K  # noqa: E402
 import i3_fills as FL  # noqa: E402
 import i3_flows as F  # noqa: E402
@@ -578,12 +579,20 @@ async def _main(phase: str) -> int:
         row = record_flow(_FLOW_ARGS["amount"], _FLOW_ARGS.get("memo", ""), datetime.now())
         print(json.dumps({"기록": row, "안내": "다음 판단(15:50) 때 성과 지수에서 뺀다"}, ensure_ascii=False))
         return 0
+    # 무소식 감시(㉑): 단계 시작 = 살아 있음 신호 — PC 밖 서비스가 시각까지 못 받으면 휴대폰 경보. 기다리지 않는다
+    beat = HB.ping(phase)
     try:
         return await _run_phase(phase)
     except Exception as e:                      # 조용히 끝나면 '판단 없음'을 아무도 모른다
         log.exception("[%s] 예외", phase)
         await _notify(f"⛔ [I3] {phase} 단계 예외 — {type(e).__name__}: {str(e)[:150]}", critical=True)
+        if beat:
+            await asyncio.to_thread(beat.join, HB.TIMEOUT * HB.TRIES)   # 시작 신호 뒤에 /fail 이 가야 한다
+        await asyncio.to_thread(HB.ping_now, phase, True)
         return 1
+    finally:
+        if beat:
+            await asyncio.to_thread(beat.join, HB.TIMEOUT * HB.TRIES)
 
 
 async def _run_phase(phase: str) -> int:

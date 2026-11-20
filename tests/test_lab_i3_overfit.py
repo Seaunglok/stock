@@ -20,7 +20,7 @@ import strategy_lab as L  # noqa: E402
 
 def test_declared_constants():
     assert O.N_SELECT == 15                     # 연구소 1~5차 — I3 가 뽑힐 때까지
-    assert O.N_NOW == T.total()
+    assert O.N_NOW == 99                        # 측정 당시 장부 전체 — 행이 늘어도 그대로
     assert O.I3_LABEL == "I3 m6·L252"
     assert (O.FULL, O.LONG, O.CSCV_S, O.SHIFT_MIN) == (("2015-07-28", "2026-08-24"), ("1998-01-02", "2026-08-24"), 16, 21)
 

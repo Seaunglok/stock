@@ -120,7 +120,7 @@ def _through_name(prefix: str) -> int:
 
 
 N_SELECT = _through_name("연구소 5차")    # I3 가 뽑힐 때까지(연구소 1~5차) = 15
-N_NOW = TR.total()                        # 장부 전체(11-20 = 99) — 참고
+N_NOW = TR.total_through("scripts/lab_value_etf.py")   # 선언·측정 당시 장부 전체(99) — 뒤에 행이 늘어도 이 값(참고)
 
 
 # ── 통계 ─────────────────────────────────────────────────────────────────────

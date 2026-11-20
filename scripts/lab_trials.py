@@ -56,6 +56,7 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-18", "한국 팩터 기울기 F1~F5(lab_jkp, 사는 쪽만)", 5, "scripts/lab_jkp.py"),
     ("2026-11-18", "가치 ETF × I3 엔진(리그 앞으로만, 11-20 등록)", 1, "scripts/lab_value_etf.py"),
     ("2026-11-20", "점프 모형 국면 J1(0/1)·J2(× 낙폭 예산)(백로그 ㉗)", 2, "scripts/lab_jump.py"),
+    ("2026-11-20", "10세대 X10a 변동성 비례 이탈폭(리그 앞으로만, 11-23 등록)(백로그 ㉕)", 1, "scripts/lab_gen10.py"),
 ]
 
 

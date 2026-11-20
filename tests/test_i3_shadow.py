@@ -319,6 +319,22 @@ def test_value_member_is_the_declared_design(league_data):
     assert sum(1 for d in i3 if abs(i3[d] - x.get(d, 0.0)) >= S.DIVERGE_PP) >= S.PROMO_MIN_DIVERGE_DAYS
 
 
+def test_x10a_member_runs_the_declared_design(league_data):
+    """「X10a」(lab_gen10, ㉕) — 리그 실행기(std_run → shadow_target → simulate)를 그대로 지나고 같은 출발선.
+    빌더는 선언 함수를 그대로 부른다(다시 구현하지 않았다). 엔진이 빠진 날은 챔피언과 같다(이탈폭만 다르다)."""
+    import lab_gen10 as G10
+    m = next(x for x in S.MEMBERS if x.name == G10.NAME)
+    dates = S._calendar(league_data, UPTO)
+    _, t, needs_nav = S._b_x10a(league_data, dates)
+    _, ref, _ = G10.build(league_data, dates)
+    assert needs_nav
+    for i, d in enumerate(dates[:400]):
+        assert t(i, d, 3_640_000.0) == ref(i, d, 3_640_000.0), d
+    res = S.run_league(league_data, START, 3_640_000.0, UPTO, (S.MEMBERS[0], m))
+    assert "error" not in res[G10.NAME] and res[G10.NAME]["curve"][0] == (START, 3_640_000)
+    assert set(res[G10.NAME]["w_hist"]) == set(res["I3"]["w_hist"])
+
+
 def test_factor_members_start_from_the_same_line(league_data, monkeypatch):
     """종목형 팩터 멤버(저베타·퀄리티) — 대형주 데이터는 합성으로 바꿔 끼워 배선만 시험: 같은 출발선, 월말에만 매매,
     주식 비중 0~100%, 매도세 있는 자산으로 취급."""

@@ -57,6 +57,7 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-18", "가치 ETF × I3 엔진(리그 앞으로만, 11-20 등록)", 1, "scripts/lab_value_etf.py"),
     ("2026-11-20", "점프 모형 국면 J1(0/1)·J2(× 낙폭 예산)(백로그 ㉗)", 2, "scripts/lab_jump.py"),
     ("2026-11-20", "10세대 X10a 변동성 비례 이탈폭(리그 앞으로만, 11-23 등록)(백로그 ㉕)", 1, "scripts/lab_gen10.py"),
+    ("2026-11-23", "연말 대주주 양도세 매도 Y1(마감일 앞 약세)·Y2(뒤 되돌림)(lab_taxsell, 아이디어 장부 6번)", 2, "scripts/lab_taxsell.py"),
 ]
 
 

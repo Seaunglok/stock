@@ -640,12 +640,159 @@ def test_missed_window_alert_does_not_break_on_bad_state(paths):
 
 
 def test_stale_plan_is_dropped(paths):
+    """평일 8일 묵은 판단(prev_w 없는 옛 형식) — 버리고 state.w 를 모름(None)으로: 다음 판단이 '첫 판단'으로 다시 정한다."""
     _seed(paths[0], decided="2026-10-10")
     b = FakeBroker(allow_orders=False)
     notes = Notes()
     r = run(LV.phase_trade(b, notes, NOW, PRICES, *paths, dry_run=False))
     assert "오래된" in r["skip"] and any(c for c, _ in notes.msgs)
-    assert "pending" not in json.loads(paths[0].read_text(encoding="utf-8"))
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert "pending" not in st and st["w"] is None
+
+
+# ─── 장 시간이 바뀌는 날 · 연휴 뒤 판단(백로그 ⑲, 11-23) ─────────────────────
+NEWYEAR = "2027-01-04"
+
+
+def test_year_end_plan_survives_new_year_gap_and_trades_at_shifted_open(paths):
+    """★ 12-30 판단 → 01-04 매매. 옛 규칙(달력 4일)은 5일째라 버렸다 — 이제 평일 3일이라 매매하고, 10:00 개장이라 09:50 에 판다."""
+    from datetime import date
+    assert (date(2027, 1, 4) - date(2026, 12, 30)).days == 5 > 4          # 옛 규칙이 버리던 경우(기록)
+    ses = LV.MS.session_for(NEWYEAR)
+    _seed(paths[0], decided="2026-12-30", w=1.0)
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    b = FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0))
+    r = run(LV.phase_trade(b, Notes(), datetime(2027, 1, 4, 9, 50), PRICES, *paths, dry_run=False, session=ses))
+    assert [p[0] for p in b.placed] == ["sell", "buy"] and r["date"] == NEWYEAR
+
+
+def test_shifted_day_trade_before_window_is_quiet_and_keeps_plan(paths):
+    """10:00 개장일 08:50 에 (기다리지 않고) 불리면 시간대(09:30~10:20) 전 — 주문 없음, 판단 유지, 알림 없음."""
+    ses = LV.MS.session_for(NEWYEAR)
+    _seed(paths[0], decided="2026-12-30")
+    notes = Notes()
+    r = run(LV.phase_trade(FakeBroker(allow_orders=False), notes, datetime(2027, 1, 4, 8, 50), PRICES, *paths,
+                           dry_run=False, session=ses))
+    assert "09:30~10:20" in r["skip"] and notes.msgs == []
+    assert json.loads(paths[0].read_text(encoding="utf-8"))["pending"]["decided_on"] == "2026-12-30"
+    r = run(LV.phase_trade(FakeBroker(allow_orders=False), notes, datetime(2027, 1, 4, 10, 30), PRICES, *paths,
+                           dry_run=False, session=ses))
+    assert len(notes.msgs) == 1 and "매매 놓침" in notes.msgs[0][1] and "09:30~10:20" in notes.msgs[0][1]
+
+
+def test_dropped_plan_restores_w_so_next_decide_trades_again(paths, monkeypatch):
+    """★ 일부러 깨뜨리기 — 판단(writer) → 버려짐 → 다음 판단(reader). 버릴 때 state.w 를 prev_w 로 되돌리지 않으면
+    다음 판단이 '유지'로 굳어 대기 판단이 다시 생기지 않는다(옛 결함). 되돌리면 다시 생긴다."""
+    days = _days()
+    d1, d2 = days[-12], days[-1]
+    paths[0].write_text(json.dumps({"w": 0.0}), encoding="utf-8")       # 계좌는 현금(마지막 매매 목표 0)
+    hold = [{"symbol": K.CASH, "qty": 30, "cur": 113000, "name": "x", "avg": 0}]
+    run(LV.phase_decide(FakeMarket(days[:-11], d1), FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0)), Notes(),
+                        datetime.fromisoformat(d1 + "T15:50:00"), *paths))
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert st["pending"]["w"] == pytest.approx(1.0) and st["pending"]["prev_w"] == 0.0 and st["w"] == pytest.approx(1.0)
+    r = run(LV.phase_trade(FakeBroker(allow_orders=False), Notes(), datetime.fromisoformat(d2 + "T08:50:00"), PRICES,
+                           *paths, dry_run=False))
+    assert "오래된" in r["skip"] and json.loads(paths[0].read_text(encoding="utf-8"))["w"] == 0.0
+    run(LV.phase_decide(FakeMarket(days, d2), FakeBroker(holdings=hold, equity=(3_400_000.0, 0.0)), Notes(),
+                        datetime.fromisoformat(d2 + "T15:50:00"), *paths))
+    st = json.loads(paths[0].read_text(encoding="utf-8"))
+    assert st["pending"]["decided_on"] == d2 and st["pending"]["w"] == pytest.approx(1.0)
+
+
+def test_overwriting_unexecuted_plan_keeps_held_prev_w(paths, monkeypatch):
+    """대기 판단이 매매되기 전에 새 판단이 덮어쓰면 prev_w 는 '계좌가 든 것'(처음 대기 판단의 prev_w)을 잇는다."""
+    days = _days()
+    d = days[-1]
+    paths[0].write_text(json.dumps({"w": 1.0, "pending": {"decided_on": days[-2], "w": 1.0, "reason": "t",
+                                                          "prev_w": 0.0}}), encoding="utf-8")
+    monkeypatch.setattr(LV.K, "decide", lambda eng, navs, prev: (0.0, True, "이탈(시험)"))
+    run(LV.phase_decide(FakeMarket(days, d), FakeBroker(), Notes(), datetime.fromisoformat(d + "T15:50:00"), *paths))
+    p = json.loads(paths[0].read_text(encoding="utf-8"))["pending"]
+    assert p["decided_on"] == d and p["w"] == 0.0 and p["prev_w"] == 0.0
+
+
+def test_decide_waits_for_shifted_close_and_announces_upcoming(paths):
+    """수능(16:30 마감) — 15:50 엔 판단하지 않는다(16:35 이전). 곧 올 변경일은 판단 알림에 미리 적는다."""
+    days = _days()
+    today = days[-1]
+    suneung = LV.MS.Session(today, LV.dtime(10, 0), LV.dtime(16, 30))
+    notes = Notes()
+    r = run(LV.phase_decide(FakeMarket(days, today), FakeBroker(), notes, datetime.fromisoformat(today + "T15:50:00"),
+                            *paths, session=suneung))
+    assert "16:35 이전" in r["skip"] and not paths[0].exists() and notes.msgs == []
+    soon = [LV.MS.session_for(NEWYEAR)]
+    run(LV.phase_decide(FakeMarket(days, today), FakeBroker(), notes, datetime.fromisoformat(today + "T16:36:00"),
+                        *paths, session=suneung, upcoming=soon))
+    assert any("장 시간 변경 예정: 01-04 10:00~15:30(거래소 공지 확인 필요)" in m for _, m in notes.msgs)
+
+
+@pytest.mark.parametrize("now, phase, secs, word", [
+    (datetime(2027, 1, 4, 8, 50), "trade", 3600, "09:50 까지"),      # 예약 08:50 → 개장 10분 전까지
+    (datetime(2027, 1, 4, 7, 0), "trade", 0, None),                  # 평소 시간대 전 수동 실행 — 기다리지 않는다
+    (datetime(2027, 1, 4, 9, 55), "trade", 0, None),                 # 이미 매도 시각 뒤
+    (datetime(2026, 11, 19, 15, 50), "decide", 2700, "16:35 까지"),  # 수능 — 15:50 → 16:35
+    (datetime(2026, 11, 19, 14, 0), "decide", 0, None),
+    (datetime(2026, 11, 23, 8, 50), "trade", 0, None),               # 평소 날 — 옛 길 그대로
+])
+def test_shift_wait_uses_real_calendar(now, phase, secs, word):
+    ses = LV.MS.session_for(now.strftime("%Y-%m-%d"))
+    s, msg = LV.shift_wait(now, ses, phase)
+    assert s == secs and (msg is None if word is None else word in msg and not msg.startswith("⛔"))
+
+
+@pytest.mark.parametrize("start, phase, slept, ses_open", [
+    (datetime(2027, 1, 4, 8, 50), "trade", 3600.0, "10:00"),    # 새해 첫 거래일 — 08:50 예약 → 09:50 까지
+    (datetime(2026, 11, 23, 8, 50), "trade", None, "09:00"),    # 평소 날 — 기다리지 않는다(옛 길)
+    (datetime(2026, 11, 19, 15, 50), "decide", 2700.0, "10:00"),  # 수능 — 15:50 → 16:35
+])
+def test_run_phase_wiring_waits_and_passes_session(monkeypatch, start, phase, slept, ses_open):
+    """실제 연결(_run_phase) — 실제 일정 파일로 오늘 장 시간을 찾아, 기다리고, 그 장 시간을 단계에 넘긴다."""
+    clock = {"t": start}
+
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["t"]
+    sleeps, got = [], {}
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        clock["t"] = clock["t"] + __import__("datetime").timedelta(seconds=s)
+
+    async def fake_trade(broker, notify, now, prices, **kw):
+        got.update(kw, now=now)
+        await kw["wait_after_open"]()
+        return {"skip": "시험"}
+
+    async def fake_decide(market, broker, notify, now, **kw):
+        got.update(kw, now=now)
+        return {"skip": "시험"}
+    notes = Notes()
+    monkeypatch.setattr(LV, "datetime", FakeDT)
+    monkeypatch.setattr(LV.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(LV, "_notify", notes)
+    monkeypatch.setattr(LV, "load_state", lambda *a, **k: {})
+    monkeypatch.setattr(LV, "phase_trade", fake_trade)
+    monkeypatch.setattr(LV, "phase_decide", fake_decide)
+    monkeypatch.setattr(LV, "KiwoomBroker", lambda: object())
+    monkeypatch.setattr(LV, "KiwoomMarket", lambda: object())
+    assert run(LV._run_phase(phase)) == 0
+    assert f"{got['session'].open:%H:%M}" == ses_open
+    if slept is None:
+        assert sleeps[:1] != [3600.0] and notes.msgs == []
+    else:
+        assert sleeps[0] == slept and "기다린다" in notes.msgs[0][1] and not notes.msgs[0][0]
+        assert got["now"] == start + __import__("datetime").timedelta(seconds=slept)
+    if phase == "trade":                                          # 매수는 그날 개장 + 5분 30초까지 기다린다
+        assert clock["t"].time() == got["session"].buy_after       # 10:05:30 · 평소 09:05:30
+
+
+def test_shift_wait_refuses_absurd_calendar():
+    """★ 일부러 깨뜨리기 — 개장 12:00 오타면 3시간을 기다리지 않고 critical 문장(단계는 '시간대 밖'으로 멈춘다)."""
+    ses = LV.MS.Session("2027-01-04", LV.dtime(12, 0), LV.dtime(15, 30))
+    s, msg = LV.shift_wait(datetime(2027, 1, 4, 8, 50), ses, "trade")
+    assert s == 0 and msg.startswith("⛔") and "오타" in msg
 
 
 def test_trade_aborts_when_holdings_unknown(paths):

@@ -26,7 +26,9 @@ import sys
 from datetime import datetime, time as dtime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))     # 한국은 일광절약시간이 없다 — tzdata 없이 고정 오프셋
-WINDOWS = ((dtime(8, 30), dtime(9, 20)), (dtime(15, 50), dtime(16, 0)))
+WINDOWS = ((dtime(8, 30), dtime(9, 20)), (dtime(15, 50), dtime(16, 0)))   # 평소 날
+# 장 시간이 바뀐 날(수능 · 새해 첫 거래일 — `market_session`, 백로그 ⑲ 11-23)은 평소 창과 바뀐 창을 합친다
+# (10:00 개장 → 08:30~10:20 · 16:30 마감 → 15:50~16:45 — 배치가 기다리는 동안도 막는다). 일정을 못 읽으면 평소 창.
 ROOT = "d:/kiwoom_rest_study/multi_agent_kiwoom/"
 
 SHELL_TOOLS = {"Bash", "PowerShell"}
@@ -48,11 +50,19 @@ WRITE_PREFIXES = ("scripts/", "src/", "data/")
 WRITE_FILES = (".env", "run_mcp_local.py")
 
 
+def windows_for(day: str) -> tuple[tuple[dtime, dtime], ...]:
+    try:
+        import market_session as MS
+        return MS.session_for(day).guard_windows()
+    except Exception:
+        return WINDOWS
+
+
 def in_order_window(now: datetime) -> bool:
     if now.weekday() >= 5:
         return False
     t = now.time()
-    return any(a <= t < b for a, b in WINDOWS)
+    return any(a <= t < b for a, b in windows_for(now.strftime("%Y-%m-%d")))
 
 
 def _rel(path: str) -> str | None:
@@ -78,9 +88,11 @@ def decide(tool: str, tool_input: dict, now: datetime) -> str | None:
 
 
 def reason_text(what: str, now: datetime) -> str:
-    return (f"⛔ 주문 시간({now:%H:%M}, 평일 08:30~09:20 · 15:50~16:00)이라 막았다 — {what}. CLAUDE.md 규칙 4: 이 시간엔 "
-            f"배치 재실행·MCP 재시작·운용 코드 수정을 하지 않는다. 읽기(Read·Grep·로그)는 된다. 매매 단계는 시작할 때 "
-            f".env 를 이미 읽었으니 지금 바꿔도 오늘 매매엔 안 듣는다 — 급하면 HTS·MTS 로 직접. 09:20(오후 16:00) 뒤에 다시.")
+    (m0, m1), (a0, a1) = windows_for(now.strftime("%Y-%m-%d"))
+    return (f"⛔ 주문 시간({now:%H:%M}, 오늘 평일 {m0:%H:%M}~{m1:%H:%M} · {a0:%H:%M}~{a1:%H:%M})이라 막았다 — {what}. "
+            f"CLAUDE.md 규칙 4: 이 시간엔 배치 재실행·MCP 재시작·운용 코드 수정을 하지 않는다. 읽기(Read·Grep·로그)는 된다. "
+            f"매매 단계는 시작할 때 .env 를 이미 읽었으니 지금 바꿔도 오늘 매매엔 안 듣는다 — 급하면 HTS·MTS 로 직접. "
+            f"{m1:%H:%M}(오후 {a1:%H:%M}) 뒤에 다시.")
 
 
 def main(argv: list[str]) -> int:

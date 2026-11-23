@@ -66,6 +66,30 @@ def test_outside_window_everything_passes(now):
     assert G.decide("Edit", {"file_path": P + "scripts\\i3_live.py"}, now) is None
 
 
+@pytest.mark.parametrize("now, blocked", [
+    (datetime(2027, 1, 4, 9, 55), True),      # 새해 첫 거래일 10:00 개장 — 매도 09:50·매수 10:05:30 시간대
+    (datetime(2027, 1, 4, 10, 19), True),
+    (datetime(2027, 1, 4, 10, 21), False),
+    (datetime(2027, 1, 4, 8, 40), True),      # 평소 창도 그대로 막는다(예약 실행이 08:50 에 떠서 기다린다)
+    (datetime(2026, 11, 19, 16, 40), True),   # 수능 16:30 마감 — 판단 16:35 까지 기다리는 배치
+    (datetime(2026, 11, 19, 16, 46), False),
+    (datetime(2026, 11, 23, 9, 55), False),   # 평소 날은 옛 창 그대로
+])
+def test_shifted_session_days_follow_calendar(now, blocked):
+    assert bool(G.decide("PowerShell", {"command": "python run_mcp_local.py stop"}, now)) is blocked
+
+
+def test_calendar_failure_falls_back_to_normal_windows(monkeypatch):
+    """일정을 못 읽어도 훅은 멈추지 않는다 — 평소 창으로(10:00 개장일 09:55 는 놓치지만 08:55 는 막는다)."""
+    import market_session as MS
+
+    def boom(day, path=None):
+        raise ValueError("깨짐")
+    monkeypatch.setattr(MS, "session_for", boom)
+    assert G.windows_for("2027-01-04") == G.WINDOWS
+    assert G.decide("PowerShell", {"command": "python run_mcp_local.py stop"}, datetime(2027, 1, 4, 8, 55))
+
+
 def _hook(payload, now: str | None, raw: bytes | None = None):
     args = [sys.executable, str(_ROOT / "scripts" / "claude_guard.py")] + (["--now", now] if now else [])
     data = raw if raw is not None else json.dumps(payload, ensure_ascii=False).encode("utf-8")

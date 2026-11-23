@@ -20,6 +20,12 @@ Windows 작업 스케줄러가 단발로 부른다(상주 데몬 아님 — hang
   (LP 호가 의무 시간) **현재가 +1% 지정가**(5원 올림, 즉시 체결)로, 수량은 **실제 주문가능금액** 안으로 줄인다. 현재가·주문가능금액을
   못 읽으면 사지 않고 알린다(추측 주문 금지). 매도는 시장가(증거금 무관, 08:50 동시호가).
 - 하루 한 번: 같은 날 판단·매매는 다시 돌려도 중복되지 않는다(상태 파일 기록).
+- **장 시간이 바뀌는 날**(수능 · 새해 첫 거래일 — 백로그 ⑲, 11-23): 시각은 `market_session` 이 일정 파일
+  (`scripts/market_calendar.json` 의 open·close)에서 그날 개장·마감에 맞춰 다시 잰다 — 10:00 개장이면 08:50 예약 실행이
+  09:50 까지 기다렸다 팔고 10:05:30 에 산다, 16:30 마감이면 15:50 판단 배치가 16:35 까지 기다린다. 평소 날은 옛 상수 그대로.
+  일정 파일을 못 읽으면 평소 시간으로 보고 critical. 기다림이 2시간을 넘으면 오타로 보고 기다리지 않는다(critical).
+- **대기 판단의 유효 기간은 평일 4일**(11-23, 전엔 달력 4일 — 12-30 판단이 01-04 에 버려졌다). 버릴 때는 state.w 를
+  계좌가 실제로 든 목표(prev_w)로 되돌린다 — 새 목표로 남기면 다음 판단이 '유지'로 굳어 엔진과 계좌가 어긋났다.
 
 운용 자금: 계좌 추정예탁자산 − I3 외 보유분(현재 SK이노베이션 — 추세추종 데몬이 청산 관리) = I3 자산.
 """
@@ -32,7 +38,7 @@ import logging
 import math
 import os
 import sys
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -46,14 +52,20 @@ import heartbeat as HB  # noqa: E402
 import i3_core as K  # noqa: E402
 import i3_fills as FL  # noqa: E402
 import i3_flows as F  # noqa: E402
+import market_session as MS  # noqa: E402
 
 DATA_DIR = _ROOT / "data" / "i3"
 STATE_FILE = DATA_DIR / "state.json"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 LOG_DIR = _ROOT / "logs" / "i3"
+# 아래 시각은 **평소 날**(09:00~15:30) 값 — 장 시간이 바뀐 날은 `market_session.Session` 이 개장·마감에서 다시 잰다
+# (백로그 ⑲, 11-23 — 평소 날엔 같은 값임을 시험이 잠근다).
 DECIDE_AFTER = dtime(15, 35)
 TRADE_WINDOW = (dtime(8, 30), dtime(9, 20))
-MAX_PLAN_AGE_DAYS = 4
+# 대기 판단의 유효 기간 — **평일 수**(11-23, 전엔 달력 4일). 연말연시(12-30 판단 → 01-04 매매, 달력 5일)·설(목 → 화)에
+# 판단이 버려지고, 버려도 state.w 는 새 목표로 남아 다음 판단이 '유지'로 굳는 결함이 있었다(이탈 판단이면 낙폭 방어 상실).
+MAX_PLAN_AGE_WEEKDAYS = 4
+MAX_SHIFT_WAIT = timedelta(hours=2)   # 장 시간이 바뀐 날 예약 실행이 기다리는 한도 — 넘으면 일정 오타로 보고 기다리지 않는다
 CONSISTENCY_TOL = 0.005
 BUY_LIMIT_PCT = 0.01      # 매수 지정가 = 현재가 × 1.01 — 즉시 체결되면서 상한가 증거금을 피한다
 # 매수 시각 — ETF 유동성공급자(LP)의 호가 의무가 없는 09:00~09:05 를 피한다(호가 공백 시 +1% 상한까지 밀릴 수
@@ -165,10 +177,13 @@ def missing_bar_reason(today: str, long_base: dict, long_kospi: dict, rb: dict, 
 
 async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: datetime,
                        state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
-                       dry_run: bool = True) -> dict:
+                       dry_run: bool = True, session: MS.Session | None = None,
+                       upcoming: tuple[MS.Session, ...] | list = ()) -> dict:
+    """session = 오늘 장 시간(None 이면 평소 09:00~15:30) · upcoming = 곧 올 장 시간 변경일(알림에 미리 적는다)."""
     today = now.strftime("%Y-%m-%d")
-    if now.time() < DECIDE_AFTER:
-        return {"skip": f"{DECIDE_AFTER:%H:%M} 이전 — 오늘 일봉이 미완성"}
+    ses = session or MS.Session(today)
+    if now.time() < ses.decide_after:
+        return {"skip": f"{ses.decide_after:%H:%M} 이전 — 오늘 일봉이 미완성"}
     long_base, long_kospi = await market.base_bars(), await market.kospi_bars()
     rb, rk = await market.recent(K.BASE), await market.recent("KOSPI")
     if today not in rb or today not in rk:
@@ -236,13 +251,19 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     st["acct"] = {"date": today, "snap": F.snapshot(hold, nav, (K.BASE, K.CASH)), "index": idx, "units": units}
     st["last_decision"] = rec
     if need:
+        # prev_w = 계좌가 실제로 들고 있는 목표(마지막으로 **매매된** 판단의 w). 아직 매매 안 된 대기 판단을 덮어쓰면 그 대기
+        # 판단의 prev_w 를 잇는다. 판단이 버려지면(phase_trade) state.w 를 이것으로 되돌려 다음 판단이 다시 정하게 한다.
+        old = st.get("pending")
+        prev_w = (old.get("prev_w") if old else st.get("w"))
         st["w"] = w
-        st["pending"] = {"decided_on": today, "w": w, "reason": reason}
+        st["pending"] = {"decided_on": today, "w": w, "reason": reason, "prev_w": prev_w}
     save_state(st, state_path)
     log_event("decide", rec, events_path)
     tag = "🧪 모의" if dry_run else "💰 실전"
+    soon = " · ".join(f"{s.day[5:]} {s.label()}" + ("" if s.confirmed else "(거래소 공지 확인 필요)") for s in upcoming)
     await notify(f"[I3 {tag}] {today} 판단 — 엔진 {'보유' if eng.holding else '이탈'} · 낙폭예산 {e:.0%} → "
-                 f"KODEX200 목표 {w:.0%} · {'내일 매매' if need else '매매 없음'} ({reason}) · I3 자산 {nav:,.0f}원")
+                 f"KODEX200 목표 {w:.0%} · {'내일 매매' if need else '매매 없음'} ({reason}) · I3 자산 {nav:,.0f}원"
+                 + (f" · 🕙 장 시간 변경 예정: {soon} — 매매 단계가 개장 시각에 맞춰 기다린다" if soon else ""))
     if how == "auto-withdrawal":
         await notify(f"⚠️ [I3] 출금으로 보고 자동 보정 — 설명 안 되는 감소 {-resid:,.0f}원(매매 없는 날). "
                      f"낙폭 예산(성과 지수)은 영향 없음. 출금한 적이 없다면 HTS 로 확인 필요", critical=True)
@@ -286,7 +307,8 @@ def order_status(resp: Any) -> str:
     return "ok" if rc in (0, "0", None) else "rejected"
 
 
-async def _alert_missed_window(notify: Notifier, state_path: Path, now: datetime, today: str) -> None:
+async def _alert_missed_window(notify: Notifier, state_path: Path, now: datetime, today: str,
+                               window: tuple[dtime, dtime] = TRADE_WINDOW) -> None:
     """매매 시간대 **뒤**에 돈 매매 단계 — 대기 판단이 남아 있으면 놓친 것이다(11-19 평가).
 
     PC 가 09:20 뒤에 켜지면 `I3Trade`(StartWhenAvailable)가 늦게 돌아 여기로 온다. 전엔 조용히 건너뛰어, 이탈(매도)
@@ -302,26 +324,29 @@ async def _alert_missed_window(notify: Notifier, state_path: Path, now: datetime
     if not plan or st.get("traded_on") == today or str(plan.get("decided_on", "")) >= today:
         return
     await notify(f"🚨 [I3] {today} 매매 놓침 — 대기 판단({plan['decided_on']} · KODEX200 목표 {float(plan['w']):.0%})이 "
-                 f"있는데 매매 단계가 {now:%H:%M} 에 돌았다(시간대 {TRADE_WINDOW[0]:%H:%M}~{TRADE_WINDOW[1]:%H:%M} 밖). "
-                 f"주문 안 함 · 다음 매매일 08:50 에 다시 시도(판단 {MAX_PLAN_AGE_DAYS}일 넘으면 폐기). "
+                 f"있는데 매매 단계가 {now:%H:%M} 에 돌았다(시간대 {window[0]:%H:%M}~{window[1]:%H:%M} 밖). "
+                 f"주문 안 함 · 다음 매매일 08:50 에 다시 시도(판단 평일 {MAX_PLAN_AGE_WEEKDAYS}일 넘으면 폐기). "
                  f"급하면 직접 매매해도 다음 실행이 잔고 기준으로 맞춘다", critical=True)
 
 
 async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: dict[str, float],
                       state_path: Path = STATE_FILE, events_path: Path = EVENTS_FILE,
                       dry_run: bool = True, halt: bool = False, wait_after_open=None,
-                      before_check=None, fills_path: Path | None = None) -> dict:
+                      before_check=None, fills_path: Path | None = None,
+                      session: MS.Session | None = None) -> dict:
+    """session = 오늘 장 시간(None 이면 평소) — 매매 시간대가 개장 시각을 따른다(10:00 개장이면 09:30~10:20)."""
     today = now.strftime("%Y-%m-%d")
-    in_window = TRADE_WINDOW[0] <= now.time() <= TRADE_WINDOW[1]
+    window = (session or MS.Session(today)).trade_window
+    in_window = window[0] <= now.time() <= window[1]
     # 아침 알림(운용자 10-26 "1번 2번 다"): 할 일이 없거나 정지 중이어도 예약 시간대엔 한 줄 — 수동 실행엔 울리지 않는다
     if halt:
         if in_window:
             await notify(f"⏸️ [I3] {today} 매매 정지 중(I3_HALT=true) — 주문 안 함. 다시 켜려면 .env 에서 false")
         return {"skip": "I3_HALT=true"}
     if not in_window:
-        if now.time() > TRADE_WINDOW[1]:
-            await _alert_missed_window(notify, state_path, now, today)
-        return {"skip": f"매매 시간대({TRADE_WINDOW[0]:%H:%M}~{TRADE_WINDOW[1]:%H:%M}) 밖"}
+        if now.time() > window[1]:
+            await _alert_missed_window(notify, state_path, now, today, window)
+        return {"skip": f"매매 시간대({window[0]:%H:%M}~{window[1]:%H:%M}) 밖"}
     st = load_state(state_path)
     plan = st.get("pending")
     if not plan:
@@ -329,9 +354,15 @@ async def phase_trade(broker: Broker, notify: Notifier, now: datetime, prices: d
         return {"skip": "대기 중인 판단 없음"}
     if st.get("traded_on") == today:
         return {"skip": "오늘 이미 매매함"}
-    age = (now.date() - datetime.strptime(plan["decided_on"], "%Y-%m-%d").date()).days
-    if age > MAX_PLAN_AGE_DAYS or plan["decided_on"] >= today:
-        await notify(f"⚠️ [I3] 판단({plan['decided_on']})이 오래됐거나 오늘 것 — 매매 안 함", critical=True)
+    age = MS.weekdays_between(plan["decided_on"], today) if plan["decided_on"] < today else 0
+    if age > MAX_PLAN_AGE_WEEKDAYS or plan["decided_on"] >= today:
+        # 버리면 state.w 도 '계좌가 실제로 든 목표'로 되돌린다 — 새 목표로 남기면 다음 판단이 '유지'로 굳는다(11-23 발견).
+        # prev_w 가 없는 옛 대기 판단이면 None → 다음 판단이 '첫 판단'으로 다시 정한다(잔고 기준 주문이라 이미 맞으면 주문 없음).
+        restored = plan.get("prev_w")
+        st["w"] = restored
+        await notify(f"⚠️ [I3] 판단({plan['decided_on']})이 오래됐거나(평일 {age}일 > {MAX_PLAN_AGE_WEEKDAYS}) 오늘 것 — "
+                     f"매매 안 함 · 직전 비중을 {'모름(다음 판단이 다시 정함)' if restored is None else f'{restored:.0%}'}"
+                     f"으로 되돌림 — 오늘 15:50 판단이 다시 정한다", critical=True)
         st.pop("pending", None)
         save_state(st, state_path)
         return {"skip": "오래된 판단"}
@@ -595,12 +626,49 @@ async def _main(phase: str) -> int:
             await asyncio.to_thread(beat.join, HB.TIMEOUT * HB.TRIES)
 
 
+def session_today(day: str, path: Path | None = None) -> tuple[MS.Session, list[MS.Session], str | None]:
+    """(오늘 장 시간, 곧 올 변경일, 오류). 일정 파일이 깨졌으면 평소 장 시간 + 오류 — 부르는 쪽이 critical 로 알린다."""
+    try:
+        p = path or MS.CALENDAR_FILE
+        return MS.session_for(day, p), MS.upcoming(day, path=p), None
+    except Exception as e:
+        return MS.Session(day), [], f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def shift_wait(now: datetime, ses: MS.Session, phase: str) -> tuple[float, str | None]:
+    """장 시간이 바뀐 날, 평소 시각에 돈 예약 실행이 기다릴 초와 알릴 문장. 평소 날·수동 실행(평소 시각 전)은 0.
+    기다림이 MAX_SHIFT_WAIT 를 넘으면 0 + critical 문장(일정 오타로 보고 기다리지 않는다 — 단계가 '시간대 밖'으로 멈춘다)."""
+    if not ses.shifted:
+        return 0.0, None
+    normal, target = ((DECIDE_AFTER, ses.decide_after) if phase == "decide" else (TRADE_WINDOW[0], ses.sell_at))
+    if now.time() < normal or now.time() >= target:
+        return 0.0, None
+    secs = MS.wait_seconds(now, target, MAX_SHIFT_WAIT)
+    if secs is None:
+        return 0.0, (f"⛔ [I3] 오늘 장 {ses.label()} — {phase} 단계가 {target:%H:%M} 까지 {MAX_SHIFT_WAIT} 넘게 기다려야 한다. "
+                     f"일정 파일(scripts/market_calendar.json) 오타로 보고 기다리지 않는다 — 확인 필요")
+    what = "판단" if phase == "decide" else "매매(매도 동시호가)"
+    return secs, (f"🕙 [I3] 오늘 장 {ses.label()}{'' if ses.confirmed else '(거래소 공지 확인 필요)'} — "
+                  f"{what}을 {target:%H:%M} 까지 기다린다")
+
+
 async def _run_phase(phase: str) -> int:
     dry = _env_bool("I3_DRY_RUN", True)
     halt = _env_bool("I3_HALT", False)
     now = datetime.now()
+    ses, soon, cal_err = session_today(now.strftime("%Y-%m-%d"))
+    if cal_err:
+        await _notify(f"⚠️ [I3] 일정 파일을 못 읽어 평소 장 시간(09:00~15:30)으로 본다 — {cal_err}", critical=True)
+    secs, msg = shift_wait(now, ses, phase)
+    if msg:
+        await _notify(msg, critical=msg.startswith("⛔"))
+    if secs > 0:
+        log.info("[%s] 오늘 장 %s — %.0f초 기다린다", phase, ses.label(), secs)
+        await asyncio.sleep(secs)
+        now = datetime.now()
     if phase == "decide":
-        res = await phase_decide(KiwoomMarket(), KiwoomBroker(), _notify, now, dry_run=dry)
+        res = await phase_decide(KiwoomMarket(), KiwoomBroker(), _notify, now, dry_run=dry, session=ses,
+                                 upcoming=soon)
     else:
         st = load_state()
         close = (st.get("last_decision") or {}).get("close") or {}
@@ -612,18 +680,19 @@ async def _run_phase(phase: str) -> int:
                 await asyncio.sleep(secs)
 
         async def wait_buy():
-            await wait_until(BUY_AFTER)        # 매도 대금 확보 + LP 호가 의무 시간에 현재가로 지정가
+            await wait_until(ses.buy_after)     # 매도 대금 확보 + LP 호가 의무 시간에 현재가로 지정가(평소 09:05:30)
 
         async def settle():
-            await wait_until(dtime(9, 0, 30))  # 동시호가 매도는 09:00 에 체결 — 그 전엔 대조하지 않는다
+            await wait_until(ses.settle_at)     # 동시호가 매도는 개장에 체결 — 그 전엔 대조하지 않는다(평소 09:00:30)
             await asyncio.sleep(15)
 
         broker = KiwoomBroker()
+        win = ses.trade_window
         if not halt and st.get("pending") and st.get("traded_on") != now.strftime("%Y-%m-%d") \
-                and TRADE_WINDOW[0] <= now.time() <= TRADE_WINDOW[1]:
-            await wait_broker_ready(broker, datetime.combine(now.date(), BROKER_WAIT_UNTIL))
+                and win[0] <= now.time() <= win[1]:
+            await wait_broker_ready(broker, datetime.combine(now.date(), ses.broker_wait_until))
         res = await phase_trade(broker, _notify, now, prices, dry_run=dry, halt=halt,
-                                wait_after_open=wait_buy, before_check=settle)
+                                wait_after_open=wait_buy, before_check=settle, session=ses)
     log.info("[%s] %s", phase, json.dumps(res, ensure_ascii=False, default=str)[:500])
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
     return 0

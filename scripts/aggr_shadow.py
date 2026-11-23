@@ -35,6 +35,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
 
 import atomic_io as AIO  # noqa: E402
 import lab_fear as F  # noqa: E402
+import lab_flow_fwd as FW  # noqa: E402  — 외국인 극단 순매도 뒤 인버스 20일(아이디어 10번, 11-23 선언, 11-24 신호부터 앞으로만)
 import lab_orb as B  # noqa: E402
 import league_stats as S  # noqa: E402  — ㉔ S2: 판정은 각 lab 선언 그대로, '실계좌 재검토 자격'에만 통계 조건(2027-01~)
 import strategy_lab as L  # noqa: E402
@@ -47,13 +48,13 @@ EQUITY = F.F_EQUITY
 STOP_PCT = F.F_MAX_MDD_PCT
 KOSPI, VIX = "^KS11", "^VIX"
 NDQ = "133690"
-DAILY = (F.BASE, F.LONGS["2"], F.CASH, NDQ)
+DAILY = (F.BASE, F.LONGS["2"], F.CASH, NDQ, FW.INV)
 HH_START = "2026-10-29"
 EXCEPTIONS = {   # 입장 조건 밖으로 들어온 멤버 — 운용자 결정만(I3 리그 INTAKE_EXCEPTIONS 와 같은 방식)
     "HH1": "운용자 예외(10-29): '넣어줘' — 3세대 P2(연 16.5% < 21.75%)·P3·P5 미달. 연수익÷MDD 0.85~1.13 · "
            "P4(롤링 3년 > 0) 첫 통과라 앞으로의 기록으로 본다. 1998~ 장기 MDD 26.4%·3년 최악 −24.6% 를 알고 넣음",
 }
-MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS + ("HH1",)
+MEMBERS = tuple(f"ORB-{v}" for v in B.VARIANTS) + F.MEMBERS + ("HH1", FW.NAME)
 # Notion 표시 이름(「풀네임(줄임말)」) — 멤버를 늘리면 여기 함께(테스트가 빠짐을 잡는다) + Notion 공격형 리그 멤버DB 1행.
 # 11-12 리팩터링: 전엔 i3_notion_sync.AGGR_DISPLAY 에 따로 있었다(지금은 그 이름이 이것을 가리킨다).
 DISPLAY = {
@@ -67,6 +68,7 @@ DISPLAY = {
     "FEAR-P1": "공포 정점 뒤 매수 KODEX200(FEAR-P1)",
     "FEAR-P2": "공포 정점 뒤 매수 레버리지(FEAR-P2)",
     "HH1": "한미 반반 × 한국 2배(HH1)",
+    FW.NAME: "외국인 극단 순매도 뒤 인버스 20일(FLOW-S1)",
 }
 
 
@@ -184,6 +186,13 @@ def run_members(px: dict, upto: str, equity: float = EQUITY, replay=B.replay) ->
                                 "verdict": orb_verdict(r["curve"])}, r["curve"], cash, upto)
     except Exception as e:          # noqa: BLE001
         out["HH1"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        r = FW.run(px, upto, equity=equity)
+        out[FW.NAME] = with_stat({**_record(r["curve"], equity), "trades": len(r["trades"]), "signals": r["signals"],
+                                  "today": "인버스 보유(외국인 극단 매도 뒤 20일)" if r["on_today"] else None,
+                                  "verdict": FW.verdict(r["curve"], r["trades"])}, r["curve"], cash, upto)
+    except Exception as e:          # noqa: BLE001
+        out[FW.NAME] = {"error": f"{type(e).__name__}: {e}"}
     return out
 
 

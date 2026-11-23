@@ -36,6 +36,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
 import atomic_io as AIO  # noqa: E402
 import lab_fear as F  # noqa: E402
 import lab_orb as B  # noqa: E402
+import league_stats as S  # noqa: E402  — ㉔ S2: 판정은 각 lab 선언 그대로, '실계좌 재검토 자격'에만 통계 조건(2027-01~)
 import strategy_lab as L  # noqa: E402
 
 DATA_DIR = _ROOT / "data" / "aggr"
@@ -124,8 +125,33 @@ def _record(curve: list[tuple[str, float]], equity: float) -> dict:
             "asof": curve[-1][0]}
 
 
+def excess_rets(curve: list[tuple[str, float]], cash: dict[str, dict]) -> list[float]:
+    """멤버 곡선의 이웃한 두 점 사이 수익 − 같은 두 날 사이 현금 자리(488770) 종가 수익. 현금 종가가 없는 구간은 뺀다
+    (분봉 없는 날을 건너뛴 ORB 곡선도 같은 두 날로 맞춘다)."""
+    out = []
+    for (d0, v0), (d1, v1) in zip(curve, curve[1:]):
+        c0, c1 = cash.get(d0, {}).get("close"), cash.get(d1, {}).get("close")
+        if v0 > 0 and c0 and c1:
+            out.append((v1 / v0 - 1) - (c1 / c0 - 1))
+    return out
+
+
+def with_stat(rec: dict, curve: list[tuple[str, float]], cash: dict[str, dict], upto: str) -> dict:
+    """㉔ S2 — 초과 수익의 확률적 샤프 z(공격형 멤버 수로 본페로니)를 붙이고, 판정이 났으면 '실계좌 재검토 자격'을 적는다.
+    판정(verdict) 자체는 각 lab 선언 그대로 둔다."""
+    st = S.edge_stat(excess_rets(curve, cash), len(MEMBERS))
+    rec["stat"] = st
+    v = rec.get("verdict") or {}
+    if v.get("judged"):
+        v["real_money_ok"] = bool(v.get("pass")) and (st["pass"] or not S.in_force(upto))
+        if v.get("pass") and not v["real_money_ok"]:
+            v["hold_reason"] = f"판정 통과 · 통계 미달 — 실계좌 재검토 전 기록 연장({st['why']})"
+    return rec
+
+
 def run_members(px: dict, upto: str, equity: float = EQUITY, replay=B.replay) -> dict:
     dates = L.calendar(px[F.BASE], F.ANCHOR, upto)
+    cash = px.get(F.CASH, {})
     out: dict[str, dict] = {}
     for v in B.VARIANTS:
         name = f"ORB-{v}"
@@ -137,24 +163,25 @@ def run_members(px: dict, upto: str, equity: float = EQUITY, replay=B.replay) ->
                 x = last[1]
                 today = (f"{'인버스' if x['side'] == 'inv' else '롱'} {x['how']} {x['ret'] * 100:+.2f}%"
                          if "size" in x else x.get("why", "쉼"))
-            out[name] = {**_record(r["curve"], equity), "days": r["days"], "missing": r["missing"],
-                         "today": today, "verdict": orb_verdict(r["curve"])}
+            out[name] = with_stat({**_record(r["curve"], equity), "days": r["days"], "missing": r["missing"],
+                                   "today": today, "verdict": orb_verdict(r["curve"])}, r["curve"], cash, upto)
         except Exception as e:      # noqa: BLE001 — 한 멤버 실패가 리그 전체를 멈추지 않게
             out[name] = {"error": f"{type(e).__name__}: {e}"}
     for name in F.MEMBERS:
         sig, lv = name[-2], name[-1]
         try:
             r = F.run(px, sig, lv, upto, F.ANCHORS[sig], equity)
-            out[name] = {**_record(r["curve"], equity), "entries": r["entries"], "held": len(r["held"]),
-                         "on_today": r["on_today"],
-                         "verdict": F.verdict(r["curve"], r["held"], px[F.BASE], r["dates"])}
+            out[name] = with_stat({**_record(r["curve"], equity), "entries": r["entries"], "held": len(r["held"]),
+                                   "on_today": r["on_today"],
+                                   "verdict": F.verdict(r["curve"], r["held"], px[F.BASE], r["dates"])},
+                                  r["curve"], cash, upto)
         except Exception as e:      # noqa: BLE001
             out[name] = {"error": f"{type(e).__name__}: {e}"}
     try:
         r = hh1_run(px, upto, equity)
         today = (None if r["w_kr"] is None else f"한국2배 {r['w_kr']:.0%}·나스닥 {r['w_us']:.0%}")
-        out["HH1"] = {**_record(r["curve"], equity), "today": today, "exception": EXCEPTIONS["HH1"],
-                      "verdict": orb_verdict(r["curve"])}
+        out["HH1"] = with_stat({**_record(r["curve"], equity), "today": today, "exception": EXCEPTIONS["HH1"],
+                                "verdict": orb_verdict(r["curve"])}, r["curve"], cash, upto)
     except Exception as e:          # noqa: BLE001
         out["HH1"] = {"error": f"{type(e).__name__}: {e}"}
     return out

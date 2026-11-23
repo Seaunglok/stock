@@ -37,6 +37,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
 import atomic_io as AIO  # noqa: E402
 import i3_core as K  # noqa: E402
 import lab_reentry as R  # noqa: E402
+import league_stats as S  # noqa: E402  — ㉔ 통계 조건(2027-01 점검부터 시행, 그 전엔 보고만)
 import strategy_lab as L  # noqa: E402
 
 DATA_DIR = _ROOT / "data" / "i3"
@@ -496,8 +497,10 @@ def run_models(base: dict, kospi: dict, cash: dict, start: str, equity: float, u
     return {n: std_run(_b_i3(mode))(data, start, equity, upto) for n, mode in models.items()}
 
 
-def promotion(champ: dict, chal: dict, since: str) -> dict:
-    """등록일(since) 이후만 잘라 선언된 승격 규칙으로 판정."""
+def promotion(champ: dict, chal: dict, since: str, n_tests: int | None = None) -> dict:
+    """등록일(since) 이후만 잘라 선언된 승격 규칙으로 판정. ok = 10-22 선언 다섯 조건.
+    n_tests 가 있으면 ㉔ 통계 조건 S1(`league_stats` — 도전자 − 챔피언 일간 차이 수익의 확률적 샤프 z)을 'stat' 으로 붙인다.
+    S1 을 판정에 쓰는 것은 govern(2027-01 점검부터) — 여기서는 계산만."""
     cc = [(d, v) for d, v in champ["curve"] if d >= since]
     xc = [(d, v) for d, v in chal["curve"] if d >= since]
     if len(cc) < 2 or len(xc) < 2:
@@ -516,8 +519,18 @@ def promotion(champ: dict, chal: dict, since: str) -> dict:
         f"MDD ≤ {PROMO_MAX_MDD:g}%": xm["mdd"] <= PROMO_MAX_MDD,
         f"MDD ≤ 챔피언 +{PROMO_MDD_TOL_PP:g}%p": xm["mdd"] <= cm["mdd"] + PROMO_MDD_TOL_PP,
     }
-    return {"days": len(xc), "diverge_days": diverge, "ret": round(xm["total"], 3), "champ_ret": round(cm["total"], 3),
-            "mdd": round(xm["mdd"], 3), "champ_mdd": round(cm["mdd"], 3), "checks": checks, "ok": all(checks.values())}
+    out = {"days": len(xc), "diverge_days": diverge, "ret": round(xm["total"], 3), "champ_ret": round(cm["total"], 3),
+           "mdd": round(xm["mdd"], 3), "champ_mdd": round(cm["mdd"], 3), "checks": checks, "ok": all(checks.values())}
+    if n_tests:
+        out["stat"] = S.edge_stat(S.paired(S.daily_rets(chal["curve"], since), S.daily_rets(champ["curve"], since)),
+                                  n_tests)
+    return out
+
+
+def n_challengers(members, retired, res: dict) -> int:
+    """그 점검에서 함께 재는 도전자 수(통계 조건의 N) — 챔피언·탈락·기록 없는 멤버 제외, 최소 1."""
+    return max(1, sum(1 for m in members if m.name != CHAMPION and m.name not in retired
+                      and "curve" in res.get(m.name, {})))
 
 
 # ── 리그 운영: 탈락·승격 연속·중복·챔피언 점검 (순수 함수 — 테스트로 일부러 깨뜨린다) ─────────────
@@ -637,12 +650,19 @@ def govern(status: dict, res: dict, members, upto: str, live_navs: list[list]) -
         for drop, keep, c in dups:
             msgs.append((f"🔁 [I3 리그] 중복 의심 — {drop} ↔ {keep} 최근 {DUP_WINDOW}일 일간 수익 상관 {c:.3f} "
                          f"(자동 탈락 안 함: 같은 국면에선 다른 설계도 같게 움직인다 — 운용자 판단)", False))
-        cands = []
+        cands, held = [], []
         if "curve" in champ:
+            n_tests = n_challengers(active, st["retired"], res)
             for m in active:
                 if m.name == CHAMPION or m.name in st["retired"] or "curve" not in res.get(m.name, {}):
                     continue
-                ok = promotion(champ, res[m.name], max(m.registered, champ["curve"][0][0]))["ok"]
+                p = promotion(champ, res[m.name], max(m.registered, champ["curve"][0][0]), n_tests)
+                ok = p["ok"]
+                if ok and S.in_force(upto) and not p["stat"]["pass"]:     # ㉔ S1 — 기존 다섯은 충족, 통계 미달 → 보류
+                    ok = False
+                    held.append(m.name)
+                    msgs.append((f"⏸️ [I3 리그] {m.name} 승격 조건(기존 다섯)은 충족 — 통계 미달로 보류·기록 연장 "
+                                 f"({p['stat']['why']}, 함께 잰 도전자 {n_tests}명 기준)", False))
                 st["promo_streak"][m.name] = st["promo_streak"].get(m.name, 0) + 1 if ok else 0
                 if st["promo_streak"][m.name] >= PROMO_CONSECUTIVE:
                     cands.append(m.name)
@@ -651,7 +671,8 @@ def govern(status: dict, res: dict, members, upto: str, live_navs: list[list]) -
                          f"운용자 승인 전엔 챔피언을 바꾸지 않는다(실행 가능성·실전==검증 대조 먼저).", True))
         n_active = sum(1 for m in members if m.name not in st["retired"])
         st["reviews"][upto[:7]] = {"date": upto, "active": n_active, "retired_total": len(st["retired"]),
-                                   "candidates": cands, "duplicate_suspects": [[a, b, c] for a, b, c in dups]}
+                                   "candidates": cands, "stat_held": held,
+                                   "duplicate_suspects": [[a, b, c] for a, b, c in dups]}
         st["last_review"] = upto
         if n_active > CAPACITY:
             msgs.append((f"⚠️ [I3 리그] 활성 멤버 {n_active} > 정원 {CAPACITY} — 신규 등록 중지", False))
@@ -756,6 +777,7 @@ async def main_async(now: datetime) -> int:
     live_nav = float(navs[-1][1])
     promo = {}
     models = {}
+    n_tests = n_challengers(MEMBERS, retired, res)
     for mb in MEMBERS:
         if mb.name in retired:
             models[mb.name] = {"retired": status["retired"][mb.name], "family": mb.family}
@@ -771,7 +793,7 @@ async def main_async(now: datetime) -> int:
                            "w": None if r["w"] is None else round(r["w"], 4),
                            "registered": mb.registered, "admitted": mb.admitted, "note": mb.note}
         if mb.name != CHAMPION and "error" not in champ:
-            promo[mb.name] = promotion(champ, r, max(start, mb.registered))
+            promo[mb.name] = promotion(champ, r, max(start, mb.registered), n_tests)   # stat = ㉔ S1(2027-01 전엔 보고만)
     rec = {"asof": upto, "start": start, "equity": round(equity),
            "live": {"nav": round(live_nav), "ret": round((live_nav / equity - 1) * 100, 3), "date": navs[-1][0]},
            "models": models, "promotion": promo,

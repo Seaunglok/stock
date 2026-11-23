@@ -440,6 +440,44 @@ MEMBERS = MEMBERS + (
            "상한 20%(MDD 한도). 재진입·낙폭 예산·현금은 I3 그대로",
            (K.BASE, K.CASH, KOSPI), std_run(_b_x10a)),
 )
+
+
+def _run_m11a(data: dict, start: str, equity: float, upto: str) -> dict:
+    """「M11a」 — lab_gen11 선언 그대로: KODEX200(KOSPI 확인)·미국 S&P500(H)·금(H)을 1/3씩, 몫마다 I3 엔진(`G11.sleeve_target`),
+    매년 첫 거래일 1/3 로 재조정(`G11.combine_n`). 현금 자리는 리그 공통(머니마켓)."""
+    import lab_gen11 as G11
+    sleeves = []
+    n = len(G11.SLEEVES)
+    part = float(int(round(equity)) // n)
+    shares = [round(equity) - part * (n - 1)] + [part] * (n - 1)   # 정수 금액으로 나눠 합이 출발 자산과 같게(남는 원은 첫 몫)
+    for (asset, reg), eq in zip(G11.SLEEVES.items(), shares):
+        def build(d, dates, asset=asset, reg=reg):
+            return (asset, K.CASH), G11.sleeve_target(d[asset], d[reg], asset, K.CASH), True
+        sleeves.append(std_run(build)(data, start, eq, upto))
+    comb = G11.combine_n([([d for d, _ in s["curve"]], [v for _, v in s["curve"]]) for s in sleeves])
+    curve = list(zip(comb.dates, comb.curve))
+    w_hist = {}
+    for d in comb.dates:                                       # 위험 비중 = 몫 자산으로 가중한 몫 비중
+        num = den = 0.0
+        for s in sleeves:
+            v, w = s["nav_hist"].get(d), s["w_hist"].get(d)
+            if v is not None and w is not None:
+                num, den = num + v * w, den + v
+        if den > 0:
+            w_hist[d] = num / den
+    ws = [s["w"] for s in sleeves if s["w"] is not None]
+    return {"curve": curve, "w_hist": w_hist, "trade_days": sorted({d for s in sleeves for d in s["trade_days"]}),
+            "nav_hist": dict(curve), "w": (sum(ws) / len(ws)) if ws else None}
+
+
+MEMBERS = MEMBERS + (
+    Member("M11a", "I3 계보", "2026-12-01",
+           "운용자 예외(11-23): '넣어줘' — 11세대(lab_gen11 선언 6476629 → 결과 ecd61fe) 입장 조건 G2 미달(연 8.48% vs I3 12.61%, "
+           "MDD 10.5% vs 19.8%) — 규칙 밖 결정으로 입장. 12월 신규 1(운용자 '1자리')",
+           "11세대: KODEX200·미국 S&P500(H, 219480)·금(H, 132030) 1/3씩, 몫마다 I3 엔진(미국·금은 자기 120일선), 매년 1/3 재조정 — "
+           "한 시장(반도체 두 종목) 집중을 나누기로. 장기(2001~) MDD 13.5%(I3 28.4%)",
+           (K.BASE, "219480", "132030", K.CASH, KOSPI), _run_m11a),
+)
 # Notion 표시 이름 — 운용자(10-22): "노션에서는 줄임말을 풀네임(줄임말)로". 영문이 들어간 멤버는 여기에 있어야 한다
 # (테스트가 빠짐을 잡는다). 멤버를 등록할 때 MEMBERS 와 같은 자리에서 함께 고친다(11-12 리팩터링 — 전엔 i3_notion_sync 에 있었다).
 DISPLAY = {
@@ -455,6 +493,7 @@ DISPLAY = {
     "T6c": "장기 추세 연동 예산 배수 8/4(T6c)",
     "V7a": "추세 연동 배수 + 변동성 브레이크(V7a)",
     "X10a": "변동성 비례 이탈폭(X10a)",
+    "M11a": "세 시장 나눠 담기 KODEX200·미국 S&P500·금(M11a)",
 }
 
 

@@ -198,6 +198,8 @@ def league_data():
     if not (cache / "223190_2026-10-21.json").exists():
         pytest.skip("223190 고정 캐시 없음(「가치저변동」)")
     data["223190"] = {d: b for d, b in L.load_bars("223190", "2015-06-26", "2026-10-21").items() if d <= "2026-08-24"}
+    # M11a(11-23) — 미국 S&P500(H). lab_gen11 측정 때 받은 고정 기준일 캐시(2014-01-01~2026-10-21)
+    data["219480"] = {d: b for d, b in L.load_bars("219480", "2014-01-01", "2026-10-21").items() if d <= "2026-08-24"}
     return data
 
 

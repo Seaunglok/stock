@@ -71,7 +71,7 @@ src/
 ## 실행/운영
 
 - MCP 서버 기동: `python run_mcp_local.py start` (헬스: `python check_status.py`)
-- 종가매매 데몬: `python scripts/direct_closing_bet.py --daemon` (전략·운영 상세는 [docs/closing_bet_strategy.md](../docs/closing_bet_strategy.md), 프로젝트 지침은 `.claude/CLAUDE.md`)
+- 종가매매 데몬: `python scripts/direct_closing_bet.py --daemon` (전략·운영 상세는 [docs/closing_bet_strategy.md](../docs/closing_bet_strategy.md), 프로젝트 지침은 루트 `CLAUDE.md`)
 - 회귀 테스트: `python -m pytest tests/ -q`
 
 > 종가매매 데몬은 MCP 서버만 떠 있으면 동작한다(A2A/Claude SDK 불필요). closing_bet_mcp 의

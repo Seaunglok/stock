@@ -35,7 +35,7 @@ pdf_pages/
 .serena/
 .claude/
 .mcp.json
-CLAUDE.md
+# CLAUDE.md(루트 프로젝트 지침)는 11-23 운용자 결정으로 git 에 올린다 — 백업 사본 CLAUDE-*.md 만 뺀다
 CLAUDE-*.md
 shrimp_data/
 GEMINI.md

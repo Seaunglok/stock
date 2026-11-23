@@ -59,6 +59,7 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-20", "10세대 X10a 변동성 비례 이탈폭(리그 앞으로만, 11-23 등록)(백로그 ㉕)", 1, "scripts/lab_gen10.py"),
     ("2026-11-23", "연말 대주주 양도세 매도 Y1(마감일 앞 약세)·Y2(뒤 되돌림)(lab_taxsell, 아이디어 장부 6번)", 2, "scripts/lab_taxsell.py"),
     ("2026-11-23", "외국인 극단 순매도 뒤 인버스 20일 FLOW-S1(공격형 리그 앞으로만, 아이디어 장부 10번)", 1, "scripts/lab_flow_fwd.py"),
+    ("2026-11-23", "MSCI 한국 정기변경 M1(편입 앞 매수)·M2(편출 뒤 되돌림)(lab_msci, 아이디어 장부 7번)", 2, "scripts/lab_msci.py"),
 ]
 
 

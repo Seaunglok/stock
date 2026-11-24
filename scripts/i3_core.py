@@ -23,7 +23,7 @@ for _p in (str(_ROOT), str(_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from lab_dd_control import reentry_confirmed  # noqa: E402
+from lab_dd_control import I1_REGIME_MA, reentry_confirmed  # noqa: E402
 from lab_holdout import I3_BAND, I3_DEFAULT, I3_FLOOR_DD  # noqa: E402
 
 BASE = "069500"            # KODEX200
@@ -64,6 +64,20 @@ def engine_state(base_bars: dict[str, dict], kospi_bars: dict[str, dict], upto: 
             changed = (i > 0) and (new != holding)
             holding = new
     return EngineState(holding=holding, changed_today=changed, last_date=days[-1])
+
+
+def history_short(base_bars: dict[str, dict], kospi_bars: dict[str, dict]) -> str | None:
+    """재생 시작일 앞 이력이 엔진에 모자라면 설명(판단 중단 사유), 충분하면 None.
+
+    재생 첫날부터 검증과 같으려면 KODEX200 은 그 앞 ENGINE_N 일(20일 고점), KOSPI 는 I1_REGIME_MA 일(120일 평균)이
+    있어야 한다. FDR 이 한국 ETF 를 최근 3,000거래일만 줘서 KODEX200 첫 날이 매일 밀린다(11-24 ⑮) — 일봉 보관소가
+    앞쪽을 채우는데, 그게 안 됐을 때 판단이 조용히 다른 재생을 하지 않게 하는 마지막 가드."""
+    nb = sum(1 for d in base_bars if d < REPLAY_START)
+    nk = sum(1 for d in kospi_bars if d < REPLAY_START)
+    if nb >= ENGINE_N and nk >= I1_REGIME_MA:
+        return None
+    return (f"재생 시작일 {REPLAY_START} 앞 이력 부족 — KODEX200 {nb}일(필요 {ENGINE_N}) · KOSPI {nk}일"
+            f"(필요 {I1_REGIME_MA}). FDR 3,000거래일 상한 — 일봉 보관소(data/bar_archive, `bar_archive.py --status`) 확인")
 
 
 def budget_exposure(navs: list[float], m: float = M, lookback: int = LOOKBACK,

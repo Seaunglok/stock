@@ -292,6 +292,51 @@ def test_decide_aborts_on_source_mismatch(paths):
     assert "abort" in r and any(c for c, _ in notes.msgs) and not paths[0].exists()
 
 
+def _trim_before_start(m, keep):
+    """재생 시작일 앞 일봉을 keep 일만 남긴다(FDR 3,000거래일 상한이 앞쪽을 잘라 먹은 날 흉내)."""
+    pre = sorted(d for d in m.base if d < K.REPLAY_START)
+    cut = pre[-keep] if keep else K.REPLAY_START
+    m.base = {d: v for d, v in m.base.items() if d >= cut}
+    return m
+
+
+def test_decide_aborts_when_history_before_replay_start_is_short(paths):
+    """★ 일부러 깨뜨린다 — 재생 시작일 앞 KODEX200 이력이 20일(20일 고점)보다 적으면 판단 중단 + critical(11-24 ⑮).
+    조용히 재생하면 검증과 다른 엔진 상태가 나올 수 있다. 20일이면 통과."""
+    days = _days()
+    now = datetime.fromisoformat(days[-1] + "T15:50:00")
+    notes = Notes()
+    r = run(LV.phase_decide(_trim_before_start(FakeMarket(days, days[-1]), K.ENGINE_N - 1), FakeBroker(),
+                            notes, now, *paths))
+    assert "abort" in r and "이력 부족" in r["abort"] and not paths[0].exists()
+    assert len(notes.msgs) == 1 and notes.msgs[0][0] is True and "19일" in notes.msgs[0][1]
+    ev = [json.loads(x) for x in paths[1].read_text(encoding="utf-8").splitlines()]
+    assert ev[-1]["event"] == "decide_abort"
+    r = run(LV.phase_decide(_trim_before_start(FakeMarket(days, days[-1]), K.ENGINE_N), FakeBroker(),
+                            Notes(), now, *paths))
+    assert "abort" not in r and paths[0].exists()
+
+
+def test_history_short_checks_kospi_regime_window_too():
+    """KOSPI 120일 평균(재진입 조건)도 재생 시작일 앞에 있어야 한다."""
+    days = _days()
+    base = _bars(days)
+    assert K.history_short(base, _bars(days)) is None
+    assert "KOSPI" in K.history_short(base, {d: v for d, v in _bars(days).items() if d >= "2015-04-01"})
+
+
+def test_decide_warns_but_decides_when_archive_not_stitched(paths):
+    """일봉 보관소를 못 붙인 날 — 앞쪽 여유가 남아 있으면 판단은 하고, 일반 알림으로 알린다."""
+    days = _days()
+    m = FakeMarket(days, days[-1])
+    m.archive_errors = lambda: {"069500": "겹치는 날 가격 비율이 흩어짐"}
+    notes = Notes()
+    now = datetime.fromisoformat(days[-1] + "T15:50:00")
+    r = run(LV.phase_decide(m, FakeBroker(), notes, now, *paths))
+    assert "abort" not in r and paths[0].exists()
+    assert any(not c and "일봉 보관소" in msg and "069500" in msg for c, msg in notes.msgs)
+
+
 def test_decide_aborts_when_holdings_unknown(paths):
     """★ 계좌 조회 실패를 '보유 0' 으로 믿지 않는다."""
     days = _days()

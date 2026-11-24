@@ -54,7 +54,8 @@
   `Result(status ok|ip|fail, detail)` — 원인을 버리지 않는다(`KiwoomMarket/KiwoomBroker.errors` → 판단 중단·매수 건너뜀 알림에 「키움: …」).
   **주문·계좌 평가만 MCP**(8030 trading · 8034 portfolio — 검증된 길). 새 조회는 `kiwoom_read` 에 넣고 MCP `_kiwoom_call` 은 새로 쓰지 않는다.
 - **판단 안전장치**(일부러 깨뜨려 확인함): 15:35 전엔 판단 안 함 · 키움 응답이 비었거나 FDR 에만 오늘 일봉 → **판단 중단 + critical**
-  (휴장 아님, `missing_bar_reason`) · 둘 다 없으면 휴장 일반 알림 · FDR↔키움 종가 0.5% 넘게 다르면 중단 · 계좌 조회 불명이면 중단 ·
+  (휴장 아님, `missing_bar_reason`) · 둘 다 없으면 휴장 일반 알림 · FDR↔키움 종가 0.5% 넘게 다르면 중단 ·
+  **재생 시작일(2015-07-28) 앞 KODEX200 20일·KOSPI 120일 미만이면 중단(11-24 ⑮ `i3_core.history_short`)** · 계좌 조회 불명이면 중단 ·
   현재가·주문가능금액을 못 읽으면 매수 안 함 · **응답 불명 주문은 재전송하지 않고 잔고·체결내역으로 확인** ·
   **`state.json` 없이 `state.bak` 만 있으면 판단·매매 중단**(11-18 — 빈 상태로 시작하지 않는다. 복구: .bak 확인 → state.json 으로 복사 → 재실행) ·
   **매매 단계가 09:20 뒤에 돌았는데 대기 판단이 남아 있으면 「매매 놓침」 critical**(11-19 `_alert_missed_window` — 동작 불변, 다음 매매일 08:50) ·
@@ -105,7 +106,9 @@
     9세대 재진입 × 외국인 수급 F9a·F9b **탈락**(11-10, 실패 재진입은 거르지만 2020 V자 반등에 두 달 늦음). 폐기된 방향: 손절 강화(R4)·장중 손절(S1)·
     **점프 모형 국면 J1·J2(㉗ 11-20, `lab_jump` — 반등장 눌림을 하락으로 읽어 MDD 28.7·22.7%, 이 축은 닫음)**.
 - 데이터 주의: `strategy_lab.load_bars` 캐시는 `.meta.json` 으로 시작일을 지킨다(10-29 결함 수정) · 장기 환율 `FRED:DEXKOUS` ·
-  **FDR 한국 ETF 는 최근 3,000거래일만** → 2027-10 무렵 I3 재생 시작일(2015-07-28) 위협(Flow Task 2027-06).
+  **FDR 한국 ETF 는 최근 3,000거래일만**(첫 날이 매일 밀림) → **11-24 일봉 보관소 `bar_archive.py`**(`data/bar_archive/`): 실전·리그
+  (`load_bars(..., archive=True)`)가 받은 이력을 쌓고 앞쪽을 붙인다 — 연구는 안 쓴다. **FDR·키움 수정주가는 분배금 때 과거 전체를
+  같은 비율로 다시 계산한다**(10월 × 0.99858) → 붙일 땐 겹치는 날 비율을 곱한다 · 받은 날이 다른 캐시끼리 가격 수준을 비교하지 않는다.
 
 ## 4. 공격형 트랙 — 그림자 기록 ([docs/2026-10-28-aggressive-track.md](docs/2026-10-28-aggressive-track.md))
 
@@ -178,6 +181,7 @@
 ## 9. 파일 지도 (운용 중인 것)
 
 - **실전**: `i3_core.py`(판단) · `i3_live.py`(판단·매매 실행) · `i3_flows.py` · `i3_fills.py` · `kiwoom_read.py`(키움 조회) · `atomic_io.py`(파일 쓰기) ·
+  `bar_archive.py`(일봉 보관소 — FDR 3,000거래일 상한, `--status`·`--seed`) ·
   `market_session.py`(장 시간 — 일정 파일 open·close, 훅도 읽는다) ·
   `heartbeat.py`(무소식 감시) · `claude_guard.py`(주문 시간 훅) ·
   `ops_base.py`(I3 쪽이 부르는 공용 이름 — URL·계좌·`notify` 를 다시 내보낸다) · `trend_kiwoom_io.py`(MCP 계좌 평가·주문 헬퍼 —
@@ -189,7 +193,8 @@
   `kiwoom_net_check.py` · (중단 11-18: `collect_foreign_flow.py` + `foreign_flow.cmd`).
 - **배치**: `i3_decide.cmd` · `i3_trade.cmd` · `i3_notion.cmd` · `market_journal_morning.cmd` · `market_flows_backfill.cmd` · `kiwoom_net_check.cmd` ·
   `trend_watchdog.cmd`.
-- **데이터**: `data/i3/`(state·events·fills·shadow) · `data/aggr/` · `data/market_journal/` · `data/market_flows/` · `data/minute/` · `data/kiwoom_net/` ·
+- **데이터**: `data/i3/`(state·events·fills·shadow) · `data/bar_archive/`(일봉 보관 — 지우지 않는다, `.bak` 있음) · `data/aggr/` ·
+  `data/market_journal/` · `data/market_flows/` · `data/minute/` · `data/kiwoom_net/` ·
   `docs_cache/lab/`(연구 캐시 — 커밋하지 않는다).
 - **MCP 서버**(`src/mcp_servers/kiwoom_mcp/domains/`, `run_mcp_local.py`): 8030 trading(주문) · 8034 portfolio(계좌 평가) · 8033 investor(11-18 외인 수집 중단 뒤 운용 코드는 안 씀 — 워치독 목록은 그대로) ·
   8031 market · 8032 info. **워치독은 `run_mcp_local.py start live` 로 이 키움 5개만 띄운다**(11-12 — `LIVE` = `ESSENTIAL_PORTS`, 테스트가 맞춰 본다).

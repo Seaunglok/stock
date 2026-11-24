@@ -761,9 +761,10 @@ async def _load_data(today: str) -> tuple[dict, dict]:
             hist, rec = await m.kospi_bars(), await m.recent("KOSPI")
         elif c.startswith("ohlc:"):
             code = c.split(":", 1)[1]
-            hist, rec = C.load_ohlc(code, "2010-01-01", today), await m.recent(code)   # 실전과 같은 조회(고가·저가 포함)
+            hist, rec = (C.load_ohlc(code, "2010-01-01", today, archive=True),
+                         await m.recent(code))   # 실전과 같은 조회(고가·저가 포함)
         else:
-            hist = L.load_bars(c, "2010-01-01", today)
+            hist = L.load_bars(c, "2010-01-01", today, archive=True)     # 앞쪽은 일봉 보관소(11-24 ⑮)
             try:
                 rec = await m.recent(c)
             except Exception:
@@ -805,6 +806,10 @@ async def main_async(now: datetime) -> int:
     if gaps:
         await notify("⛔ [I3 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
                          + " (인증·IP·서버 확인 — 11-09 8050 사고). 오늘 기록은 대조 없이 FDR 만으로 했다", critical=True)
+    import bar_archive as BA
+    if BA.ERRORS:
+        await notify("⚠️ [I3 리그] 일봉 보관소를 못 붙였다 — 이 종목은 FDR 이력(최근 3,000거래일)만으로 기록: "
+                     + " · ".join(f"{k} {v}" for k, v in BA.ERRORS.items()))
     base, kospi = data[K.BASE], data[KOSPI]
     # 장중엔 오늘 일봉이 미완성 — 15:35 전이면 어제까지만 본다
     upto = (today if now.time() >= AFTER_CLOSE and today in base and today in kospi

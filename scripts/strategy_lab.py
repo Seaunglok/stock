@@ -99,8 +99,12 @@ def _write_json(path: Path, obj) -> None:
     AIO.write_text(path, json.dumps(obj))
 
 
-def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31") -> dict[str, dict]:
+def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31",
+              archive: bool = False) -> dict[str, dict]:
     """{date: {open, close}} — FDR, 디스크 캐시(같은 code·end·더 늦은 시작 재호출 시 네트워크 없음).
+
+    archive=True(실전·리그만): FDR 이 더는 주지 않는 앞쪽 날을 일봉 보관소(`bar_archive`)에서 가격 기준을 맞춰 붙인다 —
+    한국 ETF 는 최근 3,000거래일만 와서 이력 첫 날이 매일 밀린다(11-24, 백로그 ⑮). 캐시 파일은 FDR 원본 그대로 둔다.
 
     ⚠️ KRX 지수 심볼(KS11)은 인증 요구로 실패한다 — `^KS11`(캐럿) 을 쓸 것(backtest_dynamic 과 같음).
 
@@ -132,6 +136,9 @@ def load_bars(code: str, start: str = "1990-01-01", end: str = "2026-12-31") -> 
         _write_json(path, rows)
         _write_json(meta, {"fetched_from": start})
         prune_live_cache(safe, end)
+    if archive:
+        import bar_archive as BA
+        rows = BA.merge(safe, rows)
     return {d: v for d, v in rows.items() if start <= d <= end}
 
 

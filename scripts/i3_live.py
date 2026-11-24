@@ -209,6 +209,16 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
             return {"abort": f"{name} {bad}"}
     base = {**long_base, **rb}
     kospi = {**long_kospi, **rk}
+    short = K.history_short(base, kospi)
+    if short:
+        log_event("decide_abort", {"reason": short}, events_path)
+        await notify(f"⛔ [I3] {today} 판단 중단 — {short}", critical=True)
+        return {"abort": short}
+    arch_errs = getattr(market, "archive_errors", None)
+    arch_errs = arch_errs() if callable(arch_errs) else {}
+    if arch_errs:
+        await notify("⚠️ [I3] 일봉 보관소를 못 붙였다 — FDR 이력만으로 판단(재생 시작일 앞 여유가 남은 동안은 결과 같음): "
+                     + " · ".join(f"{k} {v}" for k, v in arch_errs.items()))
     hold = await broker.holdings()
     if hold is None:
         await notify("⛔ [I3] 계좌 조회 실패 — 판단 중단(보유 0 으로 믿지 않는다)", critical=True)
@@ -496,12 +506,18 @@ class KiwoomMarket:
         self.errors: dict[str, str] = {}
 
     async def base_bars(self):
+        """FDR 이 최근 3,000거래일만 주는 앞쪽은 일봉 보관소가 채운다(11-24 ⑮ — 재생 시작일 앞 이력을 지킨다)."""
         import strategy_lab as L
-        return L.load_bars(K.BASE, "2014-01-01", (datetime.now()).strftime("%Y-%m-%d"))
+        return L.load_bars(K.BASE, "2014-01-01", (datetime.now()).strftime("%Y-%m-%d"), archive=True)
 
     async def kospi_bars(self):
         import strategy_lab as L
-        return L.load_bars("^KS11", "1996-01-01", (datetime.now()).strftime("%Y-%m-%d"))
+        return L.load_bars("^KS11", "1996-01-01", (datetime.now()).strftime("%Y-%m-%d"), archive=True)
+
+    def archive_errors(self) -> dict[str, str]:
+        """이번 실행에서 보관 이력을 붙이지 못한 종목 → 이유(판단 알림에 붙는다)."""
+        import bar_archive as BA
+        return {k: v for k, v in BA.ERRORS.items() if k in (K.BASE, "IDX_KS11")}
 
     async def recent(self, code: str):
         """키움 최근 150 일봉 — 고가·저가도 담는다(리그 변동성돌파가 같은 함수를 쓴다 — 판단은 시가·종가만 본다)."""

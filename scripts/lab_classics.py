@@ -60,8 +60,9 @@ _OHLC_DIR = _ROOT / "docs_cache" / "lab"
 
 
 # ── 데이터: 고가·저가까지 ──────────────────────────────────────────────────────
-def load_ohlc(code: str, start: str = "1990-01-01", end: str = END) -> dict[str, dict]:
-    """{date: {open, high, low, close}} — strategy_lab.load_bars 는 시가·종가만 남겨 변동성 돌파를 못 잰다."""
+def load_ohlc(code: str, start: str = "1990-01-01", end: str = END, archive: bool = False) -> dict[str, dict]:
+    """{date: {open, high, low, close}} — strategy_lab.load_bars 는 시가·종가만 남겨 변동성 돌파를 못 잰다.
+    archive=True(리그만) — load_bars 와 같은 일봉 보관소(`bar_archive`, key `ohlc_<code>`)로 앞쪽 날을 붙인다."""
     safe = code.replace("^", "IDX_").replace("/", "_")
     path = _OHLC_DIR / f"ohlc_{safe}_{end}.json"
     if path.exists():
@@ -84,6 +85,9 @@ def load_ohlc(code: str, start: str = "1990-01-01", end: str = END) -> dict[str,
         _OHLC_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(rows), encoding="utf-8")
         L.prune_live_cache(f"ohlc_{safe}", end, _OHLC_DIR)
+    if archive:
+        import bar_archive as BA
+        rows = BA.merge(f"ohlc_{safe}", rows)
     return {d: v for d, v in rows.items() if start <= d <= end}
 
 

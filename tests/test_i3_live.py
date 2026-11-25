@@ -292,6 +292,51 @@ def test_decide_aborts_on_source_mismatch(paths):
     assert "abort" in r and any(c for c, _ in notes.msgs) and not paths[0].exists()
 
 
+def _stepped(days, ex_date, q, noise=0.0):
+    """키움(recent)만 분배락일 앞 날을 ×q 로 다시 계산한 모양 — FDR 이 하루 늦은 날 흉내. noise 면 날마다 흔든다."""
+    long_hist = _bars(days)
+    recent = {d: {"open": v["open"], "close": v["close"] * (q if d < ex_date else 1.0)
+                  * (1 + (noise if i % 2 else -noise))} for i, (d, v) in enumerate(long_hist.items())}
+    return long_hist, recent
+
+
+def test_basis_step_names_ex_date_only_for_clean_distribution_steps():
+    """★ 분배금 반영 시차 모양(분배락일 앞 날만 같은 비율)일 때만 진단을 붙인다 — 흩어진 차이·너무 큰 계단은 다른 원인."""
+    days = _days(60)
+    today, ex = days[-1], days[-8]
+    lh, rc = _stepped(days, ex, 1.0124)                        # KODEX200 2025-04 크기
+    assert LV.check_consistency(lh, rc, today) is not None      # 판단 중단은 그대로
+    hint = LV.basis_step(lh, rc, today)
+    assert "분배금 반영 시차" in hint and ex in hint and "+1.24%" in hint
+    lh, rc = _stepped(days, today, 1.0324)                      # 분배락일이 오늘 — 겹치는 날 전부 같은 비율
+    assert "겹치는 날 전부" in LV.basis_step(lh, rc, today)
+    assert LV.basis_step(*_stepped(days, ex, 1.0124, noise=0.004), today) is None    # 흩어짐
+    assert LV.basis_step(*_stepped(days, ex, 1.12), today) is None                    # 12% — 분배금 아님
+    assert LV.basis_step(*_stepped(days, ex, 1.003), today) is None                   # 한도 안 — 불일치 아님
+
+
+def test_decide_abort_message_carries_distribution_hint(paths):
+    """분배락 시차 날 — 판단은 멈추고(critical), 알림에 '분배금 반영 시차로 보임'이 붙는다."""
+    days = _days()
+    m = FakeMarket(days, days[-1])
+    ex = days[-6]
+    orig = m.recent
+
+    async def recent(code):
+        out = await orig(code)
+        if code != "KOSPI":
+            for d, v in out.items():
+                if d < ex:
+                    v["close"] *= 1.0124
+        return out
+    m.recent = recent
+    notes = Notes()
+    now = datetime.fromisoformat(days[-1] + "T15:50:00")
+    r = run(LV.phase_decide(m, FakeBroker(), notes, now, *paths))
+    assert "abort" in r and "분배금 반영 시차" in r["abort"] and not paths[0].exists()
+    assert notes.msgs and notes.msgs[0][0] is True and ex in notes.msgs[0][1]
+
+
 def _trim_before_start(m, keep):
     """재생 시작일 앞 일봉을 keep 일만 남긴다(FDR 3,000거래일 상한이 앞쪽을 잘라 먹은 날 흉내)."""
     pre = sorted(d for d in m.base if d < K.REPLAY_START)

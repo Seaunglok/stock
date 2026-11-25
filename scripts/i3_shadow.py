@@ -748,14 +748,15 @@ def append_history(row: dict, path: Path = HISTORY_FILE) -> None:
     AIO.write_csv(path, cols, rows)
 
 
-async def _load_data(today: str) -> tuple[dict, dict]:
+async def _load_data(today: str) -> tuple[dict, dict, dict]:
     """멤버가 쓰는 종목: 장기 이력 FDR + 최근·오늘 일봉 키움(실전 판단과 같은 출처).
-    두 출처를 겹치는 날로 대조한 결과(audit)도 돌려준다 — 어긋나면 그날 리그 기록은 믿을 수 없다."""
+    두 출처를 겹치는 날로 대조한 결과(audit)도 돌려준다 — 어긋나면 그날 리그 기록은 믿을 수 없다.
+    hints = 어긋남이 분배금 반영 시차 모양인 종목 → 설명(`i3_live.basis_step`, 11-25 — 알림에만 붙는다)."""
     import i3_live as LV
     import lab_classics as C
     m = LV.KiwoomMarket()
     codes = sorted({c for mb in MEMBERS for c in mb.codes})
-    data, audit = {}, {}
+    data, audit, hints = {}, {}, {}
     for c in codes:
         if c == KOSPI:
             hist, rec = await m.kospi_bars(), await m.recent("KOSPI")
@@ -770,8 +771,10 @@ async def _load_data(today: str) -> tuple[dict, dict]:
             except Exception:
                 rec = {}
         audit[c] = audit_sources(hist, rec, today)
+        if audit[c] is not None and audit[c] > AUDIT_TOL:
+            hints[c] = LV.basis_step(hist, rec, today, AUDIT_TOL)
         data[c] = {**hist, **rec}
-    return data, audit
+    return data, audit, hints
 
 
 def summary_line(rec: dict) -> str:
@@ -797,12 +800,13 @@ async def main_async(now: datetime) -> int:
         return 0
     start, equity = navs[0][0], float(navs[0][1])
     today = now.strftime("%Y-%m-%d")
-    data, audit = await _load_data(today)
+    data, audit, hints = await _load_data(today)
     bad = {c: x for c, x in audit.items() if x is not None and x > AUDIT_TOL}
     gaps = audit_gaps(audit)
     if bad:
         await notify("⛔ [I3 리그] 데이터 출처 불일치 — 오늘 리그 기록은 믿을 수 없다: "
-                         + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
+                         + ", ".join(f"{c} {x:.2%}" + (f"({hints[c]})" if hints.get(c) else "")
+                                     for c, x in bad.items()), critical=True)
     if gaps:
         await notify("⛔ [I3 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
                          + " (인증·IP·서버 확인 — 11-09 8050 사고). 오늘 기록은 대조 없이 FDR 만으로 했다", critical=True)

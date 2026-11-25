@@ -153,6 +153,38 @@ def check_consistency(long_hist: dict[str, dict], recent: dict[str, dict], today
     return f"종가 최대 차이 {worst:.2%} > {tol:.1%}" if worst > tol else None
 
 
+STEP_FLAT = 0.0005     # 같은 비율로 본다(정수 호가 반올림은 ~0.01% 이내)
+STEP_MAX = 0.05        # 이보다 큰 계단은 분배금이 아니다(분할 오반영·다른 종목 등) — 진단을 붙이지 않는다
+
+
+def basis_step(long_hist: dict[str, dict], recent: dict[str, dict], today: str,
+               tol: float = CONSISTENCY_TOL) -> str | None:
+    """불일치가 **분배금 반영 시차** 모양이면 설명, 아니면 None — 판단 중단은 그대로, 알림에 원인 후보로만 붙인다(11-25).
+
+    FDR·키움 수정주가는 분배락일에 그 앞 모든 날을 같은 비율로 다시 계산한다. 한쪽이 하루 늦으면 겹치는 날 중
+    분배락일 **앞 날만** 같은 비율로 어긋난다(4월이 크다 — 키움 실측 KODEX200 2025-04 1.24%·2026-04 0.44%, 223190 3.24%·1.07%).
+      · 앞 날 전부 ×q(같은 비율) · 뒤 날 ×1 → 그 날이 분배락일
+      · 겹치는 날 전부 ×q → 분배락일이 오늘(겹치는 날은 오늘 제외)
+    q 가 tol 이하·STEP_MAX 초과·비율이 흩어짐이면 None(다른 원인)."""
+    common = sorted(d for d in recent if d in long_hist and d < today)[-20:]
+    qs = [(d, recent[d]["close"] / long_hist[d]["close"]) for d in common
+          if long_hist[d].get("close") and recent[d].get("close")]
+    if len(qs) < 5:
+        return None
+
+    def flat(xs, at):
+        return all(abs(x / at - 1) <= STEP_FLAT for x in xs)
+    for k in range(1, len(qs) + 1):
+        before, after = [q for _, q in qs[:k]], [q for _, q in qs[k:]]
+        m = sorted(before)[len(before) // 2]
+        if not (tol < abs(m - 1) <= STEP_MAX and flat(before, m) and flat(after, 1.0)):
+            continue
+        where = (f"{qs[k][0]} 앞 날만" if after else "겹치는 날 전부(분배락일이 오늘이면 이 모양)")
+        return (f"분배금 반영 시차로 보임 — {where} 두 출처가 같은 비율 ×{m:.4f}({m - 1:+.2%}) 차이"
+                f"(한 출처만 과거를 다시 계산). 보통 다음 날 풀린다 — 다음 날도 같으면 출처 확인")
+    return None
+
+
 def _cause(src: Any, *codes: str) -> str:
     """조회 실패 원인(KiwoomMarket·KiwoomBroker 의 errors) 한 줄 — 가짜 객체엔 없을 수 있다."""
     errs = getattr(src, "errors", None) or {}
@@ -204,6 +236,9 @@ async def phase_decide(market: Market, broker: Broker, notify: Notifier, now: da
     for name, lh, rc in (("KODEX200", long_base, rb), ("KOSPI", long_kospi, rk)):
         bad = check_consistency(lh, rc, today)
         if bad:
+            hint = basis_step(lh, rc, today)
+            if hint:
+                bad = f"{bad} · {hint}"
             await notify(f"⛔ [I3] {name} 데이터 불일치로 판단 중단 — {bad}", critical=True)
             log_event("decide_abort", {"reason": f"{name} {bad}"}, events_path)
             return {"abort": f"{name} {bad}"}

@@ -129,7 +129,8 @@ def main() -> int:
                 got += 1
             time.sleep(0.3)
         print(f"  {year}: {got}/{len(codes)}종목")
-        OUT.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        import atomic_io as AIO       # 리그 퀄리티가 매일 읽는다 — 쓰다 끊겨도 원본이 남게(11-25)
+        AIO.write_text(OUT, json.dumps(data, ensure_ascii=False), keep_bak=True)
     print(f"저장 {OUT} · 종목 {len(data)}")
     return 0
 

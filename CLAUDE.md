@@ -54,7 +54,8 @@
   `Result(status ok|ip|fail, detail)` — 원인을 버리지 않는다(`KiwoomMarket/KiwoomBroker.errors` → 판단 중단·매수 건너뜀 알림에 「키움: …」).
   **주문·계좌 평가만 MCP**(8030 trading · 8034 portfolio — 검증된 길). 새 조회는 `kiwoom_read` 에 넣고 MCP `_kiwoom_call` 은 새로 쓰지 않는다.
 - **판단 안전장치**(일부러 깨뜨려 확인함): 15:35 전엔 판단 안 함 · 키움 응답이 비었거나 FDR 에만 오늘 일봉 → **판단 중단 + critical**
-  (휴장 아님, `missing_bar_reason`) · 둘 다 없으면 휴장 일반 알림 · FDR↔키움 종가 0.5% 넘게 다르면 중단 ·
+  (휴장 아님, `missing_bar_reason`) · 둘 다 없으면 휴장 일반 알림 · FDR↔키움 종가 0.5% 넘게 다르면 중단(분배락일에 한 출처만
+  과거를 다시 계산한 모양이면 알림에 「분배금 반영 시차로 보임」 — 11-25 `basis_step`, 4월 분배가 커서 생길 수 있다, 보통 다음 날 풀림) ·
   **재생 시작일(2015-07-28) 앞 KODEX200 20일·KOSPI 120일 미만이면 중단(11-24 ⑮ `i3_core.history_short`)** · 계좌 조회 불명이면 중단 ·
   현재가·주문가능금액을 못 읽으면 매수 안 함 · **응답 불명 주문은 재전송하지 않고 잔고·체결내역으로 확인** ·
   **`state.json` 없이 `state.bak` 만 있으면 판단·매매 중단**(11-18 — 빈 상태로 시작하지 않는다. 복구: .bak 확인 → state.json 으로 복사 → 재실행) ·
@@ -204,7 +205,7 @@
 ## 10. 개발 환경
 
 - Python 3.12+ · `uv` · 실행 `D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe`.
-- 테스트 `python -m pytest tests/ -q`(약 680개, 30초대 — 실데이터 캐시가 없으면 일부 건너뜀).
+- 테스트 `python -m pytest tests/ -q`(약 910개, 1분 남짓 — 실데이터 캐시가 없으면 일부 건너뜀).
 - `.env`: `KIWOOM_APP_KEY`·`KIWOOM_APP_SECRET`·`KIWOOM_ACCOUNT_NO`(필수) · `KIWOOM_PRODUCTION_MODE`(실거래 키 + true 만, 모의 키면 false) ·
   `TELEGRAM_BOT_TOKEN`·`TELEGRAM_CHAT_ID`(+ `TELEGRAM_CRITICAL_CHAT_ID`) · `I3_DRY_RUN`·`I3_HALT` · `HEARTBEAT_TRADE_URL`·`HEARTBEAT_DECIDE_URL` · `NAVER_CLIENT_ID/SECRET` · `DART_API_KEY` ·
   `TREND_WATCHDOG_DAEMON=off`.

@@ -42,7 +42,7 @@ def test_declared_constants_reuse_downside_defaults():
     assert F.LONGS == {"1": "069500", "2": "122630"} and F.CASH == "488770"
     assert (F.ANCHOR, F.F_EQUITY, F.F_JUDGE_DAYS, F.F_MIN_HELD, F.F_MAX_MDD_PCT) == \
         ("2026-10-28", 500_000.0, 60, 20, 30.0)
-    assert S.MEMBERS == ("ORB-B1", "ORB-B2", "ORB-B3") + F.MEMBERS + ("HH1", "FLOW-S1") and S.STOP_PCT == 30.0
+    assert S.MEMBERS == ("ORB-B1", "ORB-B2", "ORB-B3") + F.MEMBERS + ("HH1", "FLOW-S1", "LLM-N1") and S.STOP_PCT == 30.0
 
 
 def test_fear_p_declaration():

@@ -242,25 +242,29 @@ def append_history(row: dict, path: Path = HISTORY_FILE) -> None:
 
 
 # ── 실행 ─────────────────────────────────────────────────────────────────────
-async def _load(today: str) -> tuple[dict, dict]:
-    """일봉: 장기 FDR + 최근·오늘 키움(실전·I3 리그와 같은 출처, 겹치는 날 대조). VIX 는 FDR 만."""
+async def _load(today: str) -> tuple[dict, dict, dict]:
+    """일봉: 장기 FDR + 최근·오늘 키움(실전·I3 리그와 같은 출처, 겹치는 날 대조). VIX 는 FDR 만.
+    한국 ETF 앞쪽은 일봉 보관소(`bar_archive`, 11-25 — HH1 이 122630·133690 을 2015 부터 재생한다, I3 리그와 같은 이유).
+    hints = 대조가 어긋난 종목 중 분배금 반영 시차 모양인 것 → 설명(`i3_live.basis_step`, 알림에만)."""
     import i3_live as LV
-    from i3_shadow import audit_sources
+    from i3_shadow import AUDIT_TOL, audit_sources
     m = LV.KiwoomMarket()
-    px, audit = {}, {}
+    px, audit, hints = {}, {}, {}
     for c in DAILY + (KOSPI,):
         if c == KOSPI:
             hist, rec = await m.kospi_bars(), await m.recent("KOSPI")
         else:
-            hist = L.load_bars(c, "2010-01-01", today)
+            hist = L.load_bars(c, "2010-01-01", today, archive=True)
             try:
                 rec = await m.recent(c)
             except Exception:
                 rec = {}
         audit[c] = audit_sources(hist, rec, today)
+        if audit[c] is not None and audit[c] > AUDIT_TOL:
+            hints[c] = LV.basis_step(hist, rec, today, AUDIT_TOL)
         px[c] = {**hist, **rec}
     px[VIX] = L.load_bars(VIX, "2010-01-01", today)
-    return px, audit
+    return px, audit, hints
 
 
 async def main_async(now: datetime) -> int:
@@ -270,7 +274,7 @@ async def main_async(now: datetime) -> int:
     if today < F.ANCHOR:
         print(json.dumps({"skip": f"{F.ANCHOR} 전"}, ensure_ascii=False))
         return 0
-    px, audit = await _load(today)
+    px, audit, hints = await _load(today)
     base, kospi = px[F.BASE], px[KOSPI]
     upto = (today if now.time() >= AFTER_CLOSE and today in base and today in kospi
             else max(d for d in base if d < today))
@@ -296,7 +300,12 @@ async def main_async(now: datetime) -> int:
     print(json.dumps(rec, ensure_ascii=False, indent=2))
     if bad:
         await notify("⛔ [공격형 리그] 데이터 출처 불일치 — 오늘 기록은 믿을 수 없다: "
-                         + ", ".join(f"{c} {x:.2%}" for c, x in bad.items()), critical=True)
+                         + ", ".join(f"{c} {x:.2%}" + (f"({hints[c]})" if hints.get(c) else "")
+                                     for c, x in bad.items()), critical=True)
+    import bar_archive as BA
+    if BA.ERRORS:
+        await notify("⚠️ [공격형 리그] 일봉 보관소를 못 붙였다 — 이 종목은 FDR 이력(최근 3,000거래일)만으로 기록: "
+                     + " · ".join(f"{k} {v}" for k, v in BA.ERRORS.items()))
     if gaps:
         await notify("⛔ [공격형 리그] 원자료 대조 불가 — 키움 최근 일봉을 못 받았다: " + ", ".join(gaps)
                          + " (인증·IP·서버 확인)", critical=True)

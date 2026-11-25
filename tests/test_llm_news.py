@@ -79,7 +79,17 @@ def test_command_runs_clean_outside_project(monkeypatch):
         assert cmd[cmd.index(flag) + 1] == val
     assert "--strict-mcp-config" in cmd and "--no-session-persistence" in cmd and "--json-schema" in cmd
     assert seen["input"] == "글" and _ROOT not in Path(seen["cwd"]).resolve().parents and seen["timeout"] == N.TIMEOUT_S
+    raw = a.pop("_raw")
     assert a == {"direction": -1, "risk": "높음", "reason": "반도체 급락 뒤", "cost_usd": 0.0204, "duration_ms": 6023}
+    assert json.loads(raw)["modelUsage"]                                  # 원문이 그대로 따라온다(감사용)
+
+
+def test_record_keeps_raw_answer_beside_input(tmp_path):
+    jd, out, inp = _journal(tmp_path), tmp_path / "daily.csv", tmp_path / "inputs"
+    run = (lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=_answer(), stderr=""))
+    N.record(NOW, journal_dir=jd, out=out, inputs=inp, asker=lambda p: N.ask(p, run=run))
+    assert N.MODEL in json.loads((inp / f"{DAY}.answer.json").read_text(encoding="utf-8"))["modelUsage"]
+    assert "_raw" not in N.load(out)[0]
 
 
 @pytest.mark.parametrize("raw, why", [

@@ -165,7 +165,7 @@ def ask(prompt: str, run=subprocess.run) -> dict:
     p = run(command(), input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_S, cwd=RUN_DIR)
     if p.returncode != 0 and not (p.stdout or "").strip():
         raise ValueError(f"claude 종료코드 {p.returncode}: {(p.stderr or '')[-300:]}")
-    return parse_answer(p.stdout)
+    return {**parse_answer(p.stdout), "_raw": p.stdout}        # 원문은 record 가 inputs/<날짜>.answer.json 으로(감사용)
 
 
 # ── 기록 ─────────────────────────────────────────────────────────────────────
@@ -195,7 +195,10 @@ def record(now: datetime, day: str | None = None, journal_dir: Path = MJ.JOURNAL
     sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     inputs.mkdir(parents=True, exist_ok=True)
     AIO.write_text(inputs / f"{day}.txt", prompt)
-    a = asker(prompt)
+    a = dict(asker(prompt))
+    raw = a.pop("_raw", None)
+    if raw:
+        AIO.write_text(inputs / f"{day}.answer.json", raw)
     row = {"date": day, "asked_at": now.strftime("%Y-%m-%dT%H:%M:%S"), "model": MODEL, "n_titles": n,
            "input_sha256": sha, **a}
     rows = sorted(rows + [{k: row.get(k, "") for k in COLS}], key=lambda r: r["date"])

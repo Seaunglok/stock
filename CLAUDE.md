@@ -26,7 +26,7 @@
 | 매일 08:40~ 5분마다 | `KiwoomTrendWatchdog` → `trend_watchdog.cmd` | MCP 서버 기동·감시(이름만 trend — `TREND_WATCHDOG_DAEMON=off` 라 데몬은 안 띄운다) |
 | 평일 08:50 | `I3Trade` → `i3_live.py --phase trade` | 전날 판단대로 매매(대기 판단 없으면 건너뜀) |
 | 매일 09:00 | `ClaudeCliDaily` → `cmd /k claude.exe --remote-control multi_agent_kiwoom` | 프로젝트 폴더에서 대화형 Claude Code 세션 + 원격 제어(claude.ai/code·모바일 앱). 운용자 요청(11-19). 창을 닫으면 그날은 끝. 다시 만들기 `scripts/register_claude_daily.ps1` |
-| 평일 15:50 | `I3Decide` → `i3_decide.cmd` | 판단 → I3 리그 → 1분봉 수집 → 공격형 리그 → 시장 일지 close → 지표 일지 → Notion(`i3_notion.cmd`) |
+| 평일 15:50 | `I3Decide` → `i3_decide.cmd` | 판단 → I3 리그 → 1분봉 수집 → 공격형 리그 → 시장 일지 close → 지표 일지 → Notion(`i3_notion.cmd`) → Claude 뉴스 판단(`llm_news.py`, 11-25~) |
 | 매일 16:30 | `MarketFlowsBackfill` | 수급 이력 빈 날 메우기(오늘은 받지 않는다 — 확정치는 다음 날 아침) |
 
 비활성: `TrendPaperDaily` · `TrendJournalNotion` · **`TrendForeignFlowDaily`(11-18 — 종목별 외인 ka10008, 종료한 추세추종 검증용.
@@ -134,6 +134,11 @@
   ('쌍끌이'는 2020 까지만, 2021 이후 대량 매도 뒤 되돌림) — [docs/2026-11-16-flows-news-lab.md](docs/2026-11-16-flows-news-lab.md).
 - **뉴스·경제 지표 일지 `market_features.py`(11-16~, 앞으로만)**: 판단 배치에서 일지 close 뒤 하루 1행(`data/market_features/daily.csv`).
   가설 N1~N3 **판정 2027-04-30(120거래일)** — 그 전엔 결과를 계산하지 않는다(`--judge` 도 해당 날 수만).
+- **Claude 뉴스 판단 일지 `llm_news.py`(11-25~, 운용자 "시작하자", 앞으로만 — 매매엔 안 씀)**: 판단 배치 맨 끝, 그날 일지의 뉴스·공시 제목
+  (정해진 규칙, 410개 안팎)만 headless Claude(**`claude-opus-5-5` 고정** · 도구·MCP·설정 없음 · 프로젝트 밖 `%TEMP%\llm_news_cwd`)에게 주고
+  다음 5거래일 코스피 direction −2~+2 · risk 를 묻는다 → `data/llm_news/daily.csv` + 넣은 글 `inputs/`. 그날 안에만·하루 한 번·거래일만,
+  지난 날은 안 채운다. 가설 L1(부정 → 뒤 5일 약함)·L2 — N2 와 같은 잣대 + 구간 섞기 p ≤ 0.01, **판정 120거래일(2027-05 무렵)** —
+  [docs/2026-11-25-llm-news-lab.md](docs/2026-11-25-llm-news-lab.md). 실패 알림 뒤 그날 안에 `python scripts\llm_news.py` 재실행.
 
 ## 6. Notion — 쓰기 전에 [docs/notion-guide.md](docs/notion-guide.md) 를 먼저 읽는다
 
@@ -190,11 +195,11 @@
   `trend_lock.py` · `trend_watchdog.py`. trend_* 는 종료한 트랙 이름을 단 공용 기반이고, 구현은 옮기지 않았다(.env 로드 순서·
   `test_trend_config` reload 시험) — I3 쪽 새 코드는 `ops_base` 로 부른다.
 - **리그·연구**: `i3_shadow.py` · `aggr_shadow.py` · `strategy_lab.py` · `lab_*.py`(세대·판정대 선언과 결과가 docstring 에) · `trend_paper.py`(리그의 추세추종 멤버).
-- **수집·기록**: `market_journal.py` · `market_flows.py` · `market_features.py` · `collect_i3_minutes.py` · `i3_notion_sync.py` + `i3_notion_task.md` ·
+- **수집·기록**: `market_journal.py` · `market_flows.py` · `market_features.py` · `llm_news.py`(Claude 뉴스 판단) · `collect_i3_minutes.py` · `i3_notion_sync.py` + `i3_notion_task.md` ·
   `kiwoom_net_check.py` · (중단 11-18: `collect_foreign_flow.py` + `foreign_flow.cmd`).
 - **배치**: `i3_decide.cmd` · `i3_trade.cmd` · `i3_notion.cmd` · `market_journal_morning.cmd` · `market_flows_backfill.cmd` · `kiwoom_net_check.cmd` ·
   `trend_watchdog.cmd`.
-- **데이터**: `data/i3/`(state·events·fills·shadow) · `data/bar_archive/`(일봉 보관 — 지우지 않는다, `.bak` 있음) · `data/aggr/` ·
+- **데이터**: `data/i3/`(state·events·fills·shadow) · `data/bar_archive/`(일봉 보관 — 지우지 않는다, `.bak` 있음) · `data/llm_news/` · `data/aggr/` ·
   `data/market_journal/` · `data/market_flows/` · `data/minute/` · `data/kiwoom_net/` ·
   `docs_cache/lab/`(연구 캐시 — 커밋하지 않는다).
 - **MCP 서버**(`src/mcp_servers/kiwoom_mcp/domains/`, `run_mcp_local.py`): 8030 trading(주문) · 8034 portfolio(계좌 평가) · 8033 investor(11-18 외인 수집 중단 뒤 운용 코드는 안 씀 — 워치독 목록은 그대로) ·

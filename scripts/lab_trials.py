@@ -61,6 +61,7 @@ TRIALS: list[tuple[str, str, int, str]] = [
     ("2026-11-23", "외국인 극단 순매도 뒤 인버스 20일 FLOW-S1(공격형 리그 앞으로만, 아이디어 장부 10번)", 1, "scripts/lab_flow_fwd.py"),
     ("2026-11-23", "MSCI 한국 정기변경 M1(편입 앞 매수)·M2(편출 뒤 되돌림)(lab_msci, 아이디어 장부 7번)", 2, "scripts/lab_msci.py"),
     ("2026-11-23", "11세대 M11a 세 시장 I3(KODEX200·S&P500·금, 각자 엔진, 매년 재조정)", 1, "scripts/lab_gen11.py"),
+    ("2026-11-25", "Claude 뉴스 판단 L1(부정 → 뒤 5일 약함)·L2(긍정 → 뒤 5일 강함)(앞으로만, 판정 120거래일)", 2, "scripts/llm_news.py"),
 ]
 
 

@@ -35,4 +35,10 @@ REM its own check step sends a Telegram alert when the sync did not finish.
 echo ---- notion %TIME% >> logs\i3\i3_task.log
 call scripts\i3_notion.cmd
 echo notion_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
+REM Claude news judgment (forward-only research since 11-25, judged at 120 records - scripts\llm_news.py).
+REM Asks headless claude once per trading day with no tools/MCP/settings, outside the project folder. Last, so a
+REM slow or failed call cannot delay anything above. Does not change RC; a failure sends a Telegram warning.
+echo ---- llm_news %TIME% >> logs\i3\i3_task.log
+"D:\kiwoom_rest_study\multi_agent_kiwoom\.venv\Scripts\python.exe" scripts\llm_news.py >> logs\i3\i3_task.log 2>&1
+echo llm_news_exit=%ERRORLEVEL% >> logs\i3\i3_task.log
 exit /b %RC%

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import subprocess
 import sys
@@ -69,6 +70,7 @@ def test_prompt_is_deterministic_capped_and_deduped(tmp_path):
 def test_command_runs_clean_outside_project(monkeypatch):
     """★ 도구·MCP·설정(훅·플러그인)·세션 저장 없이, 고정 모델로, 프로젝트 밖 폴더에서 — 지침·메모리가 끼지 않는다."""
     seen = {}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 
     def run(cmd, **kw):
         seen.update(cmd=cmd, **kw)
@@ -79,9 +81,41 @@ def test_command_runs_clean_outside_project(monkeypatch):
         assert cmd[cmd.index(flag) + 1] == val
     assert "--strict-mcp-config" in cmd and "--no-session-persistence" in cmd and "--json-schema" in cmd
     assert seen["input"] == "글" and _ROOT not in Path(seen["cwd"]).resolve().parents and seen["timeout"] == N.TIMEOUT_S
+    assert "ANTHROPIC_API_KEY" not in seen["env"] and "PATH" in {k.upper() for k in seen["env"]}   # 구독 로그인으로만
     raw = a.pop("_raw")
     assert a == {"direction": -1, "risk": "높음", "reason": "반도체 급락 뒤", "cost_usd": 0.0204, "duration_ms": 6023}
     assert json.loads(raw)["modelUsage"]                                  # 원문이 그대로 따라온다(감사용)
+
+
+# 진짜 자식 프로세스 — 환경에 API 인증 변수가 보이면 claude 처럼 과금 오류("Credit balance is too low")로 답한다
+_FAKE_CLAUDE = (
+    "import os, json, sys; sys.stdin.read(); "
+    f"leak = [k for k in {N.API_AUTH_ENV!r} if k in os.environ]; "
+    "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': bool(leak), "
+    "'result': ('Credit balance is too low ' + ','.join(leak)) if leak else '', "
+    f"'modelUsage': {{{N.MODEL!r}: {{}}}}, 'total_cost_usd': 0.17, 'duration_ms': 1, "
+    "'structured_output': {'direction': 0, 'risk': '보통', 'reason': 'ok'}}))"
+)
+
+
+def test_ask_keeps_api_keys_away_from_real_child_process(tmp_path, monkeypatch):
+    """★ 11-26 실패의 실제 경계: .env 키가 부모 환경에 있어도 자식 claude 에겐 안 보인다(구독 로그인으로만 — 과금 없음).
+    일부러 깨뜨리기: 환경을 그대로 넘기면(옛 길) 같은 자식이 과금 오류로 답하고 ask 는 실패한다."""
+    for k in N.API_AUTH_ENV:
+        monkeypatch.setenv(k, "x")
+    monkeypatch.setattr(N, "RUN_DIR", tmp_path / "cwd")
+    monkeypatch.setattr(N, "command", lambda: [sys.executable, "-c", _FAKE_CLAUDE])
+    a = N.ask("글")                                                                   # 새 길: 키가 안 넘어감
+    assert (a["direction"], a["risk"], a["reason"]) == (0, "보통", "ok")
+    monkeypatch.setattr(N, "child_env", lambda base=None: dict(os.environ))          # 옛 길: 환경 그대로
+    with pytest.raises(ValueError, match="Credit balance is too low ANTHROPIC_API_KEY"):
+        N.ask("글")
+
+
+def test_child_env_keeps_everything_else():
+    base = {"PATH": "p", "USERPROFILE": "u", "TELEGRAM_BOT_TOKEN": "t", "ANTHROPIC_API_KEY": "k", "ANTHROPIC_BASE_URL": "b"}
+    assert N.child_env(base) == {"PATH": "p", "USERPROFILE": "u", "TELEGRAM_BOT_TOKEN": "t"}
+    assert base["ANTHROPIC_API_KEY"] == "k"                                           # 원본은 건드리지 않는다
 
 
 def test_record_keeps_raw_answer_beside_input(tmp_path):

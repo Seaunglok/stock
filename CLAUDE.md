@@ -137,7 +137,8 @@
 - **뉴스·경제 지표 일지 `market_features.py`(11-16~, 앞으로만)**: 판단 배치에서 일지 close 뒤 하루 1행(`data/market_features/daily.csv`).
   가설 N1~N3 **판정 2027-04-30(120거래일)** — 그 전엔 결과를 계산하지 않는다(`--judge` 도 해당 날 수만).
 - **Claude 뉴스 판단 일지 `llm_news.py`(11-25~, 운용자 "시작하자", 앞으로만 — 매매엔 안 씀)**: 판단 배치 맨 끝, 그날 일지의 뉴스·공시 제목
-  (정해진 규칙, 410개 안팎)만 headless Claude(**`claude-opus-5-5` 고정** · 도구·MCP·설정 없음 · 프로젝트 밖 `%TEMP%\llm_news_cwd`)에게 주고
+  (정해진 규칙, 410개 안팎)만 headless Claude(**`claude-opus-5-5` 고정** · 도구·MCP·설정 없음 · 프로젝트 밖 `%TEMP%\llm_news_cwd` ·
+  **구독 로그인만 — 자식 환경에서 `ANTHROPIC_API_KEY` 등을 뺀다(11-26 `child_env`: `.env` 키가 넘어가 API 계정 과금 → 잔액 부족 실패)**)에게 주고
   다음 5거래일 코스피 direction −2~+2 · risk 를 묻는다 → `data/llm_news/daily.csv` + 넣은 글 `inputs/`. 그날 안에만·하루 한 번·거래일만,
   지난 날은 안 채운다. 가설 L1(부정 → 뒤 5일 약함)·L2 — N2 와 같은 잣대 + 구간 섞기 p ≤ 0.01, **판정 120거래일(2027-05 무렵)** —
   [docs/2026-11-25-llm-news-lab.md](docs/2026-11-25-llm-news-lab.md). 실패 알림 뒤 그날 안에 `python scripts\llm_news.py` 재실행.

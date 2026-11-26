@@ -12,6 +12,11 @@
   모델     MODEL 고정(claude-opus-5-5). 답한 모델이 다르면 실패로 본다(대체 모델로 채우지 않는다).
   깨끗함   headless `claude -p` · 도구 없음(--tools "") · MCP 없음 · 설정·훅·플러그인 없음(--setting-sources "") ·
            프로젝트 밖 폴더에서(지침·메모리 없음) · 세션 저장 안 함 · 답 형식 JSON 스키마.
+  인증     구독 로그인(정액제)만 — 자식 환경에서 API 인증 변수(API_AUTH_ENV)를 뺀다(11-26). `.env` 의
+           ANTHROPIC_API_KEY 가 ops_base(trend_config) 로 환경에 올라와 claude 에게 넘어가면, claude 는 구독보다
+           API 키를 먼저 써서 API 계정으로 과금한다 — 11-26 "Credit balance is too low" 실패가 이것. 같은 모델·같은 글이라
+           시험 조건은 그대로다(청구 경로만). cost_usd 는 claude 가 알려 주는 환산값일 뿐 구독에선 청구되지 않는다.
+           로그인이 만료되면 실패 알림에 그 문구가 나온다 → 운용자가 터미널 `claude` → `/login` 뒤 그날 안에 재실행.
   넣는 글  `market_journal` 그날 파일에서 정해진 규칙으로(같은 파일이면 같은 글): 주요사항보고 공시 제목 전부 · 일정 ·
            대표 제목(아침·장중) · 장중 뉴스 최신 N_CLOSE(300) · 아침 뉴스 최신 N_MORNING(100) — 제목 중복 제거.
            가격·수급 숫자는 따로 주지 않는다(제목에 든 것만).
@@ -65,6 +70,9 @@ INPUTS = OUT_DIR / "inputs"
 CLAUDE_EXE = os.getenv("LLM_NEWS_CLAUDE", r"C:\Users\hihih\.local\bin\claude.exe")
 RUN_DIR = Path(tempfile.gettempdir()) / "llm_news_cwd"      # 프로젝트 밖 — CLAUDE.md·메모리가 끼지 않게
 MODEL = "claude-opus-5-5"
+# 자식 claude 에게 넘기지 않는 변수 — 하나라도 있으면 claude 가 구독 로그인 대신 그 경로(API 과금·다른 서버)로 간다
+API_AUTH_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 TIMEOUT_S = 600
 N_CLOSE = 300
 N_MORNING = 100
@@ -160,9 +168,18 @@ def parse_answer(raw: str) -> dict:
             "cost_usd": round(float(j.get("total_cost_usd") or 0), 4), "duration_ms": int(j.get("duration_ms") or 0)}
 
 
+def child_env(base=None) -> dict:
+    """자식 claude 의 환경 — 지금 환경에서 API 인증 변수만 뺀다(구독 로그인으로만 돈다, 11-26)."""
+    env = dict(os.environ if base is None else base)
+    for k in API_AUTH_ENV:
+        env.pop(k, None)
+    return env
+
+
 def ask(prompt: str, run=subprocess.run) -> dict:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    p = run(command(), input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_S, cwd=RUN_DIR)
+    p = run(command(), input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_S, cwd=RUN_DIR,
+            env=child_env())
     if p.returncode != 0 and not (p.stdout or "").strip():
         raise ValueError(f"claude 종료코드 {p.returncode}: {(p.stderr or '')[-300:]}")
     return {**parse_answer(p.stdout), "_raw": p.stdout}        # 원문은 record 가 inputs/<날짜>.answer.json 으로(감사용)
